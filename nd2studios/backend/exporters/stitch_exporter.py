@@ -213,10 +213,14 @@ def compute_tile_layout(stage_xy_um: List[Tuple[float, float]],
         m_indices = list(m_indices[:len(stage_xy_um)])
 
     # Physical layout (V1.14): stage µm → pixel offsets directly.
+    # Stage XY is negated up-front: this scope's Nikon stage uses the
+    # opposite sign convention from image coordinates on both axes, so
+    # without negation tiles end up mirrored on both X and Y. After
+    # negation, the existing "min on X, max on Y" pixel math is correct.
     if len(stage_xy_um) >= len(m_indices) and len(m_indices) > 0:
         try:
-            xs = np.array([stage_xy_um[m][0] for m in m_indices], dtype=np.float64)
-            ys = np.array([stage_xy_um[m][1] for m in m_indices], dtype=np.float64)
+            xs = -np.array([stage_xy_um[m][0] for m in m_indices], dtype=np.float64)
+            ys = -np.array([stage_xy_um[m][1] for m in m_indices], dtype=np.float64)
             spread_x = float(xs.max() - xs.min())
             spread_y = float(ys.max() - ys.min())
             if spread_x > 0.1 or spread_y > 0.1:
@@ -225,15 +229,11 @@ def compute_tile_layout(stage_xy_um: List[Tuple[float, float]],
 
                 offsets: List[Tuple[int, int]] = []
                 for i in range(len(m_indices)):
-                    m = m_indices[i]
-                    sx, sy = stage_xy_um[m]
+                    sx = -float(stage_xy_um[m_indices[i]][0])
+                    sy = -float(stage_xy_um[m_indices[i]][1])
                     px_x = int(round((sx - min_x) / pixel_size_um))
                     px_y = int(round((max_y - sy) / pixel_size_um))
                     offsets.append((px_y, px_x))
-                # Reverse so M=0 occupies the canvas slot that M=last had
-                # and M=last occupies M=0's slot. Tile image content is
-                # unchanged; only canvas positions are swapped.
-                offsets = list(reversed(offsets))
 
                 canvas_w = max(off[1] for off in offsets) + tile_w
                 canvas_h = max(off[0] for off in offsets) + tile_h

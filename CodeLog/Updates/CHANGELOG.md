@@ -6,6 +6,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased] - 2026-05-21 (V1.32)
 
+### Bug Fixes
+
+- **Stitched tile positions were doubly wrong**
+  (`backend/exporters/stitch_exporter.py`):
+
+  Two stacked bugs in `compute_tile_layout`'s physical-layout branch.
+  (1) `offsets = list(reversed(offsets))` reversed the per-tile pixel
+  offsets while leaving the tile image list in natural `m_indices`
+  order; downstream zips (`stitch_one_frame`, `export_stitched_tiff`,
+  the preview widgets in `tile_layout` / `tile_preview`) then paired
+  M=k's pixels with M=last-k's canvas slot, point-mirroring every M
+  across the canvas. (2) The stage-XY-to-pixel math assumed image-style
+  conventions (smallest X → leftmost, largest Y → top), but this
+  scope's Nikon stage uses the opposite sign on both axes, leaving
+  tiles mirrored on X and Y even after fix (1). Removed the reverse
+  and negate `sx`/`sy` up-front so the existing `min_x` / `max_y`
+  arithmetic resolves to the correct quadrant.
+
 ### Added
 
 - **Export preview dialog with brightness / contrast / saturation / hue / fade**
