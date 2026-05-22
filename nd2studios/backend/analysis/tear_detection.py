@@ -30,9 +30,12 @@ from skimage.morphology import disk
 # V1.39 Phase 7: route ``gaussian`` and ``threshold_otsu`` through the
 # GPU-aware shim. Identical signatures to ``skimage.filters``; falls
 # back to skimage when GPU mode is off or unavailable.
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from nd2studios.compute.gpu.ops import gaussian, threshold_otsu
 from nd2studios.core.analysis_registry import AnalysisPipeline, AnalysisResult
 from nd2studios.core.plugin_registry import ParamSpec
+from nd2studios.utils.resources import recommended_worker_count
 
 
 @AnalysisPipeline.register
@@ -141,22 +144,30 @@ class TearDetectionPipeline(AnalysisPipeline):
         label_stack = np.zeros((T, H, W), dtype=np.int32)
         measurements: List[Dict[str, Any]] = []
 
-        for t in range(T):
-            if cancelled_cb and cancelled_cb():
-                break
+        # Addendum Phase 5 Improvement 1: the per-frame work
+        # (`_tissue_mask`, `_homogeneity_score`, `regionprops`) lives
+        # entirely in scipy / scikit-image / numpy, all of which
+        # release the GIL. Parallelise across T with a thread pool so a
+        # 100-frame stack on a 4-core machine drops from ~N×t to ~N×t/4
+        # without touching the per-frame code. We collect per-frame
+        # outputs and stitch them back in T-order at the bottom so the
+        # ``label_stack`` and ``measurements`` shapes are byte-equivalent
+        # to the V1.19 sequential path.
 
+        def _process_one(t: int):
             frame = volume[t].astype(np.float32)
-            cs_frame = cs_volume[t].astype(np.float32) if cs_volume is not None else None
-
+            cs_frame = (
+                cs_volume[t].astype(np.float32)
+                if cs_volume is not None else None
+            )
             tissue_mask = _tissue_mask(frame)
             score_map = _homogeneity_score(frame, tissue_mask, win)
-
             candidate = (score_map > threshold) & tissue_mask
-
             labeled, _ = skimage_label(candidate, return_num=True)
             intensity_img = frame
 
             accepted = np.zeros_like(labeled, dtype=np.int32)
+            frame_rows: List[Dict[str, Any]] = []
             new_id = 1
             for region in regionprops(labeled, intensity_image=intensity_img):
                 if region.area < min_area_px:
@@ -164,18 +175,13 @@ class TearDetectionPipeline(AnalysisPipeline):
                 if max_area_px > 0 and region.area > max_area_px:
                     continue
                 accepted[labeled == region.label] = new_id
-
-                # Classification
                 region_mask = labeled == region.label
                 region_class = _classify_region(
                     region_mask, frame, cs_frame, tissue_mask
                 )
-
                 cy, cx = region.centroid
-                # Mean homogeneity score over this region
                 hs = float(np.mean(score_map[region_mask]))
-
-                measurements.append({
+                frame_rows.append({
                     "frame": t,
                     "label_id": new_id,
                     "area_px": float(region.area),
@@ -189,11 +195,33 @@ class TearDetectionPipeline(AnalysisPipeline):
                     "eccentricity": round(float(region.eccentricity), 4),
                 })
                 new_id += 1
+            return accepted, frame_rows
 
+        per_t: Dict[int, Any] = {}
+        n_workers = recommended_worker_count()
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = {ex.submit(_process_one, t): t for t in range(T)}
+            done = 0
+            for fut in as_completed(futures):
+                if cancelled_cb and cancelled_cb():
+                    # Stop scheduling further results; in-flight tasks
+                    # finish their current plane before unwinding.
+                    for f in futures:
+                        f.cancel()
+                    break
+                t_key = futures[fut]
+                per_t[t_key] = fut.result()
+                done += 1
+                if progress_cb:
+                    progress_cb(int(done / T * 100))
+
+        # Stitch in T-order so ``label_stack[t]`` and the per-frame
+        # measurement order match the pre-parallel V1.19 layout
+        # exactly. Cancelled frames simply stay as zeros.
+        for t in sorted(per_t.keys()):
+            accepted, rows = per_t[t]
             label_stack[t] = accepted
-
-            if progress_cb:
-                progress_cb(int((t + 1) / T * 100))
+            measurements.extend(rows)
 
         areas = [m["area_px"] for m in measurements]
         summary: Dict[str, Any] = {

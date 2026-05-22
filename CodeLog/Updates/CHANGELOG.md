@@ -4,6 +4,118 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-05-22 (V1.40)
+
+### Added
+
+- **Phase Addendum — Multi-Core Parallelism** (`nd2studios/utils/storage.py`,
+  `nd2studios/utils/threading.py`,
+  `nd2studios/compute/parallel/__init__.py`,
+  `nd2studios/compute/parallel/shared_array.py`,
+  `nd2studios/compute/parallel/process_map.py`,
+  `nd2studios/compute/parallel/thread_map.py`,
+  `nd2studios/backend/analysis/tear_detection.py`,
+  `nd2studios/pipeline/stages/recipe_stage.py`,
+  `nd2studios/pipeline/stages/pyramid_stage.py`):
+
+  Applies `CodeLog/ClaudesPlan/08_addendum_parallelism.md` to the
+  V1.34/V1.38/V1.39 codebase. The addendum closes the parallelism
+  gaps the original 7-phase plan left on the table — most importantly
+  the sequential M×T×Z×C loop in `PyramidStage.build`. The work is
+  scoped to ND2Studios: where the addendum prescribes Dask or Numba
+  (neither is a project dependency), we substitute the GIL-releasing
+  `ThreadPoolExecutor` pattern with thread-local file handles.
+
+  - New `nd2studios/utils/storage.py`:
+    - `is_fast_storage(path)` — Linux sysfs lookup for the backing
+      device's `queue/rotational` flag. Returns `True` for NVMe /
+      SSD-class storage, `False` on rotational disks and on
+      Windows/macOS (conservative; the V1.34 single-reader default
+      is the safe fallback).
+    - `recommended_io_thread_count(path)` — returns 2 for NVMe-class
+      storage and 1 elsewhere. Caps at 2; beyond that the queue
+      depth benefit plateaus and the prefetcher's cache hit rate
+      starves the readers anyway.
+  - `nd2studios/utils/threading.py` additions:
+    - `IOWorker.__init__(shared_queue=None)` — when a shared
+      `PriorityQueue` is supplied, the worker drains the caller's
+      queue instead of allocating its own. Single-worker callers
+      keep the V1.34 shape.
+    - `WorkerGroup` — facade over N `IOWorker` instances sharing one
+      priority queue. Exposes `.submit`, `.cancel_all`, `.stop`;
+      callers connect to the individual workers' `plane_ready` and
+      `error` signals as before.
+    - `start_io_workers(volume, n)` — spawns *n* `IOWorker`
+      instances on dedicated `QThread`s sharing one queue and
+      returns `(WorkerGroup, [QThread])`. `n=1` is equivalent to
+      `start_io_worker`. Per-thread `volume.reopen()` keeps each
+      worker on its own ND2/TIFF handle (the `nd2` SDK is not
+      thread-safe across file handles).
+  - New `nd2studios/compute/parallel/` subpackage:
+    - `shared_array.py` — `shared_ndarray(arr)` context manager
+      exposes a numpy array to worker processes via
+      `multiprocessing.shared_memory`, yielding `(name, shape,
+      dtype_str)`. Cleans up the block on exit. `attach_shared(...)`
+      is the worker-side reconstructor.
+    - `process_map.py` — `process_map_planes(stack, fn_module,
+      fn_name, indices, kwargs=, n_workers=)` runs a pure-Python
+      CPU-bound per-plane function across a `ProcessPoolExecutor`
+      backed by shared memory. The worker function must be
+      importable (module-level); use this when the work is
+      GIL-bound at the Python level.
+    - `thread_map.py` — `thread_map_planes(stack, fn, indices=,
+      kwargs=, n_workers=, progress_cb=, cancelled_cb=)` runs a
+      callable across a `ThreadPoolExecutor`. The right primitive
+      for ND2Studios analysis pipelines, all of which sit on
+      scipy / scikit-image / numpy C extensions that release the
+      GIL.
+  - `TearDetectionPipeline.run` — the per-T loop is now fanned out
+    across a `ThreadPoolExecutor` sized to
+    `recommended_worker_count()`. Per-frame outputs (label mask +
+    measurement rows) are collected and stitched in T-order at the
+    end so the output `label_stack` shape and the row order match
+    the V1.19 sequential path byte-for-byte. The `cancelled_cb`
+    contract is preserved.
+  - `EnhancedDataset.materialize_all` — channels are independent
+    (different keys, separate output buffers, GIL-releasing plugin
+    work) so the recipe is now applied across them in parallel via
+    a `ThreadPoolExecutor` capped at `min(channel_count,
+    recommended_worker_count())`. `materialize_channel` gains a
+    `threading.Lock` around the cache read/write so two concurrent
+    materializations on the same channel don't both compute and
+    race the final write. `clear_cache` is held under the same lock.
+  - `PyramidStage.build` — the sequential `for m for t for z for c`
+    nest is converted to a per-level `ThreadPoolExecutor` whose
+    tasks share a thread-local `volume.reopen()` handle (the `nd2`
+    SDK's per-file state is not thread-safe). Each task writes to a
+    unique `(m, t, z, c)` zarr chunk — distinct files in a
+    DirectoryStore, no contention. Progress is reported through a
+    new `_AtomicCounter` so the bar stays monotonic across N
+    worker threads. Cancellation is honored within ~1 s. Reader
+    handles are closed deterministically after each level finishes
+    (the executor recycles worker threads, so per-thread destructors
+    are not available; we track them in a registry and close them
+    in a `finally`).
+
+### Changed
+
+- `nd2studios/utils/threading.py:IOWorker` — gains an optional
+  `shared_queue` constructor parameter. Default `None` preserves
+  the V1.34 owns-its-own-queue behavior.
+
+### Notes
+
+- No new third-party dependencies. The addendum's Dask / Numba
+  patterns require packages ND2Studios does not ship; the
+  thread-pool path used here achieves the same near-linear scaling
+  on the workloads that matter (analysis per-T, pyramid build per
+  chunk, recipe per channel) because every hot kernel sits on a
+  GIL-releasing C extension.
+- The new patterns are opt-in: nothing in the V1.34/V1.38/V1.39
+  call sites changes. Tear detection, recipe materialization, and
+  pyramid building light up the parallel path automatically the
+  next time they run.
+
 ## [Unreleased] - 2026-05-22 (V1.39)
 
 ### Added

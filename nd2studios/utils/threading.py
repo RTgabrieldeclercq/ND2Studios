@@ -134,10 +134,23 @@ class IOWorker(QObject):
     # request_id, error message
     error = Signal(int, str)
 
-    def __init__(self, reader_factory: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        reader_factory: Callable[[], Any],
+        *,
+        shared_queue: Optional["PriorityQueue[PlaneRequest]"] = None,
+    ) -> None:
         super().__init__()
         self._reader_factory = reader_factory
-        self._queue: "PriorityQueue[PlaneRequest]" = PriorityQueue()
+        # Addendum Phase 2 Addition A: when several IOWorkers cooperate
+        # on the same NVMe-backed file, they share a single queue so
+        # whichever decoder finishes its current plane first picks up
+        # the next request. ``shared_queue=None`` keeps the V1.34
+        # single-worker shape: this worker owns its queue.
+        self._queue: "PriorityQueue[PlaneRequest]" = (
+            shared_queue if shared_queue is not None else PriorityQueue()
+        )
+        self._owns_queue: bool = shared_queue is None
         self._stop_event = threading.Event()
         self._seq = 0  # tie-breaker for equal-priority requests
 
@@ -241,3 +254,94 @@ def start_io_worker(volume: Any) -> Tuple[IOWorker, QThread]:
     thread.started.connect(worker.run_loop)
     thread.start()
     return worker, thread
+
+
+class WorkerGroup:
+    """Facade over N :class:`IOWorker` instances drained by one queue.
+
+    Addendum Phase 3 hook: when Phase 2 Addition A spawns multiple
+    readers on NVMe-class storage, the
+    :class:`~nd2studios.workers.prefetch_worker.PrefetchManager` and
+    :class:`~nd2studios.widgets.multi_axis_viewer.MultiAxisViewer`
+    should not have to know how many workers exist — they just want a
+    ``submit()`` surface. This wrapper exposes that and delegates to
+    the shared :class:`PriorityQueue` underneath. The
+    :attr:`plane_ready` and :attr:`error` signals are *not* re-emitted
+    here; callers connect to each underlying worker individually
+    (cheap, and avoids inventing a new ``QObject``).
+
+    Instances are created by :func:`start_io_workers`. The single-
+    worker path keeps using :func:`start_io_worker` unchanged.
+    """
+
+    def __init__(self, workers: list[IOWorker]) -> None:
+        if not workers:
+            raise ValueError("WorkerGroup requires at least one IOWorker")
+        self._workers = list(workers)
+
+    @property
+    def workers(self) -> list[IOWorker]:
+        """The individual workers — connect their signals here."""
+        return list(self._workers)
+
+    def submit(self, req: PlaneRequest) -> None:
+        """Hand *req* to the shared queue (any worker may service it)."""
+        # All workers share one queue, so submitting via the first
+        # worker enqueues for the whole group.
+        self._workers[0].submit(req)
+
+    def cancel_all(self) -> None:
+        """Drop every pending request across the group."""
+        # One queue → calling cancel_all on a single worker drains it
+        # for the whole group. We still iterate so callers can pass
+        # back a group whose workers were created independently
+        # (different queues) without losing their cancellation.
+        self._workers[0].cancel_all()
+
+    def stop(self) -> None:
+        """Signal every worker to exit and unblock the shared queue."""
+        for w in self._workers:
+            w.stop()
+
+
+def start_io_workers(
+    volume: Any, n: int = 1,
+) -> Tuple[WorkerGroup, list[QThread]]:
+    """Spawn *n* :class:`IOWorker` instances sharing one priority queue.
+
+    Addendum Phase 2 Addition A. Returns ``(group, threads)``. Caller is
+    responsible for keeping the lists alive and for clean shutdown::
+
+        group.stop()
+        for thread in threads:
+            thread.quit()
+            thread.wait(2000)
+
+    ``n=1`` produces a single-worker group equivalent to
+    :func:`start_io_worker`, so call-sites can switch unconditionally
+    and let :func:`~nd2studios.utils.storage.recommended_io_thread_count`
+    decide the count. The shared queue means the prefetcher submits
+    once and whichever worker is free picks up the request — no
+    round-robin bookkeeping at the caller.
+    """
+    if n < 1:
+        raise ValueError(f"start_io_workers: n must be >= 1 (got {n})")
+    if not hasattr(volume, "reopen"):
+        raise TypeError(
+            "IOWorker volume must expose reopen() — "
+            f"{type(volume).__name__} does not"
+        )
+
+    shared_queue: "PriorityQueue[PlaneRequest]" = PriorityQueue()
+    workers: list[IOWorker] = []
+    threads: list[QThread] = []
+    for i in range(n):
+        thread = QThread()
+        thread.setObjectName(f"ND2StudiosIOWorker[{i}]")
+        worker = IOWorker(volume.reopen, shared_queue=shared_queue)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run_loop)
+        thread.start()
+        workers.append(worker)
+        threads.append(thread)
+    return WorkerGroup(workers), threads

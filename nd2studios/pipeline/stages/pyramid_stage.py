@@ -37,6 +37,8 @@ import json
 import logging
 import math
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -45,6 +47,7 @@ import numpy as np
 from nd2studios.pipeline.session import Session, StageRecord
 from nd2studios.pipeline.stage import PipelineStage
 from nd2studios.pipeline.storage import HAS_ZARR
+from nd2studios.utils.resources import recommended_worker_count
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +55,33 @@ _STAGE_NAME = "pyramid"
 _PYRAMID_SUBDIR = "pyramid"
 _PYRAMID_ZARR = "pyramid.zarr"
 _MAX_LEVEL = 6  # cap pyramid depth even on enormous images
+
+
+class _AtomicCounter:
+    """Lock-guarded integer counter for cross-thread progress accounting.
+
+    Addendum Phase 7 helper: the parallel pyramid build needs to know
+    how many planes have finished across N worker threads so the
+    ``progress_cb`` hook reports a monotonic 0–100. A bare ``int +=``
+    is non-atomic under CPython once the GIL is released inside the
+    worker's C-extension hot path, so we wrap it.
+    """
+
+    __slots__ = ("_value", "_lock")
+
+    def __init__(self, start: int = 0) -> None:
+        self._value = int(start)
+        self._lock = threading.Lock()
+
+    def increment(self) -> int:
+        with self._lock:
+            self._value += 1
+            return self._value
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._value
 
 
 class PyramidUnavailable(RuntimeError):
@@ -216,32 +246,102 @@ class PyramidStage(PipelineStage):
         # that complicates cancellation; one fresh read per level is
         # simple and idempotent.
         total_planes = n_m * n_t * n_z * n_c * len(level_shapes)
-        done = 0
 
-        for level_idx, (h_l, w_l) in enumerate(level_shapes, start=1):
-            factor = self._downscale ** level_idx
-            arr = root[str(level_idx)]
-            for m in range(n_m):
-                for t in range(n_t):
-                    for z in range(n_z):
+        # Addendum Phase 7: the per-plane work splits cleanly into
+        # ``reader.get_frame`` (GIL-releasing nd2/tifffile decode) +
+        # ``_downscale_pow2`` (numpy mean-pool, releases GIL) + a
+        # zarr write into a unique ``(m, t, z, c)`` chunk (releases
+        # GIL, writes go to distinct files in a DirectoryStore so
+        # they don't contend). All three release the GIL, so a
+        # :class:`ThreadPoolExecutor` scales near-linearly with cores
+        # for the build. Each worker thread holds its own
+        # ``volume.reopen()`` handle — the ``nd2`` SDK's per-file
+        # state is not thread-safe, so reusing the caller's handle
+        # would race.
+        n_workers = max(1, recommended_worker_count())
+        worker_done = _AtomicCounter()
+        worker_cancel = threading.Event()
+        # We open one reader per thread on first use and stash it in
+        # ``threading.local``. We also park them in ``readers_registry``
+        # so we can close them deterministically once the level
+        # finishes — ``ThreadPoolExecutor`` doesn't expose per-thread
+        # finalisers.
+        thread_local = threading.local()
+        readers_registry: List[Any] = []
+        registry_lock = threading.Lock()
+
+        def _get_reader():
+            reader = getattr(thread_local, "reader", None)
+            if reader is None:
+                reader = volume.reopen()
+                thread_local.reader = reader
+                with registry_lock:
+                    readers_registry.append(reader)
+            return reader
+
+        def _process_one(args):
+            m, t, z, c, factor, arr_ref = args
+            if worker_cancel.is_set():
+                return None
+            reader = _get_reader()
+            plane = reader.get_frame(c=c, m=m, t=t, z=z, z_mode="none")
+            plane = np.asarray(plane)
+            if plane.ndim != 2:
+                plane = np.squeeze(plane)
+                if plane.ndim != 2:
+                    return None
+            down = _downscale_pow2(plane, factor)
+            # Distinct (m, t, z, c) → distinct zarr chunk → no contention.
+            arr_ref[m, t, z, c, : down.shape[0], : down.shape[1]] = down
+            return None
+
+        try:
+            for level_idx, (h_l, w_l) in enumerate(level_shapes, start=1):
+                factor = self._downscale ** level_idx
+                arr = root[str(level_idx)]
+                tasks = [
+                    (m, t, z, c, factor, arr)
+                    for m in range(n_m)
+                    for t in range(n_t)
+                    for z in range(n_z)
+                    for c in range(n_c)
+                ]
+                with ThreadPoolExecutor(
+                    max_workers=n_workers,
+                    thread_name_prefix=f"PyramidL{level_idx}",
+                ) as ex:
+                    futures = [ex.submit(_process_one, args) for args in tasks]
+                    for fut in as_completed(futures):
                         if cancel_cb is not None and cancel_cb():
-                            log.info("pyramid build cancelled at level %d", level_idx)
-                            return self._partial_record(out_dir, store_path, level_idx)
-                        for c in range(n_c):
-                            plane = volume.get_frame(c=c, m=m, t=t, z=z, z_mode="none")
-                            plane = np.asarray(plane)
-                            if plane.ndim != 2:
-                                plane = np.squeeze(plane)
-                                if plane.ndim != 2:
-                                    # Skip unreadable shapes — they
-                                    # show as zeros at this level.
-                                    done += 1
-                                    continue
-                            down = _downscale_pow2(plane, factor)
-                            arr[m, t, z, c, : down.shape[0], : down.shape[1]] = down
-                            done += 1
-                            if progress_cb is not None and done % 4 == 0:
-                                progress_cb(int(done / total_planes * 100))
+                            worker_cancel.set()
+                            for f in futures:
+                                f.cancel()
+                            log.info(
+                                "pyramid build cancelled at level %d",
+                                level_idx,
+                            )
+                            return self._partial_record(
+                                out_dir, store_path, level_idx,
+                            )
+                        # Propagate any exception from the worker.
+                        fut.result()
+                        done = worker_done.increment()
+                        if progress_cb is not None and done % 4 == 0:
+                            progress_cb(int(done / total_planes * 100))
+        finally:
+            # Close every per-thread reader we opened — ``volume.reopen()``
+            # returns a fresh ND2/TIFF file handle and Python's GC
+            # won't run inside the worker threads after the executor
+            # shuts down.
+            with registry_lock:
+                for reader in readers_registry:
+                    close = getattr(reader, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                readers_registry.clear()
 
         # Final progress nudge so the bar always lands on 100.
         if progress_cb is not None:

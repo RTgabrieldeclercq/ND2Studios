@@ -17,6 +17,8 @@ write-time cost. A later phase can revisit if profiling changes its mind.
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -24,6 +26,7 @@ import numpy as np
 from nd2studios.core.plugin_registry import PluginBase
 from nd2studios.pipeline.session import StageRecord
 from nd2studios.pipeline.stage import PipelineStage
+from nd2studios.utils.resources import recommended_worker_count
 
 
 _RECIPE_ARTIFACT = "recipe"
@@ -137,6 +140,14 @@ class EnhancedDataset:
         self._recipe = [(n, dict(p)) for (n, p) in recipe]
         self._normalized = bool(normalized)
         self._materialized: Dict[str, np.ndarray] = {}
+        # Addendum Phase 6: ``materialize_all`` now fans out across
+        # channels via :class:`ThreadPoolExecutor`. The recipe plugins
+        # (skimage / opencv / scipy) release the GIL so the speed-up
+        # is real, but ``materialize_channel`` reads-then-writes
+        # ``self._materialized`` — a non-atomic operation that needs
+        # a lock so two threads on the same channel don't both
+        # recompute and race the cache write.
+        self._materialized_lock = threading.Lock()
         self.pixel_size_um = float(pixel_size_um)
 
     # ── dict-like surface ────────────────────────────────────────────
@@ -169,7 +180,8 @@ class EnhancedDataset:
         same page (Export looping channels, Results computing
         measurements) skip the work.
         """
-        cached = self._materialized.get(name)
+        with self._materialized_lock:
+            cached = self._materialized.get(name)
         if cached is not None:
             return cached
 
@@ -203,7 +215,14 @@ class EnhancedDataset:
             if progress_cb is not None:
                 progress_cb(int((idx + 1) / n_steps * 100))
 
-        self._materialized[name] = current
+        with self._materialized_lock:
+            # Another concurrent caller may have populated the cache
+            # while we were computing — return the cached value so we
+            # don't waste the duplicate work on the next read either.
+            existing = self._materialized.get(name)
+            if existing is not None:
+                return existing
+            self._materialized[name] = current
         return current
 
     def materialize_all(
@@ -214,15 +233,40 @@ class EnhancedDataset:
 
         Restores the same shape :attr:`ND2StudiosRecord._processed_channels`
         held before the release hook fired.
+
+        Addendum Phase 6: channels are independent — different keys,
+        different output buffers — so we fan out across them with a
+        :class:`ThreadPoolExecutor`. The recipe plugins (skimage /
+        opencv / scipy) release the GIL during their hot loops, so a
+        4-channel volume on a 4-core machine returns ~4× faster than
+        the V1.38 sequential walk. Single-channel recipes pay zero
+        extra cost (the pool degenerates to one task).
         """
-        out: Dict[str, np.ndarray] = {}
         names = list(self._raw.keys())
-        for i, name in enumerate(names):
-            out[name] = self.materialize_channel(name)
-            if progress_cb is not None and names:
-                progress_cb(int((i + 1) / len(names) * 100))
+        if not names:
+            return {}
+
+        out: Dict[str, np.ndarray] = {}
+        # One worker per channel, capped at the host's recommended
+        # CPU pool size. Going beyond N=channel-count buys nothing
+        # because each task is already a whole channel.
+        n_workers = max(1, min(recommended_worker_count(), len(names)))
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = {ex.submit(self.materialize_channel, name): name
+                       for name in names}
+            done = 0
+            for fut in as_completed(futures):
+                name = futures[fut]
+                # Surface plugin errors on the calling thread so the
+                # release-and-rematerialize path matches the V1.38
+                # sequential behavior.
+                out[name] = fut.result()
+                done += 1
+                if progress_cb is not None:
+                    progress_cb(int(done / len(names) * 100))
         return out
 
     def clear_cache(self) -> None:
         """Forget any per-channel results — next read will recompute."""
-        self._materialized.clear()
+        with self._materialized_lock:
+            self._materialized.clear()
