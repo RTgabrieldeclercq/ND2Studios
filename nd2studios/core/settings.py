@@ -34,6 +34,30 @@ class Settings:
     # Custom title bar drag-resize grip thickness
     GRIP_SIZE = 10
 
+    # ── Display backend (V1.36 Phase 4) ─────────────────────────────
+    # Default to the pyqtgraph-backed GPU canvas in
+    # ``MultiAxisViewer``. Falls back to the legacy QLabel canvas if
+    # ``ND2_DISABLE_GPU_DISPLAY=1`` is in the environment, or if
+    # ``GpuImageCanvas`` construction raises at runtime.
+    USE_GPU_DISPLAY = True
+    GPU_DISPLAY_ENV_DISABLE = "ND2_DISABLE_GPU_DISPLAY"
+
+    # ── GPU analysis dispatch (V1.39 Phase 7) ───────────────────────
+    # Off by default — the user must opt in via the Performance dialog
+    # so analysis outputs stay byte-identical to V1.38 unless they
+    # actively choose to route through CuPy / cucim. The env var is
+    # the hard override ("never use GPU, even if the dialog is on").
+    USE_GPU_ANALYSIS = False
+    GPU_ANALYSIS_ENV_DISABLE = "ND2_DISABLE_GPU_ANALYSIS"
+
+    # ── Multi-resolution pyramids (V1.39 Phase 7) ───────────────────
+    # On by default — pyramid builds are background jobs that do not
+    # block the GUI, and the viewer falls back to level 0 gracefully
+    # while the build is in progress. The env var lets the profiling
+    # harness pin the viewer to level 0 for like-for-like measurements.
+    BUILD_PYRAMIDS = True
+    PYRAMID_ENV_DISABLE = "ND2_DISABLE_PYRAMIDS"
+
     # ── Dracula palette (matches CellTracker + Modern_GUI_PyDracula) ──
     BG_PRIMARY = "#282a36"      # main background
     BG_SECONDARY = "#21252b"    # sidebar / top + bottom bars

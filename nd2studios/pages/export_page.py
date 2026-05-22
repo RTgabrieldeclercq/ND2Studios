@@ -265,9 +265,15 @@ class ExportPage(QWidget):
         if self.main_window is None or self.main_window.exp_manager.active is None:
             return
         exp = self.main_window.exp_manager.active
-        # Default to processed if available, raw otherwise.
-        if exp._processed_channels:
+        # Default to processed if available, raw otherwise. V1.38 Phase 6:
+        # ``has_processed()`` returns True when either ``_processed_channels``
+        # (in-RAM) or ``_processed_view`` (lazy after a workspace release)
+        # has data — so the radio defaults stay sensible after a
+        # Recipe → Export navigation that released RAM.
+        has_processed = getattr(exp, "has_processed", lambda: bool(exp._processed_channels))()
+        if has_processed:
             self.rb_proc.setChecked(True)
+            self.rb_proc.setEnabled(True)
         else:
             self.rb_raw.setChecked(True)
             self.rb_proc.setEnabled(False)
@@ -363,8 +369,14 @@ class ExportPage(QWidget):
         if self.main_window is None or self.main_window.exp_manager.active is None:
             return {}, {}, {}, {}
         exp = self.main_window.exp_manager.active
-        if self.rb_proc.isChecked() and exp._processed_channels:
-            channels = exp._processed_channels
+        has_processed = getattr(exp, "has_processed", lambda: bool(exp._processed_channels))()
+        if self.rb_proc.isChecked() and has_processed:
+            # V1.38 Phase 6 — ``processed_view()`` returns the in-RAM
+            # dict when present, else an ``EnhancedDataset`` proxy.
+            # Materialize each channel on access — exports stream
+            # one channel at a time anyway, so peak RAM stays bounded.
+            source = exp.processed_view() if hasattr(exp, "processed_view") else exp._processed_channels
+            channels = {name: source[name] for name in source}
         else:
             # Materialize lazy proxies for export.
             channels = {}

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.ndimage import gaussian_filter, gaussian_laplace
+
+# V1.39 Phase 7: route through the GPU-aware shim. The shim has the
+# same signatures as ``scipy.ndimage.{gaussian_filter, gaussian_laplace}``
+# and falls back to scipy when GPU mode is off, CuPy is missing, or the
+# device runs out of memory — see :mod:`nd2studios.compute.gpu.ops`.
+from nd2studios.compute.gpu.ops import gaussian_filter, gaussian_laplace
 
 
 def resolve_sigma(typical_diameter_px: float) -> tuple[float, float]:

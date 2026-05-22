@@ -291,7 +291,12 @@ class ResultsPage(QWidget):
     def _channels_for_m(self, exp: ND2StudiosRecord, m: int) -> Dict[str, Any]:
         """Return materialised (T, H, W) channel arrays for a single M position."""
         vol = getattr(exp, "_raw_volume", None)
-        if vol is not None and exp._processed_channels is None:
+        # V1.38 Phase 6: ``has_processed()`` is True for both the in-RAM
+        # ``_processed_channels`` dict and a lazy ``_processed_view``
+        # proxy from a workspace release — keep the volume-based fast
+        # path active when *neither* is available.
+        has_processed = getattr(exp, "has_processed", lambda: bool(exp._processed_channels))()
+        if vol is not None and not has_processed:
             z_mode = getattr(exp, "z_view_mode", None) or "max"
             z_index = int(getattr(exp, "z_view_index", None) or 0)
             return {
@@ -300,14 +305,46 @@ class ResultsPage(QWidget):
                 ).materialize()
                 for c_idx, ch_name in enumerate(vol.channel_names)
             }
-        channels = exp._processed_channels or exp._raw_channels or {}
+        source = exp.processed_view() if hasattr(exp, "processed_view") else (
+            exp._processed_channels or exp._raw_channels or {}
+        )
         result: Dict[str, Any] = {}
-        for k, v in channels.items():
+        for k in source:
+            v = source[k]
             if hasattr(v, "materialize") and callable(v.materialize):
                 result[k] = v.materialize()
             else:
                 result[k] = np.asarray(v)
         return result
+
+    # ── V1.38 Phase 6 — workspace rehydrate ──────────────────────────────────
+
+    def _rehydrate_released_label_masks(
+        self, pipeline_name: str, results_by_m: Dict[int, Any],
+    ) -> None:
+        """Refill ``label_masks`` from the workspace if they were released.
+
+        Released results are recognized by an empty ``label_masks`` dict
+        on an otherwise-populated :class:`AnalysisResult`. Reads back
+        from the workspace's Zarr/NPZ artifacts via
+        :meth:`AnalysisStage.rehydrate_m`. If the workspace is
+        unavailable, the method is a no-op and the caller will see the
+        original (likely empty) label masks — same behaviour as V1.37.
+        """
+        if self.main_window is None:
+            return
+        stage = self.main_window.analysis_stage(pipeline_name)
+        if stage is None or not stage.is_committed():
+            return
+        for m, result in results_by_m.items():
+            if result.label_masks:
+                continue
+            fresh = stage.rehydrate_m(m)
+            if fresh is None:
+                continue
+            result.label_masks = fresh.label_masks
+            if fresh.secondary_label_masks:
+                result.secondary_label_masks = fresh.secondary_label_masks
 
     # ── Compute ───────────────────────────────────────────────────────────────
 
@@ -343,6 +380,13 @@ class ResultsPage(QWidget):
                 "No result found for the selected pipeline."
             )
             return
+
+        # V1.38 Phase 6 — if the Analysis page released label masks
+        # after committing them to the workspace, read them back now.
+        # Released results have ``label_masks == {}`` but the
+        # measurements / summary still in RAM; rehydrate fills the
+        # arrays before ``compute_measurements`` needs them.
+        self._rehydrate_released_label_masks(pipeline_name, results_by_m)
 
         metadata = dict(exp.nd2_metadata or {})
         metadata.setdefault("pixel_size_um", exp.pixel_size_um)

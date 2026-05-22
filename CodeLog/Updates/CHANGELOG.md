@@ -4,6 +4,737 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-05-22 (V1.39)
+
+### Added
+
+- **Phase 7 — Optional GPU Acceleration & Multi-Resolution Pyramids**
+  (`nd2studios/compute/gpu/`,
+  `nd2studios/pipeline/stages/pyramid_stage.py`,
+  `nd2studios/compute/pipeline_jobs.py`,
+  `nd2studios/core/main_window.py`,
+  `nd2studios/core/settings.py`,
+  `nd2studios/pages/import_page.py`,
+  `nd2studios/widgets/multi_axis_viewer.py`,
+  `nd2studios/backend/analysis/spots/scale_space.py`,
+  `nd2studios/backend/analysis/tear_detection.py`,
+  `nd2studios/backend/analysis/nuclei_segmentation.py`,
+  `nd2studios/__main__.py`):
+
+  Up to V1.38 every analysis op ran on CPU and every viewer
+  zoom-out painted a full-resolution plane to the texture. Phase 7
+  introduces *two* independently-toggleable optional speedups:
+
+  1. **GPU dispatch for hot analysis ops.** A new
+     `nd2studios.compute.gpu` package wraps the four ops the V1.33
+     profiling baseline flagged as analysis hotspots — `gaussian`,
+     `gaussian_filter`, `gaussian_laplace`, `threshold_otsu` — so
+     they route through CuPy + `cucim.skimage.filters` when GPU
+     mode is on, and through scipy / scikit-image when it is off.
+     Hosts without CuPy installed run exactly as in V1.38 with no
+     warnings; hosts with CuPy fall back gracefully on
+     `cupy.cuda.memory.OutOfMemoryError`, missing `cucim`, or any
+     other GPU runtime failure (one log warning per op the first
+     time it falls back, then silent).
+  2. **Multi-resolution display pyramids.** Each imported file now
+     gets a `pyramid.zarr` artifact in its V1.38 workspace; the
+     viewer reads from a downsampled level when the visible image
+     extent overflows the viewport, so a 4096² source at "fit to
+     window" zoom uploads a 1024² plane instead of the full one.
+     Level 0 is the source ND2 itself (read by the existing
+     `LazyND2Volume`) — the pyramid stores levels 1..N only,
+     keeping disk overhead to ≈ 33 % of source size rather than
+     ≈ 133 %. The build runs as a Phase 5 background `AnalysisJob`,
+     so the GUI stays responsive at level 0 while the pyramid is
+     materialising. Pyramids require `zarr` (already a soft V1.38
+     dep); without it the viewer pins to level 0 and the
+     Performance dialog explains why.
+
+  - New `nd2studios.compute.gpu` package (Qt-free, scipy/skimage
+    re-exports on CPU-only hosts):
+
+    - `detect.py` — `gpu_status()` returns
+      `{available, reason, device_name, memory_gb, cucim}` without
+      raising; `log_gpu_status()` emits a single info line at
+      startup.
+    - `array.py` — module-level `_USE_GPU` bool driven by
+      `configure(use_gpu)` (returns the *effective* value so a
+      requested-True on a CPU-only host stays False). Reads via
+      `is_gpu_enabled()`. Env override `ND2_DISABLE_GPU_ANALYSIS=1`
+      pins the flag to False regardless of the GUI checkbox. A
+      256² array-size floor (`should_dispatch_to_gpu`) prevents
+      tiny-array GPU dispatch where transfer cost dominates.
+    - `ops.py` — the four shape-compatible wrappers. Every function
+      catches the broad set of GPU failures (`OutOfMemoryError`,
+      `cucim` ImportError, NVML/driver runtime errors) and falls
+      back to the CPU implementation, logging once per op name.
+
+  - New `BuildPyramidJob` in `compute/pipeline_jobs.py` — wraps
+    `PyramidStage.build()` into the Phase 5 `JobRunner` so the build
+    is cancellable, progress-reported, and coalesced on the
+    `"pyramid_build"` key. Submitting a new build cancels any
+    in-flight one.
+
+  - New `PyramidStage` + `PyramidReader` in
+    `pipeline/stages/pyramid_stage.py`. `PyramidStage` mirrors
+    `RecipeStage` / `AnalysisStage`: Qt-free, owns a per-level
+    Zarr array `(M, T, Z, C, H_L, W_L)` chunked
+    `(1, 1, 1, 1, H_L, W_L)`. `default_pyramid_levels(h, w)` picks
+    a level count from source dimensions, clamped to `[2, 6]`.
+    `PyramidReader.get_frame(level, c, m, t, z, z_mode)` mirrors
+    `LazyND2Volume.get_frame()` with one extra slot so the
+    viewer's read site dispatches by level with no other branch.
+    `pick_level_for_viewport(screen_px, image_pixels_visible)`
+    returns the smallest level whose width still ≥ the visible
+    extent. Raises `PyramidUnavailable` when `zarr` is missing or
+    the source is too small to benefit (≤ 256 px); callers catch
+    and degrade to level 0.
+
+  - `MainWindow` gains three Phase-7 hooks and one slot:
+    - `pyramid_stage()` — returns a `PyramidStage` for the active
+      session, or `None` when no session is attached, when
+      `ND2_DISABLE_PYRAMIDS=1`, or when `zarr` is missing.
+    - `start_pyramid_build(volume)` — submits a `BuildPyramidJob`
+      and surfaces the status; reattaches the reader if the
+      pyramid is already committed for this source hash.
+    - `_attach_pyramid_reader_to_viewers(reader)` — pushes a
+      `PyramidReader` into every page exposing a `viewer` that
+      implements `attach_pyramid`. Today only the multi-axis
+      viewer does, but the scan is page-agnostic.
+    - `_on_pyramid_job_done(result)` — connected to
+      `JobRunner.job_done`; filters by `result.key == "pyramid_build"`
+      so analysis-preview/commit slots are unaffected. Updates
+      the status text and reattaches the freshly-built reader.
+
+  - `MainWindow._open_performance_settings()` — modal dialog with
+    two checkboxes ("Use GPU acceleration (NVIDIA RTX A4000, 16.0 GB)"
+    and "Build multi-resolution pyramids on import") plus a
+    "Rebuild pyramid for current file" button. The GPU checkbox is
+    disabled with a "GPU not available: <reason>" tooltip on
+    CPU-only hosts; the pyramid checkbox is disabled and tooltipped
+    when `zarr` is missing. OK pushes the values onto
+    `Settings.USE_GPU_ANALYSIS` / `Settings.BUILD_PYRAMIDS` and
+    calls `compute.gpu.configure()`. A new sidebar `⚙ Performance`
+    button next to New / Save / Load opens the dialog.
+
+  - `MultiAxisViewer` extensions:
+    - `attach_pyramid(reader)` / `detach_pyramid()` — bind or unbind
+      a `PyramidReader`. Attach connects
+      `viewbox.sigRangeChanged → _on_viewport_changed` so pyramid
+      level recomputes on every pan/zoom.
+    - `_active_level: int` — 0 means "read from
+      `LazyND2Volume`/IOWorker (V1.38 path)"; ≥ 1 means
+      "synchronously read from `_pyramid_reader.get_frame(level, …)`".
+    - `_frame_cache_key(c)` — returns the V1.38 5-tuple
+      `(c, m, t, z, z_mode)` at level 0 and a 6-tuple
+      `(level, c, m, t, z, z_mode)` at level ≥ 1, so pyramid
+      planes coexist in the cache with level-0 planes without
+      colliding. The V1.38 prefetcher and IOWorker continue
+      reading and writing 5-tuples — they remain level-0-only by
+      design (pyramid planes are small enough to read
+      synchronously without their help).
+    - `_render_current_frame_gpu()` and `_compose_current_frame()`
+      now call `_frame_cache_key(c)` and, on a level-≥-1 miss,
+      take the synchronous pyramid path via `_read_pyramid_plane(c)`.
+      Level-0 misses still flow through the V1.34 IOWorker and
+      V1.35 prefetcher unchanged. The level-change handler bumps
+      the existing `_request_counter` so any in-flight level-0 IO
+      worker plane arriving after the switch is silently dropped
+      by `_on_io_plane_ready`, exactly as a stale slider would be.
+
+  - `ImportPage._on_confirm`'s `_attach_workspace_and_maybe_resume`
+    path now calls a new `_kick_off_pyramid(exp)` helper after the
+    workspace is attached. The helper:
+    - no-ops when `Settings.BUILD_PYRAMIDS` is False, when no raw
+      volume is bound to the experiment, or when
+      `MainWindow.pyramid_stage()` returns `None`;
+    - submits a `BuildPyramidJob` when the source has no committed
+      pyramid yet; or
+    - reattaches the existing `PyramidReader` to the viewer when a
+      prior pyramid is already on disk for this source hash.
+
+  - Hot analysis backends switched to GPU-aware shims:
+    - `backend/analysis/spots/scale_space.py` — imports
+      `gaussian_filter` and `gaussian_laplace` from
+      `compute.gpu.ops` instead of `scipy.ndimage`. Same
+      signatures; CPU pass-through when GPU is off.
+    - `backend/analysis/tear_detection.py` — imports `gaussian`
+      and `threshold_otsu` from `compute.gpu.ops` instead of
+      `skimage.filters`.
+    - `backend/analysis/nuclei_segmentation.py` —
+      `models.Cellpose(gpu=is_gpu_enabled())`. Cellpose owns its
+      own CUDA setup; we just forward the flag. Failure to import
+      the GPU module on a CPU-only host leaves
+      `use_gpu = False` and Cellpose runs on CPU as before.
+
+  - `__main__.py` — after `QApplication` instantiation calls
+    `log_gpu_status()` (one info line summarising availability)
+    and `configure(Settings.USE_GPU_ANALYSIS)` (defaulting to
+    False). Both are wrapped in a broad `try/except` so a
+    misbehaving GPU runtime cannot block startup.
+
+  - `Settings` additions:
+    - `USE_GPU_ANALYSIS = False` — off by default; user opts in
+      via the Performance dialog.
+    - `GPU_ANALYSIS_ENV_DISABLE = "ND2_DISABLE_GPU_ANALYSIS"` —
+      env override that pins the flag to False.
+    - `BUILD_PYRAMIDS = True` — on by default; the build is a
+      background job and the GUI stays responsive while it runs.
+    - `PYRAMID_ENV_DISABLE = "ND2_DISABLE_PYRAMIDS"` — env
+      override that suppresses both build submission and reader
+      attachment, pinning the viewer to level 0 (used by the
+      profiling harness for like-for-like measurements).
+
+### Changed
+
+- `nd2studios/pipeline/__init__.py` re-exports `PyramidStage`,
+  `PyramidReader`, `PyramidUnavailable`, `default_pyramid_levels`.
+- `nd2studios/compute/__init__.py` re-exports `BuildPyramidJob`.
+- The frame cache (V1.35) now coexists with level-tagged 6-tuple
+  keys at level ≥ 1 alongside the legacy 5-tuple keys at level 0;
+  the cache itself is unchanged — it has always treated keys as
+  opaque tuples — but the viewer's pin/unpin bookkeeping clears
+  on level transitions so pyramid planes do not displace source
+  planes when the user zooms back in.
+
+### Notes
+
+- Pyramids are an optional speedup, not a correctness change.
+  Analysis pipelines always receive full-resolution channel data;
+  the pyramid is read by the multi-axis viewer only.
+- GPU mode is opt-in even when CuPy is installed, so analysis
+  outputs stay byte-identical to V1.38 unless the user explicitly
+  flips the Performance dialog checkbox.
+- Optional dependencies (not added to `requirements.txt` as hard
+  pins because `version_push.py` regenerates that file from
+  `pip freeze`): `cupy-cuda12x` (or matching CUDA version),
+  `cucim-cu12`. `zarr` is shared with V1.38; `cellpose` continues
+  to be optional via the existing `find_spec` guard.
+
+## [Unreleased] - 2026-05-22 (V1.38)
+
+### Added
+
+- **Phase 6 — Pipeline Workspace with Per-Source Stage Commits**
+  (`nd2studios/pipeline/`, `nd2studios/core/main_window.py`,
+  `nd2studios/core/experiment_manager.py`,
+  `nd2studios/pages/import_page.py`, `nd2studios/pages/recipe_page.py`,
+  `nd2studios/pages/analysis_page.py`,
+  `nd2studios/pages/results_page.py`,
+  `nd2studios/pages/export_page.py`):
+
+  Up to V1.37 every stage of a session lived in RAM at once: raw
+  channels, processed channels (full `(T, H, W)` per channel),
+  per-pipeline label masks `(T, H, W)` int32 per channel × per M.
+  On a 200-frame 2048² 3-channel ND2 with two committed analyses,
+  that's >5 GiB of int32 labels alone — and there was no on-disk
+  copy, so a navigation that "should have" freed RAM didn't, and
+  re-opening the same file later re-ran every stage from scratch.
+
+  Phase 6 introduces an automatic per-source-file workspace and
+  two stage adapters that flush committed outputs to disk so the
+  in-RAM copies can be released without losing the work.
+
+  - New `nd2studios.pipeline` package (Qt-free; sits next to
+    `compute/`):
+
+    - `Session` (`session.py`) — owns one workspace directory per
+      source file, keyed by `hash_source_file(path)` (first MiB +
+      last MiB + size + mtime; sha-256 truncated to 16 hex chars).
+      Default root `~/.nd2studios/workspace/sessions/`, overridable
+      via `ND2STUDIOS_WORKSPACE`. `SessionManifest` + `StageRecord`
+      are plain dataclasses serialized to `manifest.json` alongside
+      the artifacts. `archive(suffix)` renames the session dir to
+      `<hash>.archived-<timestamp>/` for the Import page's "Start
+      fresh" branch.
+    - `PipelineStage` ABC (`stage.py`) — Qt-free; subclasses
+      implement `commit()` returning a `StageRecord`. Stages do not
+      own threads or timers; commits run on the GUI thread after a
+      worker has produced the heavy data, and the I/O is small
+      (JSON manifest + one label-stack write per M).
+    - `storage.py` — `write_label_stack(path, arr)` /
+      `read_label_stack(path)` / `open_label_stack(path)` with a
+      Zarr-or-NPZ fallback. `zarr` is optional: when present, label
+      stacks are chunked `(1, H, W)` and zstd-3 compressed; when
+      absent, NPZ is used (already in the dependency surface via
+      `ND2StudiosManager.save_session`). `HAS_ZARR` exposes the
+      decision to callers.
+    - `RecipeStage` (`stages/recipe_stage.py`) — parameter-only
+      commit: writes the accepted recipe to `recipe/recipe.json`
+      and stamps the manifest. No `processed.zarr` is materialized
+      by default — `EnhancedDataset` lazily reapplies the recipe
+      on a per-channel basis when the Export / Analysis / Results
+      pages ask for processed channels after the Recipe page has
+      released them from RAM.
+    - `EnhancedDataset` (`stages/recipe_stage.py`) — dict-like
+      proxy over raw channels + recipe; `materialize_channel(name)`
+      runs the plugin chain via `PluginBase` (matching
+      `RecipeWorker`'s logic) and caches per-channel results.
+      Peak RAM during a re-derivation is one channel rather than
+      `n_channels`.
+    - `AnalysisStage` (`stages/analysis_stage.py`) — per-pipeline
+      stage. `commit_m(m, AnalysisResult)` streams one M's label
+      masks (primary + secondary) to
+      `analysis/<pipeline>/m_NNN/labels_<channel>.{zarr,npz}` and
+      writes a small `summary.json` per M with measurements +
+      overlay defaults + serialised
+      `volumetric_voxel_counts`. `rehydrate_m(m)` reads them back
+      as a fresh `AnalysisResult`; `open_label_lazy(m, channel)`
+      hands out a zarr `Array` so the Results page can stream
+      slices for a measurements computation.
+
+  - `MainWindow.__init__` now also owns `self.session: Optional[Session]`,
+    plus three helpers:
+
+    - `attach_session_for(filepath)` — called by the Import page
+      after a successful load; creates or reuses the workspace and
+      stamps the manifest's shape (`n_t`, `n_m`, `n_z`,
+      `n_channels`, dims, pixel size, channel names).
+    - `recipe_stage()` / `analysis_stage(name)` — convenience
+      constructors used by the pages so the touchpoints don't need
+      to import `pipeline.stages`.
+    - `_release_outgoing_stage(page_key)` — called from
+      `_navigate` after `save_to_experiment`. When the outgoing
+      page is `recipe` and the workspace has a committed recipe,
+      swaps `exp._processed_channels` for an `EnhancedDataset`
+      proxy (`exp._processed_view`) and drops the dict. When the
+      outgoing page is `analysis`, clears `label_masks` /
+      `secondary_label_masks` on every `AnalysisResult` whose M
+      position is committed to the workspace.
+
+  - `ND2StudiosRecord` gains two accessors that hide the dict /
+    proxy duality from consumers:
+
+    - `processed_view()` — returns the in-RAM `_processed_channels`
+      if present, else `_processed_view` (the `EnhancedDataset`),
+      else `_raw_channels`. Dict-like in all cases.
+    - `has_processed()` — True when either source is available.
+    - New non-serialized field `_processed_view`.
+
+  - `ImportPage._on_confirm` attaches the workspace via
+    `MainWindow.attach_session_for(filepath)`. If prior commits are
+    found, a single `QMessageBox.question` offers
+    **Resume / Start fresh**. Resume re-populates the active
+    `ND2StudiosRecord` with the prior recipe (promoting status to
+    `preprocessed`) and per-pipeline `AnalysisResult`s — no rerun
+    needed. Start fresh archives the prior session dir.
+
+  - `RecipePage._on_accept` now calls `_commit_recipe_stage()`
+    after appending the new step; the workspace receives the
+    canonical recipe at every Accept. The actual `_processed_channels`
+    release is gated on the page-leave hook in `MainWindow._navigate`
+    so the right-side preview stays live while the user is still
+    on the Recipe page. `on_activated()` rehydrates from the
+    `EnhancedDataset` proxy (running `materialize_all()`) when the
+    user returns from a downstream page.
+
+  - `AnalysisPage._on_finished` now also calls
+    `_commit_analysis_m(pipeline, m, result)` on every M-completion,
+    so multi-M runs stream label masks to disk as they go rather
+    than holding all M's in RAM until the queue drains. The
+    multi-M state machine, the Phase 5 commit / cancel keys, and
+    the per-M results dict are unchanged. `_finalize_analysis_stage()`
+    stamps the manifest record once the queue is empty.
+    `on_activated()` runs the same EnhancedDataset materialize as
+    the Recipe page so the multi-axis viewer sees a normal dict.
+
+  - `ResultsPage._on_compute` calls
+    `_rehydrate_released_label_masks(pipeline, results_by_m)`
+    before `compute_measurements`. Released results have empty
+    `label_masks` but populated `measurements` / `summary` —
+    rehydrate refills the arrays from the workspace (Zarr or NPZ)
+    so the Results page works identically whether the masks were
+    released or not.
+
+  - `ExportPage.on_activated` and `_channels_to_export` use
+    `has_processed()` / `processed_view()` so the "Processed"
+    radio stays enabled after a Recipe → Export navigation that
+    released RAM. Per-channel materialization happens at write
+    time, one channel at a time, so peak RAM during a movie export
+    is unchanged from V1.37.
+
+- **Workspace escape hatches.** Setting
+  `ND2STUDIOS_DISABLE_WORKSPACE=1` makes
+  `MainWindow.attach_session_for` a no-op and the release hooks
+  short-circuit, restoring V1.37 behaviour exactly. Setting
+  `ND2STUDIOS_WORKSPACE=/path/to/dir` scopes the workspace root
+  (used by the profiling harness and tests).
+
+### Notes
+
+- `.nd2s` save/load is unchanged. The workspace is automatic and
+  independent: a `.nd2s` saved on machine A and loaded on machine
+  B without the source file (or with a workspace miss) behaves
+  exactly as in V1.37.
+- `zarr` is treated as an optional install. When absent, label
+  stacks fall back to NPZ; no other code path notices.
+- No `requirements.txt` bump is mandatory; `pip install zarr`
+  is recommended for users with large analyses (multi-GiB label
+  stacks compress 5–20× with zstd-3).
+- Long-running QThread workers (`RecipeWorker`, `BatchWorker`,
+  `LoadWorker`, `PrefetchWorker`, `IOWorker`, `StitchWorker`) are
+  unchanged. `BatchWorker` does not write to the workspace yet —
+  see Phase 6 plan, "Out of scope".
+
+## [Unreleased] - 2026-05-22 (V1.37)
+
+### Added
+
+- **Phase 5 — Background Analysis with Cancellation: project-wide
+  `JobRunner`, parameter-driven previews, cooperative cancellation
+  tokens** (`nd2studios/compute/`, `nd2studios/core/main_window.py`,
+  `nd2studios/pages/analysis_page.py`):
+
+  Up to V1.36 the Analysis page's "Screen frame" preview re-ran only
+  when the user moved the T/M/Z slider — dragging a Histogram
+  Threshold cutoff or Spots `min_sigma` left the overlay stale until
+  the next viewer-coord change. Cancellation used a plain bool flag
+  on `BaseWorker`, with no memory barrier between threads, and there
+  was no coordinated drain on app exit. Phase 5 layers a small,
+  additive coordination module on top of the existing
+  `BaseWorker` / `AnalysisWorker` plumbing without ripping it out.
+
+  - New `nd2studios.compute` package:
+
+    - `CancellationToken` (`cancellation.py`) — `threading.Event`-backed,
+      with both `is_cancelled()` (matches the existing
+      `AnalysisPipeline.run(cancelled_cb=...)` contract) and
+      `check()` (raises `CancelledError` for cooperative unwind).
+    - `ProgressReporter` (`progress.py`) — `QObject` with a single
+      `progress(key, fraction, message)` signal. The
+      `as_pipeline_progress_cb()` adapter hands back a 0–100 int
+      callable so existing pipelines stay verbatim.
+    - `AnalysisJob` ABC + frozen `JobResult` dataclass (`jobs.py`).
+      Subclasses fill in `run(progress)`; the token gives them
+      cooperative cancellation.
+    - `JobRunner` (`runner.py`) — `QThreadPool`-backed dispatcher
+      sized by `recommended_worker_count()`. `submit(job)` coalesces
+      by key: a fresh submission cancels any in-flight job sharing
+      the same key. Public signals `job_done(JobResult)`,
+      `job_cancelled(str)`, `job_progress(str, float, str)` are
+      auto-connected to the GUI thread. `shutdown(wait_ms)` drains
+      the pool on app close.
+    - `ResultStore` (`result_store.py`) — `RLock`-guarded keyed dict
+      for caching preview/commit outputs. Phase 6 will sit a Zarr
+      store in front of it for bounded-RAM commits.
+    - `PipelinePreviewJob` / `PipelineCommitJob` (`pipeline_jobs.py`)
+      — adapters that bridge any `AnalysisPipeline` to the runner.
+      Preview runs the pipeline on a `(1, H, W)` frame; Commit runs
+      it on a full `(T, H, W)` stack for one M position. Both pass
+      `token.is_cancelled` as `cancelled_cb` and
+      `progress.as_pipeline_progress_cb()` as `progress_cb`, so no
+      concrete pipeline (Histogram Threshold, Nuclei, Tear, Spots,
+      Manual Mask) needs to change.
+
+  - `MainWindow.__init__` now constructs `self.job_runner = JobRunner(self)`
+    before any page is built; `closeEvent` calls
+    `job_runner.shutdown(wait_ms=3000)` and `page.on_close()` so the
+    app drains workers cleanly and no longer prints
+    `QThread: Destroyed while thread is still running` on exit.
+
+  - `AnalysisPage` routes both tiers through the runner:
+
+    - `param_editor.params_changed` now restarts the 300 ms screen
+      debounce, so dragging a threshold slider re-screens the
+      current frame automatically (gated by the Auto-screen
+      checkbox, same as viewer-coord changes).
+    - `_screen_current_frame()` builds a `PipelinePreviewJob` under
+      key `"analysis_preview"` and submits to the runner instead of
+      starting an ad-hoc `AnalysisWorker` and connecting per-launch
+      lambdas. The runner's coalescing replaces the hand-rolled
+      `_cancel_screen()` dance.
+    - `_start_next_m_run()` builds a `PipelineCommitJob` under key
+      `"analysis_commit"` and submits, preserving the existing
+      multi-M state machine (`_run_queue`, `_results_per_m`,
+      `_on_finished`, `_on_error`).
+    - Cancel now calls `runner.cancel("analysis_commit")` and the
+      progress bar advances via `job_progress` instead of a
+      per-worker `progress` signal.
+    - New `on_close()` stops the debounce timer so it cannot fire
+      during the runner's drain window.
+
+- **`nd2studios.workers.analysis_worker.AnalysisWorker` marked
+  deprecated** in its docstring — the class is retained because no
+  out-of-tree caller has been audited and `RecipeWorker` /
+  `BatchWorker` still use the `BaseWorker` lifecycle. New analysis
+  code should submit through the runner.
+
+### Notes
+
+- Long-running QThread workers (`RecipeWorker`, `BatchWorker`,
+  `LoadWorker`, `PrefetchWorker`, `IOWorker`, `StitchWorker`) are
+  **unchanged** in V1.37. Each owns a file-handle or recipe-pipeline
+  lifecycle that fits the long-lived `QThread` model better than a
+  short pool job. A later phase will revisit.
+- No `.nd2s` schema migration; no recipe format change; no new
+  external dependency (`psutil` was pinned in Phase 2).
+
+## [Unreleased] - 2026-05-22 (V1.36)
+
+### Added
+
+- **Phase 4 — pyqtgraph GPU-Accelerated Display: per-channel `ImageItem`
+  layers, additive composition, GPU LUT + levels** (`nd2studios/widgets/gpu_image_canvas.py`,
+  `nd2studios/widgets/multi_axis_viewer.py`, `nd2studios/core/settings.py`,
+  `nd2studios/__main__.py`):
+
+  Up to V1.35, the multi-axis viewer's render path was per-pixel CPU
+  work on the GUI thread: `apply_lut(frame, lo, hi, gamma)` →
+  multiply by per-channel RGB color → accumulate float32 → clip to
+  uint8 → `QImage` → `QPixmap`. With Phase 3 delivering cache hits
+  sub-millisecond, this composite step had become the dominant cost
+  for LUT drag, channel toggle, and slider scrub.
+
+  - New `nd2studios.widgets.gpu_image_canvas.GpuImageCanvas` hosts a
+    `pyqtgraph.GraphicsLayoutWidget` + `ViewBox` with one
+    `pg.ImageItem` per channel. Each `_ChannelLayer` owns a 256-entry
+    colored LUT (black → channel color) plus `(lo, hi)` levels;
+    `CompositionMode_Plus` makes Qt sum the channels additively.
+    `update_channel(c, plane)`, `set_channel_visible(c, on)`,
+    `set_channel_color(c, rgb)`, and `set_channel_levels(c, (lo, hi))`
+    are the per-channel hot-path API. A composite-fallback
+    `ImageItem` accepts pre-composed RGB arrays via `set_image(rgb)`
+    for callers that already produce RGB (export preview, the
+    `set_frame_post_process` hook).
+
+  - Tool parity with the legacy `ImageCanvas`: `crop_rect_selected`,
+    `shape_drawn`, `vertex_moved`, `edit_committed`, `clicked`,
+    `zoom_changed`, `pan_mode_changed` signals are emitted with the
+    same payloads. `set_crop_mode`, `set_draw_mode("rect"|"ellipse"|
+    "polygon"|None)`, `set_edit_vertices([(iy, ix), ...])`, and
+    `set_pan_mode(on)` route through a `_ToolOverlayItem`
+    (`QGraphicsItem`) that paints crop/draw/edit overlays in scene
+    coordinates. Press/move/release goes through a viewport
+    `eventFilter`; the active tool short-circuits ViewBox pan so
+    drags don't fight. `widget_to_image` / `image_to_widget` reuse
+    pyqtgraph's `viewbox.mapSceneToView` / `mapFromView` so
+    coordinate math stays correct under pan/zoom.
+
+  - `MultiAxisViewer.__init__` defensively constructs
+    `GpuImageCanvas` when `Settings.USE_GPU_DISPLAY` is True (default)
+    and falls back to the legacy `ImageCanvas` if construction
+    raises, mirroring the same defensive pattern used elsewhere in
+    the codebase. The env override `ND2_DISABLE_GPU_DISPLAY=1`
+    forces the legacy path without code edits.
+
+  - `MultiAxisViewer._do_refresh` branches on `_use_gpu_canvas`. The
+    new `_render_current_frame_gpu` walks each chip, sets visibility
+    / color / levels on the GPU canvas, and pushes raw 2-D planes
+    via `canvas.update_channel`. Cache misses are dispatched to the
+    V1.34 `IOWorker` exactly as in the CPU branch — the IO
+    contract did not change. When a post-process hook is attached
+    (a CPU operation that expects `(H, W, 3) uint8`) the viewer
+    falls back to `_compose_current_frame` + `canvas.set_image`; the
+    GPU canvas's composite-fallback layer is engaged automatically.
+
+  - Pin/unpin bookkeeping ([Phase 3 pinning] from V1.35) carries
+    over to the GPU branch — on-screen planes are still exempt from
+    LRU eviction. Velocity-biased prefetch is also triggered on
+    every GPU refresh.
+
+  - `__main__` configures pyqtgraph globally before any canvas is
+    constructed: `imageAxisOrder="row-major"` (numpy `(H, W)` displays
+    upright without transpose), `useOpenGL=False` (safer on
+    Windows/RDP; can be flipped after benchmarking), `antialias=False`,
+    `background=Settings.BG_SECONDARY`. The block is wrapped in a
+    try/except so an absent pyqtgraph still launches the legacy path.
+
+### Changed
+
+- **`Settings`**: adds `USE_GPU_DISPLAY = True` and
+  `GPU_DISPLAY_ENV_DISABLE = "ND2_DISABLE_GPU_DISPLAY"` so the new
+  display backend is opt-out via env, not a code edit.
+
+### Known limitations
+
+- The GPU path applies linear `(lo, hi)` levels only; per-channel
+  `gamma` from `LutHistogramWidget` is silently ignored on the GPU
+  branch in V1.36. A 256-entry LUT per `(color × gamma)` pair is a
+  cheap follow-up but doesn't ship in this version — the McGhee Lab
+  uses gamma rarely. Sessions with a non-1.0 gamma will still
+  display, just without the gamma curve until the GPU LUT generator
+  is extended.
+- Other display surfaces — `export_preview_dialog`, the recipe page's
+  embedded `ImageViewer`, the stitch dialog — continue to use the
+  legacy `ImageCanvas`. The multi-axis viewer (the hot path) is
+  where the win is and where Phase 4 lands; other surfaces migrate
+  incrementally in later versions.
+
+## [Unreleased] - 2026-05-22 (V1.35)
+
+### Added
+
+- **Phase 3 — Frame Cache & Prefetcher: pinning, stats, velocity-aware lookahead**
+  (`nd2studios/backend/frame_cache.py`, `nd2studios/workers/prefetch_worker.py`,
+  `nd2studios/widgets/multi_axis_viewer.py`):
+
+  V1.17 shipped a byte-budgeted `FrameCache` and a `PrefetchManager`;
+  V1.34 grew the cache budget from a hard-coded 300 MB to a fraction
+  of available RAM. Three Phase-3-specific gaps remained:
+  (1) the prefetcher's ±5 T window was symmetric regardless of which
+  direction the user was scrubbing; (2) the cache evicted strictly by
+  LRU, so the on-screen plane could be displaced by its own neighbors
+  on a tight budget; (3) there was no way to ask the cache how it was
+  doing.
+
+  - `FrameCache` gains a `CacheStats` dataclass (hits, misses,
+    evictions, current_bytes, peak_bytes, hit_rate) updated under the
+    existing thread lock and readable from any thread; `pin(key)` /
+    `unpin(key)` / `is_pinned(key)` that exempt a key from eviction;
+    `set_max_bytes(n)` to resize the budget on the fly;
+    `current_bytes` / `max_bytes` / `__len__` accessors. Every cached
+    array is now marked `writeable=False` on insert so an accidental
+    in-place mutation downstream fails loudly with `ValueError`
+    instead of silently corrupting the next hit. `clear()` drops both
+    entries and pins. Eviction skips pinned entries and breaks out of
+    the loop when only pins remain — accepting a temporary over-budget
+    state rather than evicting a displayed plane (the trade Phase 3
+    deliberately makes).
+
+  - `PrefetchManager` gains a velocity-biased T-axis window. The
+    manager tracks the previous `(m, t, z, z_mode)` and its
+    `time.perf_counter()` timestamp and derives a T-axis velocity in
+    planes/sec from successive `request_neighbors` calls. Forward
+    scrubs (≥ +1 planes/sec) widen the window to `[t - 2, t + radius_t]`;
+    backward scrubs widen the opposite side; a stop falls back to a
+    symmetric `radius_t // 2` window. A 1.5 s TTL on the previous-focus
+    timestamp resets the bias after an idle pause. `radius_t` and
+    `radius_z` are now constructor parameters (defaults stay at 5 for
+    back-compat with V1.17 callers and unit tests).
+
+  - `MultiAxisViewer` (1) picks `radius_t` adaptively from
+    `nd2studios.utils.resources.detect().available_ram_gb` (2 below
+    2 GB free, 4 below 8 GB, 8 above) and passes it to
+    `PrefetchManager`; (2) tracks `_pinned_keys: set[tuple]` and
+    pin/unpin-diffs the displayed channel keys around every
+    successful `_compose_current_frame` so the on-screen composite's
+    contributing planes are exempt from eviction; (3) clears
+    `_pinned_keys` on `set_volume`, `set_channels`, and inside
+    `_teardown_io_worker`'s callers; (4) gains a `cache_stats_text()`
+    helper returning `"Cache: <used>/<budget> MB · hit <rate>% ·
+    evictions <n>"` for the V1.33 profiling harness and a future
+    status-bar tooltip; (5) drops the V1.17 `n=5` override on
+    `PrefetchManager.request_neighbors` so the manager's adaptive
+    radius takes effect.
+
+  Plan: `CodeLog/ClaudesPlan/V1.35_phase3_frame_cache_prefetch.md`.
+
+## [Unreleased] - 2026-05-22 (V1.34)
+
+### Added
+
+- **Phase 2 — Lazy Loading & Threading: foreground I/O worker + adaptive frame cache**
+  (`nd2studios/utils/resources.py`, `nd2studios/utils/threading.py`,
+  `nd2studios/widgets/multi_axis_viewer.py`):
+
+  V1.33 profiling confirmed that despite the V1.0 worker model and the
+  V1.17 prefetcher, one synchronous read path still lived on the GUI
+  thread: every cache miss inside
+  :meth:`MultiAxisViewer._compose_current_frame` called
+  ``volume.get_frame(...)`` inline, so every fresh slider movement
+  blocked the Qt event loop for ``n_channels`` disk reads + Z-projection
+  + decode. The :class:`PrefetchManager` only filled the cache for
+  *neighbors* of the previous coords, not the plane the user was about
+  to display. This phase closes that gap and also lifts the
+  hard-coded 300 MB cache budget the V1.17 :class:`FrameCache` shipped
+  with.
+
+  - New :mod:`nd2studios.utils.resources` (backend-pure, no Qt) —
+    :class:`SystemResources` dataclass + :func:`detect`,
+    :func:`recommended_cache_budget_bytes` (default reserves 60% of
+    *available* RAM, hands 40% to caches, floored at 64 MB),
+    :func:`recommended_worker_count` (physical cores capped at 8).
+    Single source of truth for "available RAM" / "physical core count"
+    used by Phase 2 cache sizing and ready for Phase 3 / 5 / 6 / 7.
+
+  - New :mod:`nd2studios.utils.threading` (Qt boundary) —
+    :class:`PlaneRequest` dataclass with :class:`~queue.PriorityQueue`-
+    friendly ordering (priority + monotonic ID), :class:`IOWorker`
+    (a :class:`QObject` moved to a dedicated :class:`QThread` with
+    ``plane_ready(request_id, key, ndarray)`` / ``error(request_id,
+    msg)`` signals), and :func:`start_io_worker(volume)` that wires
+    a fresh thread + ``volume.reopen()`` handle. Handle ownership
+    matches the existing :class:`PrefetchManager` convention — one
+    ``nd2.ND2File`` per thread, never shared. Normalization to 2-D
+    runs on the worker thread so the GUI slot stays trivial.
+
+  - :class:`MultiAxisViewer` now (1) sizes its :class:`FrameCache` from
+    :func:`recommended_cache_budget_bytes` instead of the V1.17 300 MB
+    constant — on a 32 GB workstation with ~16 GB free the cache grows
+    to ≈ 6.4 GB, twenty times the old cap, trading the RAM the user
+    has spare for fewer scrub misses; (2) starts an :class:`IOWorker`
+    alongside the :class:`PrefetchManager` on every ``set_volume()``,
+    via the same volume ``reopen()`` factory; (3) replaces the inline
+    ``volume.get_frame(...)`` cache-miss path in
+    ``_compose_current_frame`` with a :meth:`IOWorker.submit` enqueue
+    + ``cancel_all()`` of any stale foreground requests + bump of
+    ``_latest_request_id``; (4) gains ``_on_io_plane_ready`` /
+    ``_on_io_error`` / ``_teardown_io_worker`` slots. Stale
+    ``plane_ready`` results still populate the cache (so an
+    out-of-order arrival is not wasted work) but only redraw the
+    canvas when ``request_id == self._latest_request_id``.
+    ``set_channels`` (Recipe page path) and ``set_volume(None)`` both
+    teardown the worker the same way they already teardown the
+    prefetcher; ``_teardown_io_worker`` bumps the gating counter so
+    in-flight planes arriving after teardown can't sneak a redraw.
+
+  - The previous-frame stays on the canvas during the brief window
+    where the worker is still reading — no flash, no synthetic
+    placeholder. Slider input remains responsive across the whole
+    gesture; the *displayed* frame may lag by one composite, which is
+    the trade Phase 2 deliberately makes.
+
+  Plan: `CodeLog/ClaudesPlan/V1.34_phase2_lazy_loading_threading.md`.
+
+## [Unreleased] - 2026-05-22 (V1.33)
+
+### Added
+
+- **Phase 1 — Profiling & Measurement Baseline harness**
+  (`nd2studios/utils/profiling.py`, `profiling/`):
+
+  Backend-pure profiling helpers and a `profiling/` directory of
+  driver scripts that capture a reproducible performance snapshot of
+  the running application. No production code paths are modified;
+  everything new is opt-in and lives outside `nd2studios/` except for
+  a Qt-free helper module.
+
+  - New :mod:`nd2studios.utils.profiling` exposes :class:`Measurement`
+    (wall / CPU ms, RSS before / after / peak, Python-allocation peak,
+    extra dict) and a :func:`measure` context manager built on
+    :mod:`time.perf_counter`, :mod:`tracemalloc`, and :mod:`psutil`.
+    :func:`fps_from_durations` turns per-frame ms into mean / p50 /
+    p99 FPS and latency stats. Backend-pure — no PySide6 import.
+
+  - New `profiling/harness/` package with one scenario per category:
+    `scenario_load.py` (cold open + first frame on
+    :class:`LazyND2Volume` / :class:`LazyMultiFileTIFFVolume`),
+    `scenario_scrub.py` (per-frame `get_frame()` latency walking T / Z
+    / M), `scenario_tab_switch.py` (offscreen Qt — instantiates
+    :class:`MainWindow`, walks every key in :data:`Settings.PAGES`
+    via ``_navigate()`` 12× and times each), and
+    `scenario_analysis.py` (runs every registered
+    :class:`AnalysisPipeline` on a deterministic 32 × 256 × 256
+    synthetic channel so the scenario succeeds without lab data).
+
+  - `profiling/harness/run_all.py` aggregates all four scenarios and
+    writes a single ``profiling/baselines/<label>.json`` snapshot
+    keyed by a CLI-provided label so subsequent phases can re-run and
+    diff. Snapshot embeds platform / CPU / RAM via :mod:`psutil`.
+
+  - Test files are opt-in via the ``PROFILING_TEST_DATA_DIR``
+    environment variable (fallback ``~/profiling_data``). Scenarios
+    skip cleanly when expected ND2 / TIFF files are missing so a
+    clean checkout can still produce a snapshot (tab-switch and
+    analysis scenarios both run without lab data).
+
+  - `profiling/README.md` documents how to run the harness, drop in
+    real lab files, and capture optional py-spy flamegraphs into
+    `profiling/reports/`. Generated JSON / SVG / .prof outputs are
+    gitignored; `.gitkeep` files preserve the directories.
+
+  Plan: `CodeLog/ClaudesPlan/V1.33_phase1_profiling_baseline.md`.
+
 ## [Unreleased] - 2026-05-21 (V1.32)
 
 ### Bug Fixes

@@ -23,11 +23,14 @@ from scipy.ndimage import (
     uniform_filter,
     zoom,
 )
-from skimage.filters import gaussian, threshold_otsu
 from skimage.filters.rank import entropy as rank_entropy
 from skimage.measure import label as skimage_label, regionprops
 from skimage.morphology import disk
 
+# V1.39 Phase 7: route ``gaussian`` and ``threshold_otsu`` through the
+# GPU-aware shim. Identical signatures to ``skimage.filters``; falls
+# back to skimage when GPU mode is off or unavailable.
+from nd2studios.compute.gpu.ops import gaussian, threshold_otsu
 from nd2studios.core.analysis_registry import AnalysisPipeline, AnalysisResult
 from nd2studios.core.plugin_registry import ParamSpec
 

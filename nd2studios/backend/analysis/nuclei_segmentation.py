@@ -86,6 +86,16 @@ class NucleiSegmentationPipeline(AnalysisPipeline):
         from cellpose import models  # type: ignore[import]
         from skimage.measure import regionprops  # already a project dependency
 
+        # V1.39 Phase 7: honour the runtime GPU flag. Cellpose owns
+        # its own CUDA initialization; we only forward the boolean.
+        # Failure to import the GPU module (CPU-only environment)
+        # leaves ``use_gpu = False`` and Cellpose runs on CPU as before.
+        try:
+            from nd2studios.compute.gpu import is_gpu_enabled
+            use_gpu = bool(is_gpu_enabled())
+        except Exception:  # noqa: BLE001
+            use_gpu = False
+
         # ── Resolve channel ──────────────────────────────────────────────────
         channel_name = params.get("channel_name", "")
         if channel_name not in channels:
@@ -108,7 +118,7 @@ class NucleiSegmentationPipeline(AnalysisPipeline):
         if progress_cb:
             progress_cb(0)
 
-        model = models.Cellpose(model_type=model_type, gpu=False)
+        model = models.Cellpose(model_type=model_type, gpu=use_gpu)
 
         label_stack = np.zeros((T, H, W), dtype=np.int32)
         measurements: List[Dict[str, Any]] = []

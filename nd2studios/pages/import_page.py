@@ -567,3 +567,124 @@ class ImportPage(QWidget):
 
         self.main_window.exp_manager.set_status("imported")
         self.main_window.set_status_text("Imported.")
+
+        # V1.38 Phase 6 — attach the per-source workspace and surface
+        # any prior commits to the user. Failure (workspace disabled,
+        # write-protected ``~``) downgrades to a status note rather
+        # than blocking the import.
+        self._attach_workspace_and_maybe_resume(exp)
+
+    def _attach_workspace_and_maybe_resume(self, exp: ND2StudiosRecord) -> None:
+        """Open the Phase 6 workspace for the imported file.
+
+        If a prior recipe or analysis commit exists, prompt the user
+        once with a Resume / Start fresh choice. Resume rehydrates the
+        recipe (so the Recipe page lands ready to Trial) and the
+        Results page (so measurements come back without rerun).
+        Start fresh archives the prior session dir to
+        ``<hash>.archived-<timestamp>`` and starts clean.
+        """
+        if self._filepath is None or self.main_window is None:
+            return
+        session = self.main_window.attach_session_for(self._filepath)
+        if session is None:
+            return
+
+        # V1.39 Phase 7: kick off the pyramid build (or reattach an
+        # existing one) regardless of whether the user resumes prior
+        # recipe / analysis state. The build is fire-and-forget — the
+        # GUI remains responsive at level 0 until it completes.
+        self._kick_off_pyramid(exp)
+
+        prior_recipe = session.is_committed("recipe")
+        prior_analyses = [
+            name for name in session.manifest.stages
+            if name.startswith("analysis:")
+            and session.is_committed(name)
+        ]
+        if not (prior_recipe or prior_analyses):
+            return
+
+        bits = []
+        if prior_recipe:
+            bits.append("an accepted recipe")
+        if prior_analyses:
+            bits.append(
+                f"{len(prior_analyses)} analysis pipeline"
+                + ("s" if len(prior_analyses) != 1 else "")
+            )
+        joined = " and ".join(bits)
+        reply = QMessageBox.question(
+            self, "Resume prior workspace?",
+            f"A prior workspace exists for this file with {joined}.\n\n"
+            "Resume to populate the Recipe page / Results page from the "
+            "saved artifacts, or Start fresh to archive the prior data "
+            "and begin clean.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.No:
+            archived = session.archive()
+            self.main_window.set_status_text(
+                f"Started fresh; prior workspace archived → {archived.name}"
+            )
+            return
+
+        if prior_recipe:
+            self._rehydrate_recipe(exp, session)
+        if prior_analyses:
+            self._rehydrate_analyses(exp, session, prior_analyses)
+        self.main_window.set_status_text("Imported — workspace resumed.")
+
+    def _rehydrate_recipe(self, exp: ND2StudiosRecord, session) -> None:
+        from nd2studios.pipeline import RecipeStage
+
+        stage = RecipeStage(session)
+        recipe, normalized, _channels = stage.get_recipe()
+        if recipe:
+            exp.recipe = recipe
+            exp.recipe_normalized = normalized
+            # Promote status so the user can navigate to downstream pages.
+            self.main_window.exp_manager.set_status("preprocessed")
+
+    def _rehydrate_analyses(
+        self, exp: ND2StudiosRecord, session, stage_names: list,
+    ) -> None:
+        from nd2studios.pipeline import AnalysisStage
+
+        for stage_name in stage_names:
+            pipeline_name = stage_name[len("analysis:"):]
+            stage = AnalysisStage(session, pipeline_name)
+            per_m = exp.analysis_results.setdefault(pipeline_name, {})
+            if not isinstance(per_m, dict):
+                per_m = {}
+                exp.analysis_results[pipeline_name] = per_m
+            for m in stage.committed_m_indices():
+                result = stage.rehydrate_m(m)
+                if result is not None:
+                    per_m[m] = result
+
+    def _kick_off_pyramid(self, exp: ND2StudiosRecord) -> None:
+        """Attach an existing pyramid or queue a background build.
+
+        V1.39 Phase 7. The work happens inside a
+        :class:`BuildPyramidJob` so the GUI stays responsive — until
+        the build completes, the viewer reads from level 0
+        (the existing :class:`LazyND2Volume`). If the workspace
+        already has a committed pyramid, we skip the build and just
+        attach the reader.
+        """
+        if self.main_window is None:
+            return
+        if not bool(getattr(Settings, "BUILD_PYRAMIDS", True)):
+            return
+        volume = getattr(exp, "_raw_volume", None)
+        if volume is None:
+            return
+        # ``start_pyramid_build`` no-ops when no pyramid stage is
+        # available (env override, missing zarr, no session) and
+        # attaches the reader when the pyramid is already on disk.
+        try:
+            self.main_window.start_pyramid_build(volume)
+        except Exception:  # noqa: BLE001 — pyramid build must not block import
+            pass

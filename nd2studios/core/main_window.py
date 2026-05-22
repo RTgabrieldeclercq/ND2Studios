@@ -38,10 +38,21 @@ from PySide6.QtWidgets import (
     QSizeGrip, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
+from nd2studios.compute import BuildPyramidJob, JobRunner
 from nd2studios.core.experiment_manager import (
     ND2StudiosManager, SESSION_EXTENSION,
 )
 from nd2studios.core.settings import Settings
+from nd2studios.pipeline import (
+    AnalysisStage,
+    EnhancedDataset,
+    HAS_ZARR,
+    PyramidStage,
+    PyramidUnavailable,
+    RecipeStage,
+    Session,
+    workspace_disabled,
+)
 from nd2studios.widgets.common import StatusIndicator
 from nd2studios.widgets.custom_grips import CustomGrip
 
@@ -58,6 +69,25 @@ class MainWindow(QMainWindow):
         # Frameless + translucent so the rounded #bgApp shows through cleanly.
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
+
+        # V1.37 Phase 5 — project-wide job runner for short, cancellable
+        # background work (Analysis-page previews + commits). Built
+        # before any page so pages can grab a reference in their
+        # ``__init__``. Long-running QThread workers (Recipe, Batch,
+        # Load, Prefetch, IO) are unaffected and keep their existing
+        # lifecycles.
+        self.job_runner = JobRunner(parent=self)
+        # V1.39 Phase 7 — listen for pyramid-build completion so the
+        # status bar and viewer attachments can update. Other job
+        # keys (analysis_preview / analysis_commit) keep their own
+        # per-page wiring; the slot filters by ``result.key``.
+        self.job_runner.job_done.connect(self._on_pyramid_job_done)
+
+        # V1.38 Phase 6 — per-source workspace. Attached by the Import
+        # page after a successful load (see ``_attach_session_for``).
+        # None until a file is imported; None forever if
+        # ``ND2STUDIOS_DISABLE_WORKSPACE=1`` is set.
+        self.session: Optional[Session] = None
 
         # State
         self.exp_manager = ND2StudiosManager(self)
@@ -205,6 +235,9 @@ class MainWindow(QMainWindow):
             ("  📄  New",     self._new_session,    "Start a new empty session"),
             ("  💾  Save",    self._save_session,   "Save session to a .nd2s file"),
             ("  📂  Load",    self._load_session,   "Load a saved .nd2s session"),
+            ("  ⚙  Performance",
+             self._open_performance_settings,
+             "GPU acceleration and multi-resolution pyramid settings (V1.39)"),
         ]:
             btn = QPushButton(label)
             btn.setObjectName("sessionBtn")
@@ -371,6 +404,31 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._reposition_grips()
 
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        """Drain the V1.37 Phase 5 job runner before exit.
+
+        Without this hook, Python's GC may release a ``QThread``
+        wrapper while the underlying OS thread is still executing
+        a preview job — the source of "QThread: Destroyed while
+        thread is still running" warnings.
+
+        Pages may also expose ``on_close`` to flush their own
+        debounce timers or wait on legacy ``QThread`` workers
+        they still own.
+        """
+        try:
+            self.job_runner.shutdown(wait_ms=3000)
+        except Exception:  # noqa: BLE001 — shutdown must never raise
+            pass
+        for page in self.pages.values():
+            on_close = getattr(page, "on_close", None)
+            if callable(on_close):
+                try:
+                    on_close()
+                except Exception:  # noqa: BLE001
+                    pass
+        super().closeEvent(event)
+
     # ── Sidebar collapse/expand ────────────────────────────────────
     def _toggle_sidebar(self) -> None:
         start = self._sidebar.width()
@@ -431,6 +489,12 @@ class MainWindow(QMainWindow):
             if hasattr(old_page, "save_to_experiment"):
                 old_page.save_to_experiment(self.exp_manager.active)
 
+            # V1.38 Phase 6 — release-on-leave for committed stages.
+            # Frees RAM held by the outgoing page when the workspace has
+            # a persistent copy of its output (recipe → re-applies
+            # lazily; analysis → reads back from disk on demand).
+            self._release_outgoing_stage(self._current_page_key)
+
         # Switch.
         keys = [p[0] for p in Settings.PAGES]
         idx = keys.index(page_key)
@@ -457,6 +521,314 @@ class MainWindow(QMainWindow):
     def _on_status_changed(self, status: str) -> None:
         self._status_indicator.set_status(status)
 
+    # ── V1.38 Phase 6 — workspace lifecycle ────────────────────────
+    def attach_session_for(self, filepath: str) -> Optional[Session]:
+        """Create or reuse the per-source workspace for ``filepath``.
+
+        Called from :meth:`ImportPage._on_confirm` after a successful
+        load. Honours ``ND2STUDIOS_DISABLE_WORKSPACE`` as a no-op
+        escape hatch — returns ``None`` in that mode so callers can
+        skip the warm-start prompt.
+        """
+        if workspace_disabled():
+            self.session = None
+            return None
+        try:
+            self.session = Session(filepath)
+        except Exception as exc:  # noqa: BLE001 — workspace must never crash import
+            self.set_status_text(f"Workspace unavailable ({exc.__class__.__name__})")
+            self.session = None
+            return None
+        exp = self.exp_manager.active
+        if exp is not None:
+            self.session.set_shape(
+                n_t=exp.n_frames,
+                n_m=max(1, exp.n_multipoints),
+                n_z=max(1, exp.n_zslices),
+                n_channels=len(exp.channel_display) or len(exp._raw_channels or {}),
+                height=exp.frame_height,
+                width=exp.frame_width,
+                pixel_size_um=exp.pixel_size_um,
+                channel_names=list((exp._raw_channels or {}).keys()),
+            )
+        return self.session
+
+    def detach_session(self) -> None:
+        """Forget the active workspace (e.g. after ``New session``)."""
+        self.session = None
+
+    def recipe_stage(self) -> Optional["RecipeStage"]:
+        return RecipeStage(self.session) if self.session is not None else None
+
+    def analysis_stage(self, pipeline_name: str) -> Optional["AnalysisStage"]:
+        if self.session is None:
+            return None
+        return AnalysisStage(self.session, pipeline_name)
+
+    # ── V1.39 Phase 7 — pyramid lifecycle ──────────────────────────
+    def pyramid_stage(self) -> Optional["PyramidStage"]:
+        """Return a :class:`PyramidStage` for the active session, or ``None``.
+
+        Returns ``None`` when no session is attached, when the env
+        override disables pyramids, or when ``zarr`` is missing.
+        Pyramid reads require zarr's sub-chunk indexing; without it
+        we keep the viewer pinned to level 0.
+        """
+        if self.session is None:
+            return None
+        if os.environ.get(
+            getattr(Settings, "PYRAMID_ENV_DISABLE", "ND2_DISABLE_PYRAMIDS"),
+            "",
+        ) == "1":
+            return None
+        if not HAS_ZARR:
+            return None
+        return PyramidStage(self.session)
+
+    def start_pyramid_build(self, volume) -> bool:
+        """Submit a :class:`BuildPyramidJob` for ``volume``.
+
+        Returns True iff a build was actually submitted. Callers (the
+        Import page) use the return value to decide whether to show
+        the "Building pyramid..." status note. Submitting a build
+        while one is in flight coalesces — the in-flight job is
+        cancelled and the new one takes over.
+        """
+        stage = self.pyramid_stage()
+        if stage is None or volume is None:
+            return False
+        # Already committed for this source? Just (re-)attach.
+        if stage.is_committed():
+            self._attach_pyramid_reader_to_viewers(stage.reader())
+            return False
+        try:
+            self.job_runner.submit(
+                BuildPyramidJob("pyramid_build", stage, volume)
+            )
+        except Exception as exc:  # noqa: BLE001 — never crash on a soft optimization
+            self.set_status_text(
+                f"Pyramid build skipped ({type(exc).__name__}: {exc})"
+            )
+            return False
+        self.set_status_text("Building multi-resolution pyramid in background…")
+        return True
+
+    def _on_pyramid_job_done(self, result) -> None:
+        """Handle the ``pyramid_build`` :class:`JobResult`.
+
+        Connected to :attr:`JobRunner.job_done` once at startup; we
+        filter by ``result.key`` so other consumers (analysis preview
+        / commit) keep their existing slot wiring.
+        """
+        if getattr(result, "key", None) != "pyramid_build":
+            return
+        if not getattr(result, "ok", False):
+            err = getattr(result, "error", "unknown error")
+            self.set_status_text(f"Pyramid build failed: {err}")
+            return
+        # Reattach the freshly-built reader to whichever viewer is
+        # currently bound to the active experiment.
+        stage = self.pyramid_stage()
+        reader = stage.reader() if stage is not None else None
+        if reader is None:
+            self.set_status_text("Pyramid built (reader unavailable).")
+            return
+        n_levels = reader.n_levels
+        self._attach_pyramid_reader_to_viewers(reader)
+        self.set_status_text(f"Pyramid built: {n_levels} levels.")
+
+    def _attach_pyramid_reader_to_viewers(self, reader) -> None:
+        """Push a :class:`PyramidReader` into every page that owns a viewer.
+
+        The multi-axis viewer is the only consumer today, but the
+        method scans all pages defensively so a future page that
+        exposes ``viewer`` automatically benefits.
+        """
+        if reader is None:
+            return
+        for page in self.pages.values():
+            viewer = getattr(page, "viewer", None)
+            if viewer is None:
+                continue
+            attach = getattr(viewer, "attach_pyramid", None)
+            if callable(attach):
+                try:
+                    attach(reader)
+                except Exception:  # noqa: BLE001 — viewer must never break on attach
+                    pass
+
+    # ── V1.39 Phase 7 — Performance settings dialog ────────────────
+    def _open_performance_settings(self) -> None:
+        """Show the Performance settings modal.
+
+        Two checkboxes (GPU analysis, build pyramids) plus a Rebuild
+        Pyramid button. State lives on :class:`Settings` for the
+        lifetime of the process; persisting across launches is a
+        V1.40 follow-up.
+        """
+        # Imports kept local so the main window does not pay for them
+        # at startup if the dialog never opens.
+        from PySide6.QtWidgets import (
+            QCheckBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout,
+        )
+
+        from nd2studios.compute.gpu import configure as gpu_configure
+        from nd2studios.compute.gpu import gpu_status
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Performance")
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 16, 16, 12)
+
+        status = gpu_status()
+        if status["available"]:
+            mem = status.get("memory_gb", 0.0)
+            gpu_label = (
+                f"Use GPU acceleration ({status['device_name']}, {mem:.1f} GB)"
+            )
+            if not status.get("cucim", False):
+                gpu_label += "  — cucim missing; install for full speedup"
+        else:
+            gpu_label = f"Use GPU acceleration — unavailable: {status['reason']}"
+
+        gpu_cb = QCheckBox(gpu_label)
+        gpu_cb.setChecked(bool(getattr(Settings, "USE_GPU_ANALYSIS", False))
+                          and status["available"])
+        gpu_cb.setEnabled(bool(status["available"]))
+        layout.addWidget(gpu_cb)
+
+        pyr_cb = QCheckBox("Build multi-resolution pyramids on import")
+        pyr_cb.setChecked(bool(getattr(Settings, "BUILD_PYRAMIDS", True)))
+        pyr_cb.setEnabled(HAS_ZARR)
+        if not HAS_ZARR:
+            pyr_cb.setToolTip(
+                "Pyramids require the optional `zarr` package. "
+                "Install with `pip install zarr`."
+            )
+        layout.addWidget(pyr_cb)
+
+        # Rebuild button + helper label
+        from PySide6.QtWidgets import QPushButton
+        rebuild_btn = QPushButton("Rebuild pyramid for current file")
+        rebuild_btn.setEnabled(self.session is not None and HAS_ZARR)
+        layout.addWidget(rebuild_btn)
+        layout.addWidget(QLabel(
+            f"Workspace: {self.session.session_dir if self.session else '— (no file imported)'}",
+        ))
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+        )
+        layout.addWidget(buttons)
+
+        def _do_rebuild() -> None:
+            exp = self.exp_manager.active
+            volume = getattr(exp, "_raw_volume", None) if exp is not None else None
+            if volume is None:
+                self.set_status_text("No active volume to build a pyramid from.")
+                return
+            stage = self.pyramid_stage()
+            if stage is None:
+                return
+            # Wipe the prior record so the build is forced.
+            self.session.remove_stage(stage.name, delete_artifacts=True)  # type: ignore[union-attr]
+            self.start_pyramid_build(volume)
+            dlg.accept()
+
+        rebuild_btn.clicked.connect(_do_rebuild)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            Settings.USE_GPU_ANALYSIS = bool(gpu_cb.isChecked())
+            Settings.BUILD_PYRAMIDS = bool(pyr_cb.isChecked())
+            effective = gpu_configure(Settings.USE_GPU_ANALYSIS)
+            if Settings.USE_GPU_ANALYSIS and not effective:
+                self.set_status_text(
+                    "GPU acceleration requested but unavailable — staying on CPU."
+                )
+            else:
+                self.set_status_text(
+                    "Performance settings updated "
+                    f"(GPU analysis: {'on' if effective else 'off'}, "
+                    f"pyramids: {'on' if Settings.BUILD_PYRAMIDS else 'off'})."
+                )
+
+    def _release_outgoing_stage(self, page_key: str) -> None:
+        """Drop in-memory stage outputs when the workspace owns them.
+
+        Called from :meth:`_navigate` after the outgoing page has
+        flushed its state. The release is conditional on a successful
+        commit in the workspace manifest — we never throw data away if
+        the on-disk copy is missing.
+        """
+        if self.session is None:
+            return
+        exp = self.exp_manager.active
+        if exp is None:
+            return
+
+        if page_key == "recipe" and self.session.is_committed("recipe"):
+            self._release_processed_channels(exp)
+        elif page_key == "analysis":
+            self._release_committed_analysis(exp)
+
+    def _release_processed_channels(self, exp) -> None:
+        """Swap ``_processed_channels`` for a lazy ``EnhancedDataset``.
+
+        Skips when ``_raw_channels`` is missing (nothing to reapply
+        against) or when the recipe is empty (the processed dict is
+        a cheap alias to raw — no win from dropping it).
+        """
+        if not exp._raw_channels:
+            return
+        recipe = list(exp.recipe)
+        if not recipe and not exp.recipe_normalized:
+            return
+        if exp._processed_channels is None:
+            return
+        exp._processed_view = EnhancedDataset(
+            raw_channels=exp._raw_channels,
+            recipe=recipe,
+            normalized=bool(exp.recipe_normalized),
+            pixel_size_um=exp.pixel_size_um,
+        )
+        exp._processed_channels = None
+        self.set_status_text("Recipe stage released to workspace.")
+
+    def _release_committed_analysis(self, exp) -> None:
+        """Drop label-mask arrays for analysis results that hit disk.
+
+        We keep the per-pipeline ``measurements`` and ``summary`` in
+        RAM because they are small and the Results page reads them
+        directly. ``label_masks`` is the multi-GB payload — that comes
+        back via :meth:`AnalysisStage.rehydrate_m` on demand.
+        """
+        if not exp.analysis_results:
+            return
+        released_any = False
+        for pipeline_name, per_m in list(exp.analysis_results.items()):
+            stage = self.analysis_stage(pipeline_name)
+            if stage is None or not stage.is_committed():
+                continue
+            committed_ms = set(stage.committed_m_indices())
+            if isinstance(per_m, dict):
+                for m, result in per_m.items():
+                    if m in committed_ms and getattr(result, "label_masks", None):
+                        result.label_masks = {}
+                        result.secondary_label_masks = {}
+                        released_any = True
+            else:
+                # Legacy single-result shape — only release if the
+                # workspace has m=0 committed.
+                if 0 in committed_ms and getattr(per_m, "label_masks", None):
+                    per_m.label_masks = {}
+                    per_m.secondary_label_masks = {}
+                    released_any = True
+        if released_any:
+            self.set_status_text("Analysis stage released to workspace.")
+
     # ── Public hooks the pages call ────────────────────────────────
     def set_progress(self, value: int, text: str = "") -> None:
         self._progress_bar.setVisible(value > 0)
@@ -470,6 +842,7 @@ class MainWindow(QMainWindow):
     # ── Session controls ───────────────────────────────────────────
     def _new_session(self) -> None:
         self.exp_manager.new_experiment("Untitled")
+        self.detach_session()
         self.set_status_text("New session")
 
     def _save_session(self) -> None:

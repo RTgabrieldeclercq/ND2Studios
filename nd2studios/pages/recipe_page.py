@@ -379,6 +379,23 @@ class RecipePage(QWidget):
             if exp._processed_channels:
                 self.viewer_proc.set_channels(exp._processed_channels,
                                               channel_display=exp.channel_display)
+            elif exp._processed_view is not None and self._recipe:
+                # V1.38 Phase 6 — re-materialize the committed recipe so
+                # the right viewer is populated when the user navigates
+                # back from a downstream page. The lazy view caches the
+                # result so subsequent re-entries are instant.
+                try:
+                    processed = exp._processed_view.materialize_all()
+                except Exception as exc:  # noqa: BLE001
+                    if self.main_window is not None:
+                        self.main_window.set_status_text(
+                            f"Could not rehydrate recipe: {exc}"
+                        )
+                else:
+                    exp._processed_channels = processed
+                    self.viewer_proc.set_channels(
+                        processed, channel_display=exp.channel_display,
+                    )
 
     def _refresh_raw_viewer(self, exp: ND2StudiosRecord) -> None:
         """Wire the raw viewer to the volume (Z-scrollable) or flat channels.
@@ -467,6 +484,37 @@ class RecipePage(QWidget):
         if self.main_window is not None:
             self.main_window.set_status_text(f"Step accepted ({len(self._recipe)} total).")
             self.main_window.exp_manager.set_status("preprocessed")
+            # V1.38 Phase 6 — flush the accepted recipe to the
+            # per-source workspace. The release of
+            # ``exp._processed_channels`` happens on the page-leave
+            # hook in ``MainWindow._navigate`` so the right-side
+            # preview keeps working while the user is still here.
+            self._commit_recipe_stage()
+
+    def _commit_recipe_stage(self) -> None:
+        """Persist the committed recipe to the workspace.
+
+        No-op when the workspace is disabled or unavailable (e.g.
+        ``.nd2s`` re-opened on a machine without the source file). The
+        in-memory state continues to work exactly as before.
+        """
+        stage = self.main_window.recipe_stage() if self.main_window else None
+        if stage is None:
+            return
+        exp = self.main_window.exp_manager.active
+        if exp is None:
+            return
+        channel_names = list(
+            (exp._raw_channels or exp._processed_channels or {}).keys()
+        )
+        stage.set_recipe(self._recipe, self._normalized, channel_names)
+        try:
+            stage.commit()
+        except OSError as exc:
+            self.main_window.set_status_text(
+                f"Workspace write failed ({exc.__class__.__name__}); "
+                "in-memory recipe unchanged."
+            )
 
     def _on_reject(self) -> None:
         self._trial_step = None

@@ -80,6 +80,12 @@ class ND2StudiosRecord:
     _original_raw_channels: Optional[Dict[str, Any]] = field(default=None, repr=False)
     # Channels after the recipe has been applied. None if no recipe yet.
     _processed_channels: Optional[Dict[str, np.ndarray]] = field(default=None, repr=False)
+    # V1.38 Phase 6 — lazy fall-through used when the Recipe page has
+    # released ``_processed_channels`` after a stage commit. Holds an
+    # ``EnhancedDataset`` whose ``materialize_channel(name)`` reapplies
+    # the recipe on demand. ``processed_view()`` is the accessor pages
+    # should call instead of ``_processed_channels`` directly.
+    _processed_view: Optional[Any] = field(default=None, repr=False)
     # Per-frame timestamps (seconds since experiment start), if present in ND2.
     _frame_timestamps: Optional[np.ndarray] = field(default=None, repr=False)
     # V1.1: a LazyND2Volume for M/Z scrolling (rebuilt from filepath on load).
@@ -163,6 +169,36 @@ class ND2StudiosRecord:
             elif hasattr(rec, key) and not key.startswith("_"):
                 setattr(rec, key, val)
         return rec
+
+    # ── V1.38 Phase 6 ────────────────────────────────────────────────
+    def processed_view(self) -> Any:
+        """Return whichever processed-channels source is currently live.
+
+        Order of preference:
+
+        1. ``_processed_channels`` — the in-RAM dict the Recipe page
+           produces after a successful Trial/Accept.
+        2. ``_processed_view`` — an ``EnhancedDataset`` proxy set by
+           the Phase 6 release hook when ``_processed_channels`` has
+           been dropped after a commit to the workspace.
+        3. ``_raw_channels`` — fallback for sessions with no recipe at
+           all.
+
+        The returned object is dict-like (``in``, ``[name]``, ``keys()``)
+        in all three cases so callers do not branch.
+        """
+        if self._processed_channels is not None:
+            return self._processed_channels
+        if self._processed_view is not None:
+            return self._processed_view
+        return self._raw_channels or {}
+
+    def has_processed(self) -> bool:
+        """True if any processed-channels source is available."""
+        return (
+            self._processed_channels is not None
+            or self._processed_view is not None
+        )
 
 
 class ND2StudiosManager(QObject):

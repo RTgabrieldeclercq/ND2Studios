@@ -2,18 +2,25 @@
 General Analysis page — extensible pipeline runner.
 
 Hosts the AnalysisPipeline registry: one pipeline is selected from a
-drop-down, its parameters are rendered via ParamEditor, and it runs in
-an AnalysisWorker thread. Results (label masks + measurements + summary)
-are displayed with a label-mask overlay on the live MultiAxisViewer and a
-metrics panel. The viewer is wired to the experiment on tab entry so the
-user can navigate the file and tweak parameters before pressing Run.
+drop-down, its parameters are rendered via ParamEditor, and the work is
+submitted to the project-wide :class:`~nd2studios.compute.JobRunner` as
+either a :class:`PipelinePreviewJob` (single frame, ``"analysis_preview"``
+key) or a :class:`PipelineCommitJob` (full stack per M position,
+``"analysis_commit"`` key). Results (label masks + measurements +
+summary) are displayed with a label-mask overlay on the live
+MultiAxisViewer and a metrics panel. The viewer is wired to the
+experiment on tab entry so the user can navigate the file and tweak
+parameters before pressing Run.
 
 **Screening mode:** a "Screen frame" button (or "Auto-screen" checkbox)
-runs the pipeline on the *single frame currently visible in the viewer* and
-overlays the result immediately. When Auto-screen is enabled, navigating
-the T/M/Z sliders re-runs screening on the new frame after a 300 ms
-debounce. Screen results are overlaid only for their specific frame;
-full-analysis results (from "Run Analysis") cover all other frames.
+runs the pipeline on the *single frame currently visible in the viewer*
+and overlays the result immediately. When Auto-screen is enabled,
+moving the T/M/Z sliders **or** editing any parameter restarts a 300 ms
+debounce timer; firing submits a preview job. The runner cancels any
+in-flight predecessor under the same key, so rapid edits collapse to
+exactly one in-flight preview. Screen results are overlaid only for
+their specific frame; full-analysis results (from "Run Analysis") cover
+all other frames.
 
 Export buttons write label masks as int32 TIFF and measurements as CSV
 (full-analysis results only).
@@ -58,15 +65,25 @@ from nd2studios.backend.analysis.manual_mask import (
     shape_to_editable_polygon,
 )
 from nd2studios.backend.exporters.tiff_exporter import export_tiff_stack
+from nd2studios.compute import (
+    JobResult,
+    PipelineCommitJob,
+    PipelinePreviewJob,
+)
 from nd2studios.core.analysis_registry import AnalysisPipeline, AnalysisResult
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.common import ParamEditor
 from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
-from nd2studios.workers.analysis_worker import AnalysisWorker
 
 
 MANUAL_MASK_PIPELINE_NAME = "Manual Mask"
+
+# V1.37 Phase 5 — coalescing keys for the project-wide JobRunner. Each
+# value is shared across every submission of the same tier on this
+# page, so a fresh submission cancels the in-flight predecessor.
+_PREVIEW_KEY = "analysis_preview"
+_COMMIT_KEY = "analysis_commit"
 
 
 class AnalysisPage(QWidget):
@@ -76,8 +93,19 @@ class AnalysisPage(QWidget):
         super().__init__()
         self.main_window = main_window
 
+        # V1.37 Phase 5 — both preview and commit work go through the
+        # project-wide JobRunner instead of per-page QThread workers.
+        # ``job_runner`` is built in :class:`MainWindow.__init__` before
+        # any page is constructed, so it's safe to read here. We tolerate
+        # ``main_window is None`` for headless unit tests by falling
+        # back to ``None`` — those paths simply never submit jobs.
+        self._runner = getattr(main_window, "job_runner", None)
+        if self._runner is not None:
+            self._runner.job_done.connect(self._on_runner_done)
+            self._runner.job_cancelled.connect(self._on_runner_cancelled)
+            self._runner.job_progress.connect(self._on_runner_progress)
+
         # Full-analysis state
-        self._worker: Optional[AnalysisWorker] = None
         self._result: Optional[AnalysisResult] = None
         self._current_channel_names: List[str] = []
 
@@ -91,8 +119,9 @@ class AnalysisPage(QWidget):
         self._run_pipeline_cls = None
         self._run_params: Dict[str, Any] = {}
 
-        # Screening state (single-frame preview)
-        self._screen_worker: Optional[AnalysisWorker] = None
+        # Screening state (single-frame preview). _screen_frame /
+        # _screen_m are also embedded in each preview job's ``tag`` so
+        # stale completions are filtered in ``_on_runner_done``.
         self._screen_result: Optional[AnalysisResult] = None
         self._screen_frame: int = -1   # viewer T index of the last screen run
         self._screen_m: int = 0        # viewer M index of the last screen run
@@ -167,6 +196,13 @@ class AnalysisPage(QWidget):
         param_inner_layout = QVBoxLayout(param_inner)
         param_inner_layout.setContentsMargins(4, 4, 4, 4)
         self.param_editor = ParamEditor()
+        # V1.37 Phase 5 — let parameter edits drive a debounced preview
+        # so dragging a threshold / sigma slider re-renders the overlay
+        # without forcing the user to nudge the T/M/Z slider to trigger
+        # a re-screen. The same debounce timer is shared with viewer
+        # coords changes so two adjacent events collapse into one
+        # submission.
+        self.param_editor.params_changed.connect(self._on_params_changed)
         param_inner_layout.addWidget(self.param_editor)
         param_inner_layout.addStretch(1)
 
@@ -433,6 +469,23 @@ class AnalysisPage(QWidget):
         # tools operate on the right per-experiment state.
         self._manual_shapes = copy.deepcopy(getattr(exp, "manual_mask_shapes", {}) or {})
 
+        # V1.38 Phase 6 — if the Recipe page released
+        # ``_processed_channels`` after committing the recipe, ask the
+        # ``EnhancedDataset`` proxy to materialize once now so the
+        # viewer + downstream analysis sees a normal dict. The proxy
+        # caches, so re-entering Analysis is cheap.
+        if (
+            exp._processed_channels is None
+            and exp._processed_view is not None
+        ):
+            try:
+                exp._processed_channels = exp._processed_view.materialize_all()
+            except Exception as exc:  # noqa: BLE001
+                if self.main_window is not None:
+                    self.main_window.set_status_text(
+                        f"Recipe rehydrate failed: {exc}"
+                    )
+
         channels = exp._processed_channels or exp._raw_channels or {}
 
         # Wire viewer with volume (ND2) or flat channels (TIFF / post-recipe).
@@ -504,7 +557,9 @@ class AnalysisPage(QWidget):
 
     def _on_pipeline_changed(self, name: str, restore_values: Optional[Dict] = None) -> None:
         # Cancel any in-flight screen; clear both result sets (pipeline-specific).
-        self._cancel_screen()
+        if self._runner is not None:
+            self._runner.cancel(_PREVIEW_KEY)
+        self._screen_debounce.stop()
         self._result = None
         self._results_per_m.clear()
         self._screen_result = None
@@ -624,7 +679,9 @@ class AnalysisPage(QWidget):
         self._run_total = len(m_positions)
 
         # Cancel any in-flight screen; clear stale overlay while run executes.
-        self._cancel_screen()
+        if self._runner is not None:
+            self._runner.cancel(_PREVIEW_KEY)
+        self._screen_debounce.stop()
         self._screen_result = None
         self._screen_frame = -1
         self.lbl_screen_status.setText("—")
@@ -675,9 +732,12 @@ class AnalysisPage(QWidget):
         return channels or None
 
     def _start_next_m_run(self) -> None:
-        """Pop the next M position from the queue and launch an AnalysisWorker."""
+        """Pop the next M position from the queue and submit a commit job."""
         exp = self._active_exp()
         if exp is None or not self._run_queue:
+            return
+        if self._runner is None:
+            self._set_idle("Error: job runner unavailable.")
             return
         m = self._run_queue.pop(0)
         self._current_run_m = m
@@ -697,23 +757,28 @@ class AnalysisPage(QWidget):
         self.lbl_status.setText(label)
 
         # Per-M shape injection for the Manual Mask pipeline. Each M has its
-        # own drawn-shape dict; we splice it into params just before the worker
+        # own drawn-shape dict; we splice it into params just before the job
         # picks it up so the pipeline can stay pure.
-        params_for_worker = dict(self._run_params)
+        params_for_job = dict(self._run_params)
         pipeline_name = self.combo_pipeline.currentText()
         if pipeline_name == MANUAL_MASK_PIPELINE_NAME:
-            params_for_worker["frame_shapes"] = copy.deepcopy(
+            params_for_job["frame_shapes"] = copy.deepcopy(
                 self._manual_shapes.get(m, {})
             )
 
-        self._worker = AnalysisWorker(
-            self._run_pipeline_cls(), channels, metadata, params_for_worker
+        # V1.37 Phase 5 — replaces the legacy AnalysisWorker QThread.
+        # The runner coalesces by key, so submitting a new commit while
+        # one is in flight cancels the predecessor (used by the Cancel
+        # button via runner.cancel(_COMMIT_KEY)).
+        job = PipelineCommitJob(
+            key=_COMMIT_KEY,
+            pipeline_cls=self._run_pipeline_cls,
+            channels=channels,
+            metadata=metadata,
+            params=params_for_job,
+            m_index=m,
         )
-        self._worker.progress.connect(self._on_m_progress)
-        self._worker.status.connect(self._on_status)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-        self._worker.start()
+        self._runner.submit(job)
 
     def _on_m_progress(self, p: int) -> None:
         """Scale single-M worker progress (0–100) into overall multi-M progress."""
@@ -723,8 +788,8 @@ class AnalysisPage(QWidget):
 
     def _on_cancel(self) -> None:
         self._run_queue.clear()
-        if self._worker is not None:
-            self._worker.cancel()
+        if self._runner is not None:
+            self._runner.cancel(_COMMIT_KEY)
         self._set_idle("Cancelled.")
 
     def _on_status(self, msg: str) -> None:
@@ -743,6 +808,12 @@ class AnalysisPage(QWidget):
                 stored = {}
                 exp.analysis_results[pipeline_name] = stored
             stored[m] = result
+            # V1.38 Phase 6 — stream this M's label masks to the
+            # workspace so multi-M runs do not pile up GiB of int32
+            # arrays in RAM. The page-leave hook in
+            # ``MainWindow._navigate`` then drops the arrays once the
+            # user navigates away.
+            self._commit_analysis_m(pipeline_name, m, result)
 
         self._update_overlay()
 
@@ -756,6 +827,36 @@ class AnalysisPage(QWidget):
             self.btn_export_tiff.setEnabled(True)
             self.btn_export_csv.setEnabled(True)
             self._show_result(result, exp)
+            self._finalize_analysis_stage()
+
+    def _commit_analysis_m(
+        self, pipeline_name: str, m: int, result: AnalysisResult,
+    ) -> None:
+        """Persist one M's label masks to the workspace."""
+        if self.main_window is None:
+            return
+        stage = self.main_window.analysis_stage(pipeline_name)
+        if stage is None:
+            return
+        try:
+            stage.commit_m(m, result)
+        except OSError as exc:
+            self.main_window.set_status_text(
+                f"Workspace write failed for M={m} ({exc.__class__.__name__})"
+            )
+
+    def _finalize_analysis_stage(self) -> None:
+        """Stamp the manifest record after a multi-M run drains."""
+        if self.main_window is None:
+            return
+        pipeline_name = self.combo_pipeline.currentText()
+        stage = self.main_window.analysis_stage(pipeline_name)
+        if stage is None:
+            return
+        try:
+            stage.commit()
+        except OSError:
+            pass
 
     def _on_error(self, msg: str) -> None:
         self._set_idle("Error.")
@@ -775,6 +876,63 @@ class AnalysisPage(QWidget):
         self.lbl_status.setText(status)
         self.btn_screen.setEnabled(self._has_data())
 
+    # ── V1.37 Phase 5 — JobRunner signal dispatch ────────────────────────────
+
+    def _on_runner_done(self, result: JobResult) -> None:
+        """Dispatch a completed job back to the matching handler.
+
+        The runner is shared with the rest of the app, so every page
+        listening to ``job_done`` sees every result. We filter on
+        :attr:`JobResult.key` before doing anything.
+        """
+        if result.key == _PREVIEW_KEY:
+            if not result.ok:
+                self.lbl_screen_status.setText("Screen error")
+                return
+            # The runner cancels any in-flight predecessor on each
+            # submit, so any ``job_done`` we see for the preview key
+            # was the latest submission. ``_screen_frame`` /
+            # ``_screen_m`` are the (m, t) it ran on; overlay code
+            # uses those to decide where to paint.
+            self._screen_result = result.value
+            self.lbl_screen_status.setText(
+                f"Frame {self._screen_frame + 1} screened"
+            )
+            self._update_overlay()
+        elif result.key == _COMMIT_KEY:
+            if not result.ok:
+                self._on_error(result.error or "Unknown error")
+                return
+            self._on_finished(result.value)
+
+    def _on_runner_cancelled(self, key: str) -> None:
+        """Quietly absorb a cancellation.
+
+        Cancellations happen for two reasons:
+          (1) the user clicked Cancel — UI state already moved to
+              idle in :meth:`_on_cancel`.
+          (2) a fresh submission under the same key superseded the
+              previous one — there is by design nothing to update.
+        Either way, no UI change is needed here.
+        """
+        # Defensive — if a commit cancellation arrives while the run
+        # queue is empty (user clicked Cancel mid-flight), make sure
+        # the buttons are in the idle state.
+        if key == _COMMIT_KEY and not self._run_queue:
+            self._set_idle("Cancelled.")
+
+    def _on_runner_progress(self, key: str, fraction: float, message: str) -> None:
+        """Translate runner progress into the existing progress widgets."""
+        if key == _COMMIT_KEY:
+            # PipelineCommitJob reports 0–1 for one M; scale into the
+            # multi-M progress bar exactly like ``_on_m_progress`` did
+            # for the legacy AnalysisWorker.
+            self._on_m_progress(int(fraction * 100))
+            if message:
+                self._on_status(message)
+        # Preview progress is sub-second; surfacing it would just
+        # cause label thrash. Status was already set on submit.
+
     # ── Screening: single-frame preview ──────────────────────────────────────
 
     def _on_viewer_coords_changed(self, m: int, t: int, z: int) -> None:
@@ -788,12 +946,23 @@ class AnalysisPage(QWidget):
             if self._edit_active:
                 self._btn_edit.setChecked(False)
 
+    def _on_params_changed(self, _values: Dict[str, Any]) -> None:
+        """Restart the preview debounce when any parameter changes.
+
+        Mirrors :meth:`_on_viewer_coords_changed`. Auto-screen is the
+        gate — without it on, the user uses the explicit Screen frame
+        button. With it on, parameter edits behave the same way slider
+        moves do.
+        """
+        if self.chk_auto_screen.isChecked() and self._has_data():
+            self._screen_debounce.start()
+
     def _screen_current_frame(self) -> None:
-        """Run the pipeline on the single frame currently shown in the viewer."""
+        """Submit a single-frame preview job to the V1.37 JobRunner."""
         self._screen_debounce.stop()
 
         exp = self._active_exp()
-        if exp is None:
+        if exp is None or self._runner is None:
             return
 
         channels_raw = exp._processed_channels or exp._raw_channels
@@ -832,43 +1001,26 @@ class AnalysisPage(QWidget):
         metadata = dict(exp.nd2_metadata)
         metadata["pixel_size_um"] = exp.pixel_size_um
 
-        # Track which (m, t) this run belongs to so stale completions are discarded.
+        # Track which (m, t) this preview belongs to so stale completions
+        # are silently discarded. The tag travels on the job so
+        # _on_runner_done can verify without an extra signal hop.
         self._screen_frame = t
         self._screen_m = m
-        expected_t = t
-        expected_m = m
 
-        # Cancel the previous screen run (fire-and-forget; stale results are
-        # silently dropped in _on_screen_finished via the expected_t check).
-        self._cancel_screen(wait=False)
-
-        self._screen_worker = AnalysisWorker(
-            pipeline_cls(), {selected_ch: frame_arr}, metadata, params
+        # V1.37 Phase 5 — replaces the hand-rolled cancel-and-replace
+        # logic. The runner cancels any in-flight preview under the
+        # same key before scheduling this one.
+        job = PipelinePreviewJob(
+            key=_PREVIEW_KEY,
+            pipeline_cls=pipeline_cls,
+            channel_name=selected_ch,
+            frame=frame_arr,
+            metadata=metadata,
+            params=params,
+            tag=(m, t),
         )
-        self._screen_worker.finished.connect(
-            lambda result, et=expected_t, em=expected_m: self._on_screen_finished(result, et, em)
-        )
-        self._screen_worker.error.connect(self._on_screen_error)
         self.lbl_screen_status.setText(f"Screening frame {t + 1}…")
-        self._screen_worker.start()
-
-    def _on_screen_finished(self, result: AnalysisResult, expected_t: int, expected_m: int) -> None:
-        """Handle a completed single-frame screen run."""
-        if expected_t != self._screen_frame or expected_m != self._screen_m:
-            return  # superseded by a newer screen run — discard
-        self._screen_result = result
-        self.lbl_screen_status.setText(f"Frame {expected_t + 1} screened")
-        self._update_overlay()
-
-    def _on_screen_error(self, msg: str) -> None:
-        self.lbl_screen_status.setText("Screen error")
-
-    def _cancel_screen(self, wait: bool = False) -> None:
-        """Signal the in-flight screen worker to stop."""
-        if self._screen_worker is not None and self._screen_worker.isRunning():
-            self._screen_worker.cancel()
-            if wait:
-                self._screen_worker.wait(200)
+        self._runner.submit(job)
 
     # ── Manual-mask drawing tools ────────────────────────────────────────────
 
@@ -1410,6 +1562,18 @@ class AnalysisPage(QWidget):
             QMessageBox.critical(self, "Export failed", str(exc))
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def on_close(self) -> None:
+        """Called by :meth:`MainWindow.closeEvent` on app exit.
+
+        Stop the debounce timer so it can't fire during shutdown and
+        push a fresh preview submission past the runner's drain
+        deadline. The runner itself drains the actual job pool.
+        """
+        try:
+            self._screen_debounce.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _has_data(self) -> bool:
         exp = self._active_exp()

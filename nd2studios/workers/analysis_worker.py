@@ -1,4 +1,18 @@
-"""QThread worker for analysis pipelines."""
+"""QThread worker for analysis pipelines.
+
+.. deprecated:: V1.37
+
+    New analysis code should submit to
+    :class:`nd2studios.compute.runner.JobRunner` via
+    :class:`nd2studios.compute.PipelinePreviewJob` /
+    :class:`nd2studios.compute.PipelineCommitJob` instead of
+    instantiating this worker directly. The runner gives us
+    key-based coalescing, a proper :class:`CancellationToken`,
+    and coordinated app-exit shutdown.
+
+    The class itself is retained because no out-of-tree caller
+    has been audited; removing it is deferred to a later version.
+"""
 from __future__ import annotations
 
 from typing import Any, Dict
