@@ -126,7 +126,7 @@ def log_gpu_status() -> None:
     """
     s = gpu_status()
     if s["available"]:
-        cucim_note = "" if s["cucim"] else " (cucim missing — analysis ops will run on CPU)"
+        cucim_note = "" if s["cucim"] else " (cucim unavailable — tear-detection blur/Otsu use CPU)"
         log.info(
             "GPU available: %s, %.1f GB%s",
             s["device_name"], s["memory_gb"], cucim_note,
