@@ -4,6 +4,105 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-05-23 (V1.0 stitch-black-fix)
+
+### Bug Fixes
+
+- **`export_stitched_tiff`** (`nd2studios/backend/exporters/stitch_exporter.py`):
+  Removed bare `except Exception: pass` handler wrapping every
+  `volume.get_frame()` call in the tile-reading loop. Previously any failure
+  (wrong channel index, IO error, dtype mismatch) silently produced a zero tile,
+  causing the entire stitch output to be black with no error shown to the user.
+  Exceptions now propagate through `BaseWorker.run()` and surface as the
+  existing "Stitch failed" error dialog. Added `if f.ndim != 2: f = f.squeeze()`
+  after `get_frame` for edge-case shape robustness.
+- **`resolutionunit` in all TIFF exporters**: `resolutionunit="MICROMETER"` is
+  not a valid TIFF spec value and was silently ignored by `tifffile`
+  v2026.5.15. Changed to `resolutionunit=None` in:
+  - `stitch_exporter.py` (`tifffile.memmap` call)
+  - `tiff_exporter.py` (`TiffWriter.write` and `tifffile.imwrite` calls)
+  - `composite_exporter.py` (`TiffWriter.write` call)
+
+---
+
+## [Unreleased] - 2026-05-23 (V1.0 overlay-perf-cache)
+
+### Changed
+
+- **`MultiAxisViewer._do_refresh`** (`nd2studios/widgets/multi_axis_viewer.py`):
+  adds two new fast-path tiers for the post-process / overlay path, which
+  previously bypassed all existing cache tiers:
+  1. **Post-process cache hit** (`_pp_cache[(m, t, pp_version)]`): zero numpy
+     work if the overlay-composited frame was already computed at the current
+     overlay version — analogous to the QPixmap cache for base frames.
+  2. **Render cache + post-process**: if `_render_cache[(m, t)]` exists, skips
+     the full LUT+channel-compose (~20–50 ms for 2K multi-channel) and only
+     pays for the overlay callback (~10–30 ms rasterize + blend).
+- **`MultiAxisViewer._compose_current_frame`**: fills `_render_cache[(m, t)]`
+  on-demand when the entry is absent (benefits GPU-canvas users who never run
+  `PreRenderWorker`); also stores the post-processed result in `_pp_cache`
+  after the live-compose fallback so subsequent refreshes hit the cache.
+- **`MultiAxisViewer.set_frame_post_process`**: now calls
+  `invalidate_post_process_cache()` before `_do_refresh()` so stale overlay
+  composites are never shown after the callback changes.
+- **`MultiAxisViewer._invalidate_render_cache` /
+  `_start_pre_render_worker`**: both clear `_pp_cache` alongside the existing
+  render/pixmap cache clears — LUT or chip changes rebuild the base, so the
+  derived overlay cache must be flushed too.
+- **`AnalysisPage._composite_overlay`** (`nd2studios/pages/analysis_page.py`)
+  Manual Mask branch: caches the rasterized `int32` mask in
+  `_raster_cache[(m, t, z_slot, raster_version)]` so repeated calls for the
+  same frame and shape state skip `rasterize_shapes()`. Cache is bounded at
+  200 entries.
+- **`AnalysisPage._on_shape_drawn` / `_on_clear_current_frame` /
+  `_on_vertex_moved` / `_on_apply_expand`**: each calls new
+  `_invalidate_mask_cache()` before `_update_overlay()` to ensure the raster
+  cache and the viewer's `_pp_cache` are flushed whenever shapes change.
+
+### Added
+
+- **`MultiAxisViewer.invalidate_post_process_cache()`**: public method that
+  increments `_pp_version` and clears `_pp_cache`. Called by `AnalysisPage`
+  when shape state changes so that all overlay-composite entries for the old
+  shapes are evicted without touching the base render cache.
+- **`AnalysisPage._invalidate_mask_cache()`**: helper that bumps
+  `_raster_version`, clears `_raster_cache`, and delegates to
+  `viewer.invalidate_post_process_cache()`.
+
+---
+
+## [Unreleased] - 2026-05-23 (V1.0 smooth-playback)
+
+### Added
+
+- **`PreRenderWorker`** (`nd2studios/workers/pre_render_worker.py`): background
+  `QThread` that pre-composes all `(M, T)` frames to `(H, W, 3) uint8` numpy
+  arrays off the GUI thread after dataset materialization. Priority order:
+  current M first so the visible time-series is cached before other M positions.
+  Signals: `progress(int)`, `frame_cached(int, int)`, `finished()`, `error(str)`.
+  Memory guard: limits cache to `priority_m` only when `n_m × n_t > 500` frames.
+- **`ImageCanvas.set_pixmap_direct(pixmap)`** (`nd2studios/widgets/image_viewer.py`):
+  displays a pre-built `QPixmap` without creating a `QImage`; the hot path
+  during cached playback where per-frame cost is now just a `paintEvent` repaint.
+
+### Changed
+
+- **T-slider debounce** (`multi_axis_viewer.py` `_t_debounce`): 50ms → 5ms.
+  The old 50ms was designed for the V1.40 lazy-loading + IOWorker stack; with
+  all data in RAM it only added artificial latency.
+- **FPS spinbox range** (`_make_axis_row`): 0.1–30 fps → 0.1–60 fps.
+- **`_set_axis_playing`**: T-axis playback timer floor drops to 16ms (60fps)
+  once the pre-render cache is ready; otherwise keeps 50ms (20fps) to avoid
+  overloading the live compose path.
+- **`_axis_tick`**: blocks `QSlider.valueChanged` during playback and calls
+  `_do_refresh()` directly, eliminating the 5ms debounce overhead per tick.
+- **`_do_refresh`**: adds two fast-paths before live compose:
+  1. QPixmap cache path (zero numpy work, pure paintEvent swap).
+  2. numpy composite cache path (skips LUT+compose; ~1ms vs ~50ms at 2048²).
+- **`_on_lut_contrast_changed` / `_on_chip_state`**: now call
+  `_invalidate_render_cache()` so pre-rendered frames are discarded and the
+  worker restarts with the updated LUT / color settings.
+
 ## [Unreleased] - 2026-05-22 (V1.40)
 
 ### Added

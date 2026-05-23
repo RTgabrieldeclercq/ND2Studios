@@ -309,7 +309,7 @@ def export_rgb_composite_tiff(
                 rgb,
                 photometric="rgb",
                 resolution=resolution,
-                resolutionunit="MICROMETER" if resolution else None,
+                resolutionunit=None,
                 metadata=metadata if t == 0 else None,
             )
             if progress_cb is not None and (t % 5 == 0 or t == n - 1):

@@ -351,7 +351,7 @@ def export_stitched_tiff(
             bigtiff=bigtiff,
             photometric="minisblack",
             resolution=resolution,
-            resolutionunit="MICROMETER" if resolution else None,
+            resolutionunit=None,
             metadata=ij_meta,
         )
         try:
@@ -361,16 +361,12 @@ def export_stitched_tiff(
                     for c_idx, c in enumerate(channel_indices):
                         tiles: List[np.ndarray] = []
                         for m in m_indices:
-                            try:
-                                f = volume.get_frame(
-                                    c=c, m=m, t=t, z=z_request,
-                                    z_mode=z_mode,
-                                )
-                            except Exception:
-                                f = np.zeros(
-                                    (layout.tile_h, layout.tile_w),
-                                    dtype=volume.dtype,
-                                )
+                            f = volume.get_frame(
+                                c=c, m=m, t=t, z=z_request,
+                                z_mode=z_mode,
+                            )
+                            if f.ndim != 2:
+                                f = f.squeeze()
                             tiles.append(f)
                         canvas = stitch_one_frame(
                             tiles, layout, volume.dtype,

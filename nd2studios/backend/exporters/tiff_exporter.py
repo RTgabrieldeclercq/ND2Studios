@@ -115,7 +115,7 @@ def export_tiff_stack(
                     stack[t],
                     photometric="minisblack",
                     resolution=resolution,
-                    resolutionunit="MICROMETER" if resolution else None,
+                    resolutionunit=None,
                     metadata=metadata if t == 0 else None,
                 )
                 if progress_cb is not None and (t % 10 == 0 or t == n - 1):
@@ -225,7 +225,7 @@ def export_tiff_hyperstack(
             imagej=True,
             photometric="minisblack",
             resolution=resolution,
-            resolutionunit="MICROMETER" if resolution else None,
+            resolutionunit=None,
             metadata=ij_meta,
             bigtiff=bigtiff,
         )
