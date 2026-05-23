@@ -1,12 +1,21 @@
 """
-LoadWorker — open an ND2 (or TIFF) file in a background thread.
+LoadWorker — open an ND2 (or TIFF) file in a background thread and
+eagerly materialize every (M, T) plane into RAM with Z-projection
+applied.
+
+V1.41 replaces the LazyND2Volume / LazyND2Channel + IOWorker + cache +
+prefetch hot path with a single parallel decode at file open. The
+GUI viewer reads from in-RAM ndarrays after this point — slider
+scrubbing is pure dict / ndarray indexing, sub-millisecond per tick.
 
 Returns:
     {
         "metadata": dict (extended ND2 metadata or TIFF-derived equivalent),
-        "channels": {channel_name: LazyND2Channel | np.ndarray},
+        "channels": {channel_name: np.ndarray of shape (T, H, W) at fixed M=0},
         "channel_names": list[str],
         "frame_timestamps_s": np.ndarray | None,
+        "volume": MaterializedDataset  # exposes the LazyND2Volume API
+        "source_type": "nd2" | "nd2_multi" | "tiff" | "tiff_multi",
     }
 """
 from __future__ import annotations
@@ -84,44 +93,40 @@ class LoadWorker(BaseWorker):
     def _load_nd2(self) -> Dict[str, Any]:
         from nd2studios.backend.nd2_loader import (
             read_nd2_metadata, read_nd2_metadata_extended,
-            load_nd2_timeseries_lazy,
         )
-        from nd2studios.backend.nd2_volume import LazyND2Volume
+        from nd2studios.backend.materialized_loader import materialize_nd2
 
         self.set_status("Reading metadata…")
         meta = read_nd2_metadata(self.filepath)
         ext_meta = read_nd2_metadata_extended(self.filepath)
         self.set_progress(15)
 
-        # V1.1: build the M/T/Z/C volume the viewer scrolls through.
-        self.set_status("Opening lazy volume…")
-        volume = LazyND2Volume(self.filepath)
-        self.set_progress(25)
-
         n_channels = meta.n_channels
         channel_names: List[str] = list(ext_meta.get("channel_names")
                                         or meta.channel_names
                                         or [f"Ch{i}" for i in range(n_channels)])
 
-        # Build per-channel (T, H, W) lazy proxies for the recipe pipeline.
-        # We use the CURRENT z_projection setting and m_index = 0; the user
-        # can change M from the viewer and we will rebuild these on Confirm.
-        self.set_status(f"Building {n_channels} lazy channel proxies…")
-        channels: Dict[str, Any] = {}
-        for i, name in enumerate(channel_names):
-            if self.cancelled:
-                return {}
-            channels[name] = load_nd2_timeseries_lazy(
-                self.filepath,
-                channel_index=i,
-                t_start=self.t_start,
-                t_end=self.t_end,
-                t_stride=self.t_stride,
-                z_start=self.z_start,
-                z_end=self.z_end,
-                z_projection=self.z_projection,
-            )
-            self.set_progress(25 + int(65 * (i + 1) / max(1, n_channels)))
+        # V1.41: eager parallel decode into a single in-RAM dict.
+        # After this returns, every (m, t, c) plane is one ndarray
+        # index away — no Dask, no IOWorker, no FrameCache, no
+        # PrefetchManager. The hot viewer path is RAM only.
+        self.set_status("Materializing volume into RAM…")
+
+        def _on_pct(pct: int) -> None:
+            self.set_progress(25 + int(70 * pct / 100))
+
+        dataset = materialize_nd2(
+            self.filepath,
+            z_mode=self.z_projection,
+            progress_cb=_on_pct,
+            cancel_cb=lambda: bool(self.cancelled),
+        )
+        if self.cancelled:
+            return {}
+
+        # Per-channel (T, H, W) views at the currently-selected M=0,
+        # for the recipe pipeline which works on a 2D timeseries.
+        channels: Dict[str, Any] = dataset.all_channels_as_lazy(m=0)
 
         ts = ext_meta.get("frame_timestamps_s") or []
         ts_array = np.asarray(ts, dtype=np.float64) if ts else None
@@ -131,9 +136,9 @@ class LoadWorker(BaseWorker):
         return {
             "metadata": ext_meta,
             "channels": channels,
-            "channel_names": channel_names,
+            "channel_names": list(dataset.channel_names),
             "frame_timestamps_s": ts_array,
-            "volume": volume,
+            "volume": dataset,
             "source_type": "nd2",
         }
 
@@ -143,6 +148,7 @@ class LoadWorker(BaseWorker):
             read_nd2_metadata_extended_multi,
         )
         from nd2studios.backend.nd2_volume import LazyMultiFileND2Volume
+        from nd2studios.backend.materialized_loader import materialize_from_volume
 
         n_files = len(self.filepaths)
         axis = self.chain_axis
@@ -156,26 +162,36 @@ class LoadWorker(BaseWorker):
         self.set_progress(15)
 
         self.set_status(f"Opening composite volume (chain {axis})…")
-        volume = LazyMultiFileND2Volume(
+        composite = LazyMultiFileND2Volume(
             self.filepaths, axis, chain_mapping=mapping,
         )
-        self.set_progress(35)
+        self.set_progress(25)
 
-        channel_names: List[str] = list(volume.channel_names)
-        n_channels = volume.n_channels
-        self.set_status(f"Building {n_channels} lazy channel proxies…")
-        channels: Dict[str, Any] = {}
-        for i, name in enumerate(channel_names):
-            if self.cancelled:
-                return {}
-            channels[name] = volume.to_lazy_channel(
-                c=i, m=0,
-                z_mode=self.z_projection, z_index=0,
-                z_start=self.z_start, z_end=self.z_end,
-                t_start=self.t_start, t_end=self.t_end,
-                t_stride=self.t_stride,
-            )
-            self.set_progress(35 + int(55 * (i + 1) / max(1, n_channels)))
+        self.set_status(
+            f"Materializing {n_files}-file composite volume into RAM…"
+        )
+
+        def _on_pct(pct: int) -> None:
+            self.set_progress(25 + int(70 * pct / 100))
+
+        dataset = materialize_from_volume(
+            composite,
+            z_mode=self.z_projection,
+            progress_cb=_on_pct,
+            cancel_cb=lambda: bool(self.cancelled),
+        )
+        # Composite is no longer needed; its child file handles can be
+        # closed (they were only kept open for the parallel decode).
+        try:
+            close = getattr(composite, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+        if self.cancelled:
+            return {}
+
+        channels: Dict[str, Any] = dataset.all_channels_as_lazy(m=0)
 
         ts = ext_meta.get("frame_timestamps_s") or []
         ts_array = np.asarray(ts, dtype=np.float64) if ts else None
@@ -185,9 +201,9 @@ class LoadWorker(BaseWorker):
         return {
             "metadata": ext_meta,
             "channels": channels,
-            "channel_names": channel_names,
+            "channel_names": list(dataset.channel_names),
             "frame_timestamps_s": ts_array,
-            "volume": volume,
+            "volume": dataset,
             "source_type": "nd2_multi",
         }
 
@@ -196,6 +212,7 @@ class LoadWorker(BaseWorker):
         from nd2studios.backend.tiff_loader import (
             LazyMultiFileTIFFVolume, read_tiff_meta_fast,
         )
+        from nd2studios.backend.materialized_loader import materialize_from_volume
 
         n_files = len(self.filepaths)
         axis = self.chain_axis
@@ -205,40 +222,53 @@ class LoadWorker(BaseWorker):
         # File 0 metadata as a base for the import payload.
         sorted_paths = sorted(self.filepaths, key=lambda p: os.path.basename(p))
         f0 = read_tiff_meta_fast(sorted_paths[0])
+        del f0  # noqa: F841 — only sanity-probed; metadata comes from composite
         self.set_progress(15)
 
         self.set_status(f"Opening composite TIFF volume (chain {axis})…")
-        volume = LazyMultiFileTIFFVolume(
+        composite = LazyMultiFileTIFFVolume(
             self.filepaths, axis, chain_mapping=self.chain_mapping,
         )
-        self.set_progress(40)
+        self.set_progress(25)
 
-        channel_names: List[str] = list(volume.channel_names)
-        channels: Dict[str, Any] = {}
-        for i, name in enumerate(channel_names):
-            if self.cancelled:
-                return {}
-            channels[name] = volume.to_lazy_channel(
-                c=i, m=0,
-                z_mode=self.z_projection, z_index=0,
-                t_start=self.t_start or 0, t_end=self.t_end,
-                t_stride=self.t_stride,
-            )
-            self.set_progress(40 + int(50 * (i + 1) / max(1, len(channel_names))))
+        self.set_status(
+            f"Materializing {n_files}-file composite TIFF into RAM…"
+        )
+
+        def _on_pct(pct: int) -> None:
+            self.set_progress(25 + int(70 * pct / 100))
+
+        dataset = materialize_from_volume(
+            composite,
+            z_mode=self.z_projection,
+            progress_cb=_on_pct,
+            cancel_cb=lambda: bool(self.cancelled),
+        )
+        try:
+            close = getattr(composite, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+        if self.cancelled:
+            return {}
+
+        channels: Dict[str, Any] = dataset.all_channels_as_lazy(m=0)
+        channel_names = list(dataset.channel_names)
 
         meta = {
-            "filepath": volume.filepath,
-            "source_filepaths": list(volume.filepaths),
+            "filepath": dataset.filepath,
+            "source_filepaths": list(self.filepaths),
             "chain_axis": axis,
-            "dtype": str(volume.dtype),
-            "height": volume.height,
-            "width": volume.width,
-            "n_timepoints": volume.n_timepoints,
-            "n_channels": volume.n_channels,
-            "n_zslices": volume.n_zslices,
-            "n_multipoints": volume.n_multipoints,
-            "pixel_size_um": volume.pixel_size_um,
-            "z_step_um": volume.z_step_um,
+            "dtype": str(dataset.dtype),
+            "height": dataset.height,
+            "width": dataset.width,
+            "n_timepoints": dataset.n_timepoints,
+            "n_channels": dataset.n_channels,
+            "n_zslices": dataset.n_zslices,
+            "n_multipoints": dataset.n_multipoints,
+            "pixel_size_um": dataset.pixel_size_um,
+            "z_step_um": dataset.z_step_um,
             "channel_names": channel_names,
             "channel_exposure_ms": [None] * len(channel_names),
             "channel_emission_nm": [None] * len(channel_names),
@@ -263,56 +293,54 @@ class LoadWorker(BaseWorker):
             "channels": channels,
             "channel_names": channel_names,
             "frame_timestamps_s": None,
-            "volume": volume,
+            "volume": dataset,
             "source_type": "tiff_multi",
         }
 
     # ── TIFF path ──
     def _load_tiff(self) -> Dict[str, Any]:
-        """Single-file TIFF load.
-
-        Always builds a :class:`LazyMultiFileTIFFVolume` (with one
-        member) so the multi-axis viewer can scroll Z exactly like it
-        does for ND2 files. Z is preserved in the volume; the per-channel
-        ``(T, H, W)`` proxies handed back honor the worker's
-        ``z_projection`` setting so the recipe pipeline still sees a
-        2-D timeseries.
-        """
+        """Single-file TIFF load — eager parallel materialize into RAM."""
         from nd2studios.backend.tiff_loader import LazyMultiFileTIFFVolume
+        from nd2studios.backend.materialized_loader import materialize_from_volume
 
         self.set_status("Inspecting TIFF…")
-        volume = LazyMultiFileTIFFVolume([self.filepath], chain_axis="Z")
-        self.set_progress(30)
+        composite = LazyMultiFileTIFFVolume([self.filepath], chain_axis="Z")
+        self.set_progress(20)
 
-        channel_names: List[str] = list(volume.channel_names)
-        n_channels = volume.n_channels
-        self.set_status(f"Building {n_channels} lazy channel proxies…")
-        channels: Dict[str, Any] = {}
-        for i, name in enumerate(channel_names):
-            if self.cancelled:
-                return {}
-            channels[name] = volume.to_lazy_channel(
-                c=i, m=0,
-                z_mode=self.z_projection, z_index=0,
-                z_start=self.z_start or 0,
-                z_end=self.z_end,
-                t_start=self.t_start or 0,
-                t_end=self.t_end,
-                t_stride=self.t_stride,
-            )
-            self.set_progress(30 + int(60 * (i + 1) / max(1, n_channels)))
+        self.set_status("Materializing TIFF into RAM…")
+
+        def _on_pct(pct: int) -> None:
+            self.set_progress(20 + int(75 * pct / 100))
+
+        dataset = materialize_from_volume(
+            composite,
+            z_mode=self.z_projection,
+            progress_cb=_on_pct,
+            cancel_cb=lambda: bool(self.cancelled),
+        )
+        try:
+            close = getattr(composite, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+        if self.cancelled:
+            return {}
+
+        channels: Dict[str, Any] = dataset.all_channels_as_lazy(m=0)
+        channel_names = list(dataset.channel_names)
 
         meta = {
-            "filepath": volume.filepath,
-            "dtype": str(volume.dtype),
-            "height": volume.height,
-            "width": volume.width,
-            "n_timepoints": volume.n_timepoints,
-            "n_channels": volume.n_channels,
-            "n_zslices": volume.n_zslices,
-            "n_multipoints": volume.n_multipoints,
-            "pixel_size_um": volume.pixel_size_um,
-            "z_step_um": volume.z_step_um,
+            "filepath": dataset.filepath,
+            "dtype": str(dataset.dtype),
+            "height": dataset.height,
+            "width": dataset.width,
+            "n_timepoints": dataset.n_timepoints,
+            "n_channels": dataset.n_channels,
+            "n_zslices": dataset.n_zslices,
+            "n_multipoints": dataset.n_multipoints,
+            "pixel_size_um": dataset.pixel_size_um,
+            "z_step_um": dataset.z_step_um,
             "channel_names": channel_names,
             "channel_exposure_ms": [None] * len(channel_names),
             "channel_emission_nm": [None] * len(channel_names),
@@ -336,6 +364,6 @@ class LoadWorker(BaseWorker):
             "channels": channels,
             "channel_names": channel_names,
             "frame_timestamps_s": None,
-            "volume": volume,
+            "volume": dataset,
             "source_type": "tiff",
         }

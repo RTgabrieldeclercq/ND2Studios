@@ -30,17 +30,13 @@ from PySide6.QtWidgets import (
     QPushButton, QSlider, QSplitter, QVBoxLayout, QWidget,
 )
 
-from nd2studios.backend.frame_cache import FrameCache
-from nd2studios.backend.nd2_volume import LazyND2Volume
+from nd2studios.backend.materialized_dataset import MaterializedDataset
 from nd2studios.core.settings import Settings
-from nd2studios.utils.resources import detect, recommended_cache_budget_bytes
-from nd2studios.utils.threading import IOWorker, PlaneRequest, start_io_worker
 from nd2studios.widgets.image_viewer import (
     CHANNEL_COLORS, ImageCanvas, ZoomToolbar,
 )
-from nd2studios.widgets.lut_histogram import LutHistogramWidget, apply_lut
+from nd2studios.widgets.lut_histogram import apply_lut
 from nd2studios.widgets.lut_sidebar import LutSidebar
-from nd2studios.workers.prefetch_worker import PrefetchManager
 
 
 def _gpu_display_enabled() -> bool:
@@ -145,7 +141,13 @@ class MultiAxisViewer(QWidget):
         # the sidebar tile section is populated.
         self._enable_tile_section = show_tile_preview
 
-        self._volume: Optional[LazyND2Volume] = None
+        # V1.41: ``_volume`` holds a :class:`MaterializedDataset` (or any
+        # object exposing the same surface). All pixel data is resident
+        # in RAM after :class:`LoadWorker` finishes; the viewer reads
+        # planes by direct ndarray indexing. The IOWorker / FrameCache /
+        # PrefetchManager stack from V1.34-V1.40 is gone — there is
+        # nothing to async, cache, or speculatively warm.
+        self._volume: Optional[MaterializedDataset] = None
         self._channels: Dict[str, Any] = {}
         self._chip_strip: List[ChannelChip] = []
         self._z_mode: str = "max"
@@ -160,7 +162,10 @@ class MultiAxisViewer(QWidget):
         self._t_timer = QTimer(self)
         self._z_timer = QTimer(self)
 
-        # Debounce timers — separate from the playback timers above.
+        # Debounce timers coalesce fast drag events (60 Hz+) into ~50 ms
+        # refresh ticks. With in-RAM data the refresh itself is cheap;
+        # the debounce mainly avoids redundant LUT recomputation and
+        # pyqtgraph texture uploads.
         self._t_debounce = QTimer(self)
         self._t_debounce.setSingleShot(True)
         self._t_debounce.setInterval(50)
@@ -176,38 +181,8 @@ class MultiAxisViewer(QWidget):
         self._m_debounce.setInterval(80)
         self._m_debounce.timeout.connect(self._do_m_refresh)
 
-        # V1.34 Phase 2: size the LRU adaptively from available RAM.
-        # On a 32 GB workstation with ~16 GB free this comes out to
-        # ≈ 6.4 GB (vs the V1.0 hard-coded 300 MB), trading the RAM
-        # the user has spare for fewer cache misses on scrub.
-        self._frame_cache: FrameCache = FrameCache(
-            max_bytes=recommended_cache_budget_bytes(reserve_fraction=0.6),
-        )
-        self._prefetch: Optional[PrefetchManager] = None
-        # V1.34 Phase 2: foreground IO worker — serves cache misses
-        # without freezing the GUI thread. See utils/threading.py.
-        self._io_worker: Optional[IOWorker] = None
-        self._io_thread = None
-        self._request_counter: int = 0
-        self._latest_request_id: int = 0
-        # V1.35 Phase 3: keys exempt from cache eviction while on screen.
-        # Re-derived from the set of channel planes that composited into
-        # the most recent successful render in _compose_current_frame.
-        self._pinned_keys: set = set()
         self._hist_cache: dict = {}  # (m, z_mode) -> True
         self._frame_post_process: Optional[Callable] = None
-
-        # V1.39 Phase 7: optional multi-resolution pyramid.
-        # ``_active_level == 0`` → read from the existing
-        # :class:`LazyND2Volume`/IOWorker path (V1.38 behaviour).
-        # ``_active_level >= 1`` → read synchronously from
-        # ``_pyramid_reader.get_frame(level, ...)``; cache keys are
-        # extended to 6-tuples ``(level, c, m, t, z, z_mode)`` so
-        # pyramid planes coexist with level-0 planes in the cache
-        # without colliding. The level is recomputed on every
-        # viewport change (``_on_viewport_changed``).
-        self._pyramid_reader: Optional[object] = None
-        self._active_level: int = 0
 
         self._build_ui()
 
@@ -371,19 +346,18 @@ class MultiAxisViewer(QWidget):
 
     # ── Population ──
     def set_volume(self,
-                   volume: Optional[LazyND2Volume],
+                   volume: Optional[MaterializedDataset],
                    channel_display: Optional[Dict[str, Dict[str, Any]]] = None,
                    z_mode: str = "max",
                    z_index: int = 0,
                    m: int = 0, t: int = 0, z: int = 0,
                    stage_xy_um: Optional[List[Tuple[float, float]]] = None) -> None:
-        """Wire up to a LazyND2Volume so M/T/Z scrolling reads from disk."""
-        if self._prefetch is not None:
-            self._prefetch.stop()
-            self._prefetch = None
-        self._teardown_io_worker()
-        self._frame_cache.clear()
-        self._pinned_keys.clear()
+        """Wire up to a :class:`MaterializedDataset` for M/T scrolling.
+
+        V1.41: ``volume`` is now an in-RAM dataset, not a lazy file
+        handle. Frame reads are direct ndarray indexing — no cache,
+        no IOWorker, no prefetcher.
+        """
         self._hist_cache.clear()
 
         self._volume = volume
@@ -417,9 +391,10 @@ class MultiAxisViewer(QWidget):
         self._configure_slider(self.t_slider, self.t_label, self._t_row,
                                 volume.n_timepoints, self._t, visible=True,
                                 play_btn=self._t_play, fps_spin=self._t_fps)
-        z_visible = volume.n_zslices > 1 and z_mode == "none"
+        # V1.41: Z is collapsed at load time; the Z slider is always
+        # hidden. The user re-loads to switch Z mode.
         self._configure_slider(self.z_slider, self.z_label, self._z_row,
-                                volume.n_zslices, self._z, visible=z_visible,
+                                1, 0, visible=False,
                                 play_btn=self._z_play, fps_spin=self._z_fps)
         self._update_axis_labels()
 
@@ -457,46 +432,7 @@ class MultiAxisViewer(QWidget):
                 tile_h=0, tile_w=0, n_multipoints=0,
             )
 
-        # Start background prefetch for the ND2 volume path.
-        if volume is not None:
-            # Volume types expose ``reopen()`` so the prefetch thread can
-            # get its own handle without leaking the source layout (single
-            # file vs. multi-file Z-stack composite).
-            def _factory(_v=volume):
-                return _v.reopen()
-
-            # V1.35 Phase 3: scale T-axis lookahead with available RAM.
-            # Three-tier table matches the framework-agnostic Phase 3
-            # doc. A laptop with 2 GB free can't store 16+ neighbors
-            # for a multi-channel scrub; the workstation can.
-            avail_gb = detect().available_ram_gb
-            if avail_gb < 2.0:
-                radius_t = 2
-            elif avail_gb < 8.0:
-                radius_t = 4
-            else:
-                radius_t = 8
-
-            self._prefetch = PrefetchManager(
-                reader_factory=_factory,
-                cache=self._frame_cache,
-                channels=list(range(volume.n_channels)),
-                parent=self,
-                radius_t=radius_t,
-            )
-            self._prefetch.frame_ready.connect(self._on_prefetch_ready)
-            self._prefetch.start()
-            # V1.34 Phase 2: foreground IO worker — same reopen() handle
-            # convention as the prefetcher (per-thread handle; nd2 file
-            # state is not thread-safe). Serves cache misses for the
-            # plane the user is *about* to display, so the GUI thread
-            # never blocks on disk inside _compose_current_frame.
-            self._io_worker, self._io_thread = start_io_worker(volume)
-            self._io_worker.plane_ready.connect(self._on_io_plane_ready)
-            self._io_worker.error.connect(self._on_io_error)
-            # Mark the initial M/Z-mode histogram as already sampled.
-            self._hist_cache[(self._m, self._z_mode)] = True
-
+        self._hist_cache[(self._m, self._z_mode)] = True
         self._refresh()
 
     def set_channels(self,
@@ -507,12 +443,6 @@ class MultiAxisViewer(QWidget):
         Used on the Recipe page where M is fixed and Z has been
         collapsed already.
         """
-        if self._prefetch is not None:
-            self._prefetch.stop()
-            self._prefetch = None
-        self._teardown_io_worker()
-        self._frame_cache.clear()
-        self._pinned_keys.clear()
         self._hist_cache.clear()
 
         for btn in (self._m_play, self._t_play, self._z_play):
@@ -645,16 +575,16 @@ class MultiAxisViewer(QWidget):
                          dtype=self._volume.dtype)
 
     # ── Slider handlers ──
+    # V1.41: all data is in RAM so refresh is essentially free; the
+    # debounce timers (50–80 ms) only coalesce 60+ Hz drag events into
+    # one render per tick, which is what pyqtgraph wants anyway.
     def _on_m_changed(self, v: int) -> None:
         self._m = int(v)
         self._update_axis_labels()
         # Keep the sidebar tile widget in sync with slider drags.
         self.lut_sidebar.set_current_m(self._m)
         self.coords_changed.emit(self._m, self._t, self._z)
-        if self._all_channels_cached():
-            self._do_refresh()
-        else:
-            self._m_debounce.start()
+        self._m_debounce.start()
 
     def _do_m_refresh(self) -> None:
         """Timer-delayed M refresh: resample histogram only on first visit."""
@@ -674,19 +604,13 @@ class MultiAxisViewer(QWidget):
         self._t = int(v)
         self._update_axis_labels()
         self.coords_changed.emit(self._m, self._t, self._z)
-        if self._all_channels_cached():
-            self._do_refresh()
-        else:
-            self._t_debounce.start()
+        self._t_debounce.start()
 
     def _on_z_changed(self, v: int) -> None:
         self._z = int(v)
         self._update_axis_labels()
         self.coords_changed.emit(self._m, self._t, self._z)
-        if self._all_channels_cached():
-            self._do_refresh()
-        else:
-            self._z_debounce.start()
+        self._z_debounce.start()
 
     def _set_axis_playing(self, axis: str, playing: bool) -> None:
         timer = {"m": self._m_timer, "t": self._t_timer, "z": self._z_timer}[axis]
@@ -716,182 +640,6 @@ class MultiAxisViewer(QWidget):
                                   _hi: float, _gamma: float) -> None:
         self._do_refresh()
         self.channels_changed.emit()
-
-    def _on_prefetch_ready(self, c: int, m: int, t: int,
-                           z: int, z_mode: str) -> None:
-        """Re-render when the newly cached frame completes the current view."""
-        if (m == self._m and t == self._t and z == self._z
-                and z_mode == self._z_mode and self._all_channels_cached()):
-            self._do_refresh()
-
-    def _on_io_plane_ready(self, request_id: int, key: tuple,
-                           plane: np.ndarray) -> None:
-        """Receive a plane from the V1.34 foreground :class:`IOWorker`.
-
-        Always caches the plane (stale results may still help a future
-        slider re-visit), but only redraws when the result matches the
-        most recent slider gesture. The IO worker normalizes to 2D on
-        its own thread so the GUI slot stays trivial.
-        """
-        try:
-            self._frame_cache.put(key, plane)
-        except Exception:
-            pass
-        if request_id == self._latest_request_id:
-            self._do_refresh()
-
-    def _on_io_error(self, request_id: int, message: str) -> None:
-        """Swallow IO worker errors silently for now.
-
-        We deliberately do not surface a modal here: an isolated read
-        failure during fast scrubbing is recoverable (the next gesture
-        re-requests), and a permanent failure will manifest on every
-        subsequent plane so the user notices anyway. Future work can
-        wire this into the status bar.
-        """
-        _ = request_id, message
-
-    def _teardown_io_worker(self) -> None:
-        """Stop the foreground IO worker + its thread, if running.
-
-        Called whenever the volume changes (``set_volume`` /
-        ``set_channels``). Mirrors the ``PrefetchManager.stop()``
-        teardown so neither worker outlives the file it was opened
-        for. Bounded ``wait(2000)`` so a stuck disk read can't hang
-        app shutdown.
-        """
-        if self._io_worker is not None:
-            try:
-                self._io_worker.stop()
-            except Exception:
-                pass
-            self._io_worker = None
-        if self._io_thread is not None:
-            try:
-                self._io_thread.quit()
-                self._io_thread.wait(2000)
-            except Exception:
-                pass
-            self._io_thread = None
-        # Bump the gating counter so any in-flight plane_ready arriving
-        # after teardown gets dropped by _on_io_plane_ready.
-        self._latest_request_id = self._request_counter + 1
-        self._request_counter = self._latest_request_id
-
-    # ── V1.39 Phase 7 — multi-resolution pyramid support ──
-    def attach_pyramid(self, reader) -> None:
-        """Bind a :class:`PyramidReader` to this viewer.
-
-        After attach, viewport changes choose the smallest pyramid
-        level whose width matches (or exceeds) the visible screen
-        extent. Passing ``None`` detaches; ``_active_level`` resets to
-        0 so the next refresh reads from the source volume.
-        """
-        self._pyramid_reader = reader
-        self._active_level = 0
-        # Connect once. The pyqtgraph ViewBox has a sigRangeChanged
-        # signal that fires on every pan/zoom — we use that to drive
-        # level selection. The legacy CPU canvas does not expose this
-        # signal, so the level always stays at 0 there (which is fine
-        # — the legacy path predates pyramids).
-        if reader is not None:
-            vb = self._viewbox_if_any()
-            if vb is not None:
-                try:
-                    vb.sigRangeChanged.connect(self._on_viewport_changed)
-                except Exception:  # noqa: BLE001 — defensive; already-connected re-call is harmless
-                    pass
-        # Immediate re-render so the right level is picked on attach.
-        self._on_viewport_changed()
-        self._do_refresh()
-
-    def detach_pyramid(self) -> None:
-        """Drop the pyramid binding; next refresh reads from level 0."""
-        self._pyramid_reader = None
-        self._active_level = 0
-
-    def _viewbox_if_any(self):
-        """Return the pyqtgraph :class:`ViewBox` of the active canvas, if any."""
-        vb = getattr(self.canvas, "_viewbox", None)
-        if vb is not None:
-            return vb
-        # Legacy canvas: no ViewBox.
-        return None
-
-    def _on_viewport_changed(self, *_args) -> None:
-        """Pick the best pyramid level for the current viewport.
-
-        Connected to the GPU canvas's :class:`ViewBox.sigRangeChanged`
-        signal. Cheap: compares the current image-pixel extent of the
-        view rectangle against the widget's screen-pixel size and asks
-        the reader which level wins. When the chosen level changes,
-        clear pinning, bump the request counter, and request a redraw.
-        """
-        if self._pyramid_reader is None:
-            return
-        vb = self._viewbox_if_any()
-        if vb is None:
-            return
-        try:
-            view_rect = vb.viewRect()
-            screen_w = max(1, vb.width())
-            image_w = max(1, int(round(view_rect.width())))
-        except Exception:  # noqa: BLE001 — never fail rendering on a probe
-            return
-        try:
-            level = int(self._pyramid_reader.pick_level_for_viewport(
-                viewport_screen_px=int(screen_w),
-                image_pixels_visible=int(image_w),
-            ))
-        except Exception:  # noqa: BLE001
-            level = 0
-        if level == self._active_level:
-            return
-        # Level change: invalidate pin set (old keys live at a
-        # different level), bump the gating counter so in-flight IO
-        # worker frames at the old level are dropped on arrival, and
-        # force a redraw.
-        for old_key in list(self._pinned_keys):
-            self._frame_cache.unpin(old_key)
-        self._pinned_keys.clear()
-        self._request_counter += 1
-        self._latest_request_id = self._request_counter
-        self._active_level = level
-        self._do_refresh()
-
-    def _frame_cache_key(self, c_idx: int) -> tuple:
-        """Cache key for the current ``(c, m, t, z, z_mode)`` and active level.
-
-        Level 0 keeps the V1.38 5-tuple shape so the prefetcher and
-        IO worker — both of which speak the 5-tuple convention —
-        continue working unchanged. Level ≥ 1 uses a 6-tuple that
-        cannot collide with the 5-tuples.
-        """
-        if self._active_level <= 0:
-            return (c_idx, self._m, self._t, self._z, self._z_mode)
-        return (
-            self._active_level, c_idx, self._m, self._t, self._z, self._z_mode,
-        )
-
-    def _read_pyramid_plane(self, c_idx: int) -> Optional[np.ndarray]:
-        """Synchronously read a single plane from the pyramid.
-
-        Only called when ``_active_level >= 1``. Pyramid planes are
-        small (a level-2 plane of a 2048² source is 512×512 ≈ 0.5 MB
-        decompressed), so the read is fast enough to do on the GUI
-        thread without a worker.
-        """
-        if self._pyramid_reader is None or self._volume is None:
-            return None
-        try:
-            plane = self._pyramid_reader.get_frame(
-                level=self._active_level,
-                c=c_idx, m=self._m, t=self._t, z=self._z,
-                z_mode=self._z_mode,
-            )
-        except Exception:  # noqa: BLE001 — fall back to source on any error
-            return None
-        return self._normalize_to_2d(plane)
 
     # ── GPU canvas helpers (V1.36 Phase 4) ──
     def _configure_gpu_canvas_channels(self, names: List[str]) -> None:
@@ -941,16 +689,12 @@ class MultiAxisViewer(QWidget):
     def _render_current_frame_gpu(self) -> bool:
         """Per-channel GPU render path.
 
-        Returns True if at least one channel was successfully pushed
-        to the canvas (the caller skips the CPU composite). Returns
-        False if no cached planes were available — the caller may
-        then fall back to the legacy path to display *something*.
-        Issues any missing-plane reads through the V1.34 IO worker
-        exactly like ``_compose_current_frame`` does, so cache misses
-        don't block the GUI thread.
+        V1.41: every plane comes from the in-RAM :class:`MaterializedDataset`,
+        so there is no cache miss path, no IOWorker dispatch, no
+        pyramid level swap. The whole function is "for each enabled
+        channel, push its (H, W) plane to the GPU canvas and let
+        pyqtgraph composite + LUT."
         """
-        sources_for_pin: List[Tuple[Any, tuple]] = []
-        missing_channels: List[int] = []
         any_pushed = False
 
         if self._volume is not None:
@@ -961,9 +705,7 @@ class MultiAxisViewer(QWidget):
                     self.canvas.set_channel_visible(c_idx, False)  # type: ignore[attr-defined]
                     continue
 
-                # Channel visibility + color + (linear) levels — these
-                # are the GPU-only changes the chip / LUT widgets used
-                # to trigger via a full recompose.
+                # Channel visibility + color + levels — GPU-side per-tick.
                 self.canvas.set_channel_visible(c_idx, chip.enabled)  # type: ignore[attr-defined]
                 self.canvas.set_channel_color(c_idx, chip.color_rgb)  # type: ignore[attr-defined]
                 lut = self.lut_sidebar.lut_for(name)
@@ -974,42 +716,15 @@ class MultiAxisViewer(QWidget):
                 if not chip.enabled:
                     continue
 
-                key = self._frame_cache_key(c_idx)
-                frame_2d = self._frame_cache.get(key)
+                frame_2d = self._read_volume_plane(c_idx, name)
                 if frame_2d is None:
-                    # Level ≥ 1: synchronous pyramid read (planes
-                    # are small; we don't pay for IOWorker dispatch).
-                    if self._active_level >= 1:
-                        plane = self._read_pyramid_plane(c_idx)
-                        if plane is not None:
-                            self._frame_cache.put(key, plane)
-                            frame_2d = plane
-                    if frame_2d is None:
-                        missing_channels.append(c_idx)
-                        continue
+                    continue
                 self.canvas.update_channel(c_idx, frame_2d)  # type: ignore[attr-defined]
-                sources_for_pin.append((chip, key))
                 any_pushed = True
-
-            # Level ≥ 1 reads are synchronous (above); the IO worker
-            # only services level-0 misses where the source decode
-            # dominates frame time. At higher levels every miss is
-            # already resolved by the time we reach this branch.
-            if (missing_channels and self._io_worker is not None
-                    and self._active_level == 0):
-                self._request_counter += 1
-                self._latest_request_id = self._request_counter
-                self._io_worker.cancel_all()
-                for c_idx in missing_channels:
-                    self._io_worker.submit(PlaneRequest(
-                        priority=0,
-                        request_id=self._latest_request_id,
-                        c=c_idx, m=self._m, t=self._t, z=self._z,
-                        z_mode=self._z_mode,
-                    ))
         else:
-            # Recipe-page flat-channel path — same as the CPU branch,
-            # but we push planes per chip rather than precompositing.
+            # Recipe-page flat-channel path — same as the volume branch
+            # but channels are indexed by name from an in-RAM dict that
+            # was already (T, H, W).
             for c_idx, chip in enumerate(self._chip_strip):
                 self.canvas.set_channel_visible(c_idx, chip.enabled)  # type: ignore[attr-defined]
                 self.canvas.set_channel_color(c_idx, chip.color_rgb)  # type: ignore[attr-defined]
@@ -1032,44 +747,39 @@ class MultiAxisViewer(QWidget):
                 self.canvas.update_channel(c_idx, frame_2d)  # type: ignore[attr-defined]
                 any_pushed = True
 
-        # Pinning bookkeeping mirrors the CPU branch — keep on-screen
-        # planes resident on a tight cache budget.
-        new_pinned = {key for _chip, key in sources_for_pin if key is not None}
-        for old_key in self._pinned_keys - new_pinned:
-            self._frame_cache.unpin(old_key)
-        for new_key in new_pinned - self._pinned_keys:
-            self._frame_cache.pin(new_key)
-        self._pinned_keys = new_pinned
-
-        # Velocity-biased prefetch (Phase 3) is independent of the
-        # render path; trigger it on every GPU refresh too.
-        if self._prefetch is not None and self._volume is not None:
-            self._prefetch.request_neighbors(
-                m=self._m, t=self._t, z=self._z,
-                t_range=(0, self._volume.n_timepoints - 1),
-                z_range=(0, self._volume.n_zslices - 1),
-                z_mode=self._z_mode,
-            )
-
         return any_pushed
 
-    def _all_channels_cached(self) -> bool:
-        """Return True if every enabled channel for current coords is cached.
+    def _read_volume_plane(self, c_idx: int, name: str) -> Optional[np.ndarray]:
+        """Fetch the current (m, t) plane for channel ``c_idx`` from RAM.
 
-        V1.39 Phase 7: honours :attr:`_active_level` via
-        :meth:`_frame_cache_key`. At level 0 this is the V1.38 5-tuple
-        lookup; at level ≥ 1 it checks the pyramid-level cache slot.
+        Fast path: if the dataset is a MaterializedDataset we index the
+        per-channel (M, T, H, W) array directly — zero copy. Otherwise
+        we fall back to the LazyND2Volume.get_frame interface for
+        backwards compatibility with any callers still wiring a lazy
+        volume in.
         """
-        if self._volume is None:
-            return False
-        for c_idx, name in enumerate(self._volume.channel_names):
-            chip = next((c for c in self._chip_strip if c.name == name), None)
-            if chip is None or not chip.enabled:
-                continue
-            key = self._frame_cache_key(c_idx)
-            if not self._frame_cache.contains(key):
-                return False
-        return True
+        volume = self._volume
+        if volume is None:
+            return None
+        # Fast path — MaterializedDataset has a ``channels`` dict.
+        channels = getattr(volume, "channels", None)
+        if channels is not None:
+            arr = channels.get(name)
+            if arr is None:
+                return None
+            try:
+                return arr[self._m, self._t]
+            except IndexError:
+                return None
+        # Compatibility path — call the LazyND2Volume API.
+        try:
+            plane = volume.get_frame(
+                c=c_idx, m=self._m, t=self._t,
+                z=self._z, z_mode=self._z_mode,
+            )
+        except Exception:
+            return None
+        return self._normalize_to_2d(plane)
 
     @staticmethod
     def _normalize_to_2d(frame) -> Optional[np.ndarray]:
@@ -1106,50 +816,29 @@ class MultiAxisViewer(QWidget):
         return a if a.ndim == 2 else None
 
     def _compose_current_frame(self) -> Optional[np.ndarray]:
-        # V1.35 Phase 3: track keys alongside (chip, plane) so we can
-        # pin the displayed planes against eviction.
-        sources: List[Tuple[ChannelChip, np.ndarray, Optional[tuple]]] = []
-        missing_channels: List[int] = []
+        """CPU-side RGB composite, used when the GPU canvas is off or
+        when a frame post-process hook needs a uint8 RGB array.
+
+        V1.41: every plane is read directly from the in-RAM dataset
+        (or the recipe-page channel dict). No cache, no IOWorker, no
+        prefetcher — those layers paid for themselves only when the
+        underlying reads were slow.
+        """
+        sources: List[Tuple[ChannelChip, np.ndarray]] = []
         if self._volume is not None:
             for c_idx, name in enumerate(self._volume.channel_names):
                 chip = next((c for c in self._chip_strip if c.name == name), None)
                 if chip is None or not chip.enabled:
                     continue
-                key = self._frame_cache_key(c_idx)
-                frame_2d = self._frame_cache.get(key)
+                plane = self._read_volume_plane(c_idx, name)
+                if plane is None:
+                    continue
+                frame_2d = self._normalize_to_2d(plane)
                 if frame_2d is None:
-                    # V1.39 Phase 7: level ≥ 1 — read pyramid plane
-                    # synchronously (cheap; small chunks).
-                    if self._active_level >= 1:
-                        plane = self._read_pyramid_plane(c_idx)
-                        if plane is not None:
-                            self._frame_cache.put(key, plane)
-                            frame_2d = plane
-                    if frame_2d is None:
-                        # V1.34 Phase 2: level-0 misses go through the
-                        # IO worker so the GUI does not block on disk.
-                        missing_channels.append(c_idx)
-                        continue
-                sources.append((chip, frame_2d, key))
-
-            if (missing_channels and self._io_worker is not None
-                    and self._active_level == 0):
-                self._request_counter += 1
-                self._latest_request_id = self._request_counter
-                # Drop any in-flight foreground requests the user has
-                # already moved past — the prefetcher is the one that
-                # speculatively warms neighbors, the IO worker is only
-                # for the plane(s) the viewer wants *right now*.
-                self._io_worker.cancel_all()
-                for c_idx in missing_channels:
-                    self._io_worker.submit(PlaneRequest(
-                        priority=0,
-                        request_id=self._latest_request_id,
-                        c=c_idx, m=self._m, t=self._t, z=self._z,
-                        z_mode=self._z_mode,
-                    ))
+                    continue
+                sources.append((chip, frame_2d))
         else:
-            # Recipe-page in-RAM channels — no cache, no pin needed.
+            # Recipe-page in-RAM channels.
             for chip in self._chip_strip:
                 if not chip.enabled:
                     continue
@@ -1163,26 +852,15 @@ class MultiAxisViewer(QWidget):
                 frame_2d = self._normalize_to_2d(frame)
                 if frame_2d is None:
                     continue
-                sources.append((chip, frame_2d, None))
+                sources.append((chip, frame_2d))
 
         if not sources:
             return None
 
-        # V1.35 Phase 3: pin the keys that composited into this render
-        # and unpin any previously-pinned keys we no longer use. Cache
-        # eviction (driven by prefetcher writes) will skip these so the
-        # on-screen plane stays resident even on a tight budget.
-        new_pinned = {key for _chip, _frame, key in sources if key is not None}
-        for old_key in self._pinned_keys - new_pinned:
-            self._frame_cache.unpin(old_key)
-        for new_key in new_pinned - self._pinned_keys:
-            self._frame_cache.pin(new_key)
-        self._pinned_keys = new_pinned
-
         sample = sources[0][1]
         h, w = sample.shape
         composite = np.zeros((h, w, 3), dtype=np.float32)
-        for chip, frame, _key in sources:
+        for chip, frame in sources:
             lut = self.lut_sidebar.lut_for(chip.name)
             if lut is None:
                 continue
@@ -1193,16 +871,6 @@ class MultiAxisViewer(QWidget):
             composite[..., 1] += mapped * (g / 255.0)
             composite[..., 2] += mapped * (b / 255.0)
 
-        if self._prefetch is not None and self._volume is not None:
-            # V1.35 Phase 3: drop the V1.17 ``n=5`` override so the
-            # manager applies its velocity-biased ``radius_t`` window.
-            self._prefetch.request_neighbors(
-                m=self._m, t=self._t, z=self._z,
-                t_range=(0, self._volume.n_timepoints - 1),
-                z_range=(0, self._volume.n_zslices - 1),
-                z_mode=self._z_mode,
-            )
-
         result = np.clip(composite, 0, 255).astype(np.uint8)
         if self._frame_post_process is not None:
             result = self._frame_post_process(result, self._t, self._m)
@@ -1212,7 +880,10 @@ class MultiAxisViewer(QWidget):
         if self._volume is not None:
             self.m_label.setText(f"{self._m + 1}/{self._volume.n_multipoints}")
             self.t_label.setText(f"{self._t + 1}/{self._volume.n_timepoints}")
-            self.z_label.setText(f"{self._z + 1}/{self._volume.n_zslices}")
+            # V1.41: Z is collapsed at load; the label is informational only.
+            self.z_label.setText(
+                f"{self._z + 1}/{getattr(self._volume, 'n_zslices', 1)}"
+            )
         else:
             n_t = self.t_slider.maximum() + 1 if self.t_slider.maximum() >= 0 else 0
             self.t_label.setText(f"{self._t + 1}/{n_t}")
@@ -1235,21 +906,21 @@ class MultiAxisViewer(QWidget):
         return self._m, self._t, self._z
 
     def cache_stats_text(self) -> str:
-        """One-line summary of the frame cache state.
+        """One-line summary of the in-RAM dataset footprint.
 
-        Format: ``Cache: <used>/<budget> MB · hit <rate>% · evictions <n>``.
-        Used by the V1.33 profiling harness and intended for a future
-        status-bar tooltip; safe to call from the GUI thread (the cache
-        snapshots stats under its own lock).
+        V1.41: there is no cache anymore; the dataset itself is the
+        cache. We report how many bytes the materialized channels are
+        holding — which is the relevant number for the user.
         """
-        s = self._frame_cache.stats
-        used_mb = s.current_bytes / (1024 ** 2)
-        budget_mb = self._frame_cache.max_bytes / (1024 ** 2)
-        return (
-            f"Cache: {used_mb:,.0f}/{budget_mb:,.0f} MB · "
-            f"hit {s.hit_rate * 100:.1f}% · "
-            f"evictions {s.evictions}"
-        )
+        if self._volume is None:
+            return "Volume: not loaded"
+        nbytes_fn = getattr(self._volume, "nbytes", None)
+        if callable(nbytes_fn):
+            mb = nbytes_fn() / (1024 ** 2)
+        else:
+            mb = 0.0
+        z_mode = getattr(self._volume, "z_mode", "?")
+        return f"In-RAM dataset: {mb:,.0f} MB · z_mode={z_mode}"
 
     def apply_channel_state(self, state: Dict[str, Dict[str, Any]]) -> None:
         for chip in self._chip_strip:
