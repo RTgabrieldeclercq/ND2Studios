@@ -465,6 +465,11 @@ class MainWindow(QMainWindow):
 
     def _reset_active_viewer_zoom(self) -> None:
         page = self.pages.get(self._current_page_key)
+        # ImportPage exposes reset_all_viewers() to fit every panel at once.
+        reset_all = getattr(page, "reset_all_viewers", None)
+        if callable(reset_all):
+            reset_all()
+            return
         viewer = getattr(page, "viewer", None)
         if viewer and hasattr(viewer, "canvas"):
             viewer.canvas.reset_zoom()
@@ -838,6 +843,20 @@ class MainWindow(QMainWindow):
 
     def set_status_text(self, text: str) -> None:
         self._status_text.setText(text)
+
+    def get_confirmed_records(self):
+        """Return all confirmed ND2StudiosRecord objects from the Import page."""
+        page = self.pages.get("import")
+        if page is None:
+            return []
+        fn = getattr(page, "get_confirmed_records", None)
+        if callable(fn):
+            return fn()
+        # Fallback: single active record if it has been imported.
+        exp = self.exp_manager.active
+        if exp is not None and getattr(exp, "status", None) not in (None, "new"):
+            return [exp]
+        return []
 
     # ── Session controls ───────────────────────────────────────────
     def _new_session(self) -> None:

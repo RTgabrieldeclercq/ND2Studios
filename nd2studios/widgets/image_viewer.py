@@ -123,7 +123,7 @@ class ZoomToolbar(QWidget):
         self.btn_zoom_in.clicked.connect(self._on_zoom_in)
         layout.addWidget(self.btn_zoom_in)
 
-        self.btn_zoom_out = QPushButton("\u2212")  # − (minus sign)
+        self.btn_zoom_out = QPushButton("-")
         self.btn_zoom_out.setToolTip("Zoom out")
         self.btn_zoom_out.setFixedSize(BTN_H, BTN_H)
         self.btn_zoom_out.clicked.connect(self._on_zoom_out)
@@ -240,6 +240,18 @@ class ImageCanvas(QLabel):
         rgb = np.ascontiguousarray(rgb_array)
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
         self._source_pixmap = QPixmap.fromImage(qimg)
+        self.update()
+
+    def set_pixmap_direct(self, pixmap: QPixmap) -> None:
+        """Display a pre-built QPixmap without creating a new QImage.
+
+        Hot path during cached playback — the caller paid the QImage→QPixmap
+        conversion cost once during pre-render; per-frame cost is now just
+        updating the source pixmap and triggering a paintEvent repaint.
+        """
+        self._img_h = pixmap.height()
+        self._img_w = pixmap.width()
+        self._source_pixmap = pixmap
         self.update()
 
     def set_grayscale(self, gray_uint8: np.ndarray):

@@ -94,6 +94,7 @@ def threshold_percentile(
     percentile_high: float | None = None,
     sanity_floor: int | None = None,
     sanity_ceiling: int | None = None,
+    hist: "Histogram | None" = None,
 ) -> np.ndarray:
     """Threshold by percentile of the image's histogram.
 
@@ -101,8 +102,12 @@ def threshold_percentile(
     `threshold_single`. `sanity_floor` clips the resolved `low` value to
     prevent calling bright pixels "dark" on images without genuine dark regions.
     `sanity_ceiling` is the symmetric guard for the bright end.
+
+    Pass a pre-computed ``hist`` to avoid a second full-frame bincount when
+    the caller has already built the histogram (e.g. :class:`HistogramThresholdSegmenter`).
     """
-    hist = compute_histogram(image, bit_depth=bit_depth)
+    if hist is None:
+        hist = compute_histogram(image, bit_depth=bit_depth)
     low = hist.percentile(percentile_low) if percentile_low is not None else None
     high = hist.percentile(percentile_high) if percentile_high is not None else None
 

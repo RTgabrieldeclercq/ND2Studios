@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel,
     QPushButton, QSlider, QSplitter, QVBoxLayout, QWidget,
@@ -37,6 +38,7 @@ from nd2studios.widgets.image_viewer import (
 )
 from nd2studios.widgets.lut_histogram import apply_lut
 from nd2studios.widgets.lut_sidebar import LutSidebar
+from nd2studios.workers.pre_render_worker import PreRenderWorker
 
 
 def _gpu_display_enabled() -> bool:
@@ -162,13 +164,13 @@ class MultiAxisViewer(QWidget):
         self._t_timer = QTimer(self)
         self._z_timer = QTimer(self)
 
-        # Debounce timers coalesce fast drag events (60 Hz+) into ~50 ms
-        # refresh ticks. With in-RAM data the refresh itself is cheap;
-        # the debounce mainly avoids redundant LUT recomputation and
-        # pyqtgraph texture uploads.
+        # T-slider debounce: 5ms coalesces rapid drag events without
+        # adding perceptible latency. The old 50ms was designed for the
+        # lazy-loading + IOWorker stack (V1.40 and earlier); with all
+        # data in RAM this overhead is gone.
         self._t_debounce = QTimer(self)
         self._t_debounce.setSingleShot(True)
-        self._t_debounce.setInterval(50)
+        self._t_debounce.setInterval(5)
         self._t_debounce.timeout.connect(self._do_refresh)
 
         self._z_debounce = QTimer(self)
@@ -183,6 +185,31 @@ class MultiAxisViewer(QWidget):
 
         self._hist_cache: dict = {}  # (m, z_mode) -> True
         self._frame_post_process: Optional[Callable] = None
+
+        # Pre-render frame cache.
+        # _render_cache: shared dict written by PreRenderWorker, read here.
+        # _pixmap_cache: main-thread QPixmap conversion of render_cache for
+        # the current M — frame display becomes a pure paintEvent swap.
+        self._render_cache: Dict[Tuple[int, int], np.ndarray] = {}
+        self._pixmap_cache: Dict[int, QPixmap] = {}  # T → QPixmap for current M
+        self._cache_m: int = -1      # which M the pixmap cache covers
+        self._cache_ready: bool = False
+        self._pre_render_worker: Optional[PreRenderWorker] = None
+
+        # Post-process overlay cache.
+        # Keyed by (m, t, pp_version); invalidated whenever the overlay
+        # content changes (new shape, vertex edit, LUT change).  Avoids
+        # re-running the full LUT+compose on every refresh when an overlay
+        # is active — the same gain the render_cache gives for base frames.
+        self._pp_cache: Dict[Tuple[int, int, int], np.ndarray] = {}
+        self._pp_pixmap_cache: Dict[Tuple[int, int, int], QPixmap] = {}
+        self._pp_version: int = 0
+
+        self._pixmap_build_timer = QTimer(self)
+        self._pixmap_build_timer.setSingleShot(True)
+        self._pixmap_build_timer.setInterval(0)  # fire on next event-loop tick
+        self._pixmap_build_timer.timeout.connect(self._build_next_pixmap_batch)
+        self._pixmap_build_t_idx: int = 0
 
         self._build_ui()
 
@@ -304,13 +331,13 @@ class MultiAxisViewer(QWidget):
         info = QLabel("0/0")
         info.setMinimumWidth(60)
         row.addWidget(info)
-        play_btn = QPushButton("▶")
+        play_btn = QPushButton(">")
         play_btn.setCheckable(True)
         play_btn.setFixedSize(28, 22)
         play_btn.setToolTip(f"Play / pause {label} axis")
         row.addWidget(play_btn)
         fps_spin = QDoubleSpinBox()
-        fps_spin.setRange(0.1, 30.0)
+        fps_spin.setRange(0.1, 60.0)
         fps_spin.setValue(5.0)
         fps_spin.setSingleStep(0.5)
         fps_spin.setSuffix(" fps")
@@ -319,6 +346,18 @@ class MultiAxisViewer(QWidget):
         row.addWidget(fps_spin)
         return row, slider, info, play_btn, fps_spin
 
+    def invalidate_post_process_cache(self) -> None:
+        """Discard cached overlay composites so the next refresh recomputes them.
+
+        Call this whenever the overlay *content* changes (new shape drawn,
+        vertex moved, analysis result received) but the base frame and LUT
+        have not changed.  LUT / chip changes should use
+        _invalidate_render_cache() which also clears this cache.
+        """
+        self._pp_version += 1
+        self._pp_cache.clear()
+        self._pp_pixmap_cache.clear()
+
     def set_frame_post_process(self, fn: Optional[Callable]) -> None:
         """Set a callable applied to the composited frame before display.
 
@@ -326,6 +365,7 @@ class MultiAxisViewer(QWidget):
         Pass None to remove any active hook.
         """
         self._frame_post_process = fn
+        self.invalidate_post_process_cache()
         self._do_refresh()
 
     # ── Crop tool ──
@@ -358,7 +398,12 @@ class MultiAxisViewer(QWidget):
         handle. Frame reads are direct ndarray indexing — no cache,
         no IOWorker, no prefetcher.
         """
+        self._cancel_pre_render_worker()
         self._hist_cache.clear()
+        self._render_cache.clear()
+        self._pixmap_cache.clear()
+        self._cache_m = -1
+        self._cache_ready = False
 
         self._volume = volume
         self._channels = {}
@@ -374,6 +419,11 @@ class MultiAxisViewer(QWidget):
                 btn.setChecked(False)
 
         if volume is None:
+            self._cancel_pre_render_worker()
+            self._render_cache.clear()
+            self._pixmap_cache.clear()
+            self._cache_m = -1
+            self._cache_ready = False
             self._populate_chip_strip([], channel_display or {})
             self.lut_sidebar.rebuild([], channel_display or {})
             self.lut_sidebar.set_tile_layout(
@@ -434,6 +484,7 @@ class MultiAxisViewer(QWidget):
 
         self._hist_cache[(self._m, self._z_mode)] = True
         self._refresh()
+        self._start_pre_render_worker()
 
     def set_channels(self,
                      channels: Dict[str, Any],
@@ -444,6 +495,11 @@ class MultiAxisViewer(QWidget):
         collapsed already.
         """
         self._hist_cache.clear()
+        self._cancel_pre_render_worker()
+        self._render_cache.clear()
+        self._pixmap_cache.clear()
+        self._cache_m = -1
+        self._cache_ready = False
 
         for btn in (self._m_play, self._t_play, self._z_play):
             if btn.isChecked():
@@ -588,6 +644,20 @@ class MultiAxisViewer(QWidget):
 
     def _do_m_refresh(self) -> None:
         """Timer-delayed M refresh: resample histogram only on first visit."""
+        # Pixmap cache is keyed by T for a single M — clear it on M change.
+        # The numpy render_cache retains all M positions (reusable if LUT unchanged).
+        if self._m != self._cache_m:
+            self._pixmap_cache.clear()
+            self._pixmap_build_timer.stop()
+            # If this M's frames are already in the render cache (pre-rendered
+            # while another M was active), start QPixmap conversion for it.
+            n_t = self._volume.n_timepoints if self._volume else 0
+            if n_t > 0 and all((self._m, t) in self._render_cache for t in range(n_t)):
+                self._cache_m = self._m
+                self._cache_ready = True
+                self._pixmap_build_t_idx = 0
+                self._pixmap_build_timer.start()
+
         hist_key = (self._m, self._z_mode)
         if hist_key not in self._hist_cache:
             self._populate_lut_samples_from_volume()
@@ -617,29 +687,166 @@ class MultiAxisViewer(QWidget):
         fps_spin = {"m": self._m_fps, "t": self._t_fps, "z": self._z_fps}[axis]
         play_btn = {"m": self._m_play, "t": self._t_play, "z": self._z_play}[axis]
         if playing:
-            interval = max(50, int(1000 / fps_spin.value()))
+            # When T-axis cache is ready allow 60fps (16ms floor);
+            # otherwise keep 50ms to avoid overloading the live compose path.
+            if axis == "t" and self._cache_ready:
+                min_interval = 16
+            else:
+                min_interval = 50
+            interval = max(min_interval, int(1000 / fps_spin.value()))
             timer.start(interval)
-            play_btn.setText("⏸")
+            play_btn.setText("||")  
         else:
             timer.stop()
-            play_btn.setText("▶")
+            play_btn.setText(">")
 
     def _axis_tick(self, slider: QSlider) -> None:
         if slider.maximum() <= 0:
             return
-        slider.setValue((slider.value() + 1) % (slider.maximum() + 1))
+        next_val = (slider.value() + 1) % (slider.maximum() + 1)
+        # Block valueChanged so the debounce timer is not started — the
+        # playback timer is the clock and we call _do_refresh directly below.
+        slider.blockSignals(True)
+        slider.setValue(next_val)
+        slider.blockSignals(False)
+        # Manually sync the internal coordinate and axis label.
+        if slider is self.t_slider:
+            self._t = next_val
+        elif slider is self.m_slider:
+            self._m = next_val
+        elif slider is self.z_slider:
+            self._z = next_val
+        self._update_axis_labels()
+        self.coords_changed.emit(self._m, self._t, self._z)
+        self._do_refresh()
 
     def _on_chip_state(self) -> None:
         # Keep the LUT sidebar swatches in sync when colors change.
         for chip in self._chip_strip:
             self.lut_sidebar.update_swatch(chip.name, chip.color_rgb)
+        # Color or enable/disable change alters the composite — invalidate
+        # any pre-rendered frames so they don't show stale colors.
+        self._invalidate_render_cache()
         self._do_refresh()
         self.channels_changed.emit()
 
     def _on_lut_contrast_changed(self, _name: str, _lo: float,
                                   _hi: float, _gamma: float) -> None:
+        self._invalidate_render_cache()
         self._do_refresh()
         self.channels_changed.emit()
+
+    # ── Pre-render cache management ──
+
+    def _start_pre_render_worker(self) -> None:
+        """Cancel any running pre-render and start a fresh one.
+
+        Only runs on the CPU path with a loaded volume.  The GPU canvas
+        handles compositing GPU-side; the recipe-page set_channels path
+        has no M axis and is always fast enough for live compose.
+        """
+        self._cancel_pre_render_worker()
+        if self._volume is None or self._use_gpu_canvas:
+            return
+
+        # Snapshot LUT and chip state on the main thread — the worker
+        # runs on a background thread and cannot touch Qt objects.
+        lut_snapshot: Dict[str, Tuple[float, float, float]] = {}
+        chip_snapshot: Dict[str, Tuple[bool, Tuple[int, int, int]]] = {}
+        for chip in self._chip_strip:
+            chip_snapshot[chip.name] = (chip.enabled, chip.color_rgb)
+            lut = self.lut_sidebar.lut_for(chip.name)
+            if lut is not None:
+                lut_snapshot[chip.name] = lut.get_contrast()
+
+        self._render_cache.clear()
+        self._pixmap_cache.clear()
+        self._pp_cache.clear()
+        self._pp_pixmap_cache.clear()
+        self._cache_m = -1
+        self._cache_ready = False
+
+        worker = PreRenderWorker(
+            volume=self._volume,
+            lut_snapshot=lut_snapshot,
+            chip_snapshot=chip_snapshot,
+            priority_m=self._m,
+            cache=self._render_cache,
+        )
+        worker.frame_cached.connect(self._on_frame_cached)
+        worker.finished.connect(self._on_pre_render_finished)
+        self._pre_render_worker = worker
+        worker.start()
+
+    def _cancel_pre_render_worker(self) -> None:
+        """Stop any running pre-render worker and wait up to 200ms for exit."""
+        if self._pre_render_worker is not None and \
+                self._pre_render_worker.isRunning():
+            self._pre_render_worker.cancel()
+            self._pre_render_worker.wait(200)
+        self._pre_render_worker = None
+        self._pixmap_build_timer.stop()
+
+    def _invalidate_render_cache(self) -> None:
+        """Clear render + pixmap caches and restart the pre-render worker."""
+        self._render_cache.clear()
+        self._pixmap_cache.clear()
+        self._pp_cache.clear()
+        self._pp_pixmap_cache.clear()
+        self._cache_m = -1
+        self._cache_ready = False
+        self._pixmap_build_timer.stop()
+        self._start_pre_render_worker()
+
+    def _on_frame_cached(self, m: int, t: int) -> None:
+        """Called via queued connection when the worker finishes one frame.
+
+        Refreshes the display if the newly cached frame is the one currently
+        being shown — snaps to the cached version without waiting for the
+        full priority-M series to finish.
+        """
+        if m == self._m and t == self._t and not self._cache_ready:
+            self._do_refresh()
+
+    def _on_pre_render_finished(self) -> None:
+        """Priority-M series is fully cached; activate the fast display path."""
+        self._cache_ready = True
+        # Tighten the T playback timer to 60fps now that frame display is
+        # essentially free (pixmap swap vs. full numpy compose).
+        if self._t_timer.isActive():
+            fps = self._t_fps.value()
+            self._t_timer.setInterval(max(16, int(1000 / fps)))
+        # Schedule QPixmap pre-conversion for the current M.
+        self._cache_m = self._m
+        self._pixmap_build_t_idx = 0
+        self._pixmap_build_timer.start()
+
+    def _build_next_pixmap_batch(self, batch_size: int = 5) -> None:
+        """Convert the next batch of numpy composites to QPixmap objects.
+
+        Runs on the main thread in small increments so the event loop stays
+        responsive between batches.  Each QPixmap.fromImage call costs ~1–3ms
+        at 2048×2048; batching 5 = ~5–15ms per event-loop spin, imperceptible.
+        """
+        m = self._cache_m
+        if m < 0 or self._volume is None:
+            return
+        n_t = self._volume.n_timepoints
+        built = 0
+        while self._pixmap_build_t_idx < n_t and built < batch_size:
+            t = self._pixmap_build_t_idx
+            key = (m, t)
+            if key in self._render_cache and t not in self._pixmap_cache:
+                rgb = self._render_cache[key]
+                h, w = rgb.shape[0], rgb.shape[1]
+                rgb_c = np.ascontiguousarray(rgb)
+                qimg = QImage(rgb_c.data, w, h, w * 3, QImage.Format.Format_RGB888)
+                # fromImage makes a deep copy so rgb_c can be released after.
+                self._pixmap_cache[t] = QPixmap.fromImage(qimg)
+            self._pixmap_build_t_idx += 1
+            built += 1
+        if self._pixmap_build_t_idx < n_t:
+            self._pixmap_build_timer.start()  # schedule next batch
 
     # ── GPU canvas helpers (V1.36 Phase 4) ──
     def _configure_gpu_canvas_channels(self, names: List[str]) -> None:
@@ -677,6 +884,55 @@ class MultiAxisViewer(QWidget):
                 # GPU path raised — fall through to the safe CPU
                 # composite path rather than show nothing.
                 pass
+
+        # QPixmap cache fast-path — zero numpy work, pure paintEvent swap.
+        # Only active on the volume path (not recipe-page set_channels).
+        if (self._volume is not None
+                and self._frame_post_process is None
+                and self._cache_m == self._m
+                and self._t in self._pixmap_cache):
+            self.canvas.set_pixmap_direct(self._pixmap_cache[self._t])
+            return
+
+        # numpy composite cache fast-path — skip LUT+compose, still needs
+        # QImage→QPixmap but that's ~1ms vs ~50ms for 2048×2048 live compose.
+        key = (self._m, self._t)
+        if (self._volume is not None
+                and self._frame_post_process is None
+                and key in self._render_cache):
+            self.canvas.set_image(self._render_cache[key])
+            return
+
+        # Post-process overlay fast-path: QPixmap already built for this
+        # (m, t, overlay-version) — zero numpy work, pure paintEvent swap.
+        pp_key = (self._m, self._t, self._pp_version)
+        if self._frame_post_process is not None:
+            if pp_key in self._pp_pixmap_cache:
+                self.canvas.set_pixmap_direct(self._pp_pixmap_cache[pp_key])
+                return
+            if pp_key in self._pp_cache:
+                pm = self._numpy_to_pixmap(self._pp_cache[pp_key])
+                self._pp_pixmap_cache[pp_key] = pm
+                self.canvas.set_pixmap_direct(pm)
+                return
+
+        # Render cache + post-process: skip LUT/channel compose, only pay
+        # for the overlay callback (rasterize + blend, ~10–30 ms vs ~50 ms
+        # for the full live compose on multi-channel 2K images).
+        key = (self._m, self._t)
+        if (self._volume is not None
+                and self._frame_post_process is not None
+                and key in self._render_cache):
+            processed = self._frame_post_process(
+                self._render_cache[key].copy(), self._t, self._m
+            )
+            self._pp_cache[pp_key] = processed
+            pm = self._numpy_to_pixmap(processed)
+            self._pp_pixmap_cache[pp_key] = pm
+            self.canvas.set_pixmap_direct(pm)
+            return
+
+        # Live compose fallback (GPU off, no cache, or recipe-page path).
         composite = self._compose_current_frame()
         if composite is None:
             return
@@ -782,6 +1038,14 @@ class MultiAxisViewer(QWidget):
         return self._normalize_to_2d(plane)
 
     @staticmethod
+    def _numpy_to_pixmap(rgb: np.ndarray) -> QPixmap:
+        """Convert a (H, W, 3) uint8 array to a QPixmap (deep copy, safe to cache)."""
+        h, w = rgb.shape[0], rgb.shape[1]
+        rgb_c = np.ascontiguousarray(rgb)
+        qimg = QImage(rgb_c.data, w, h, w * 3, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qimg)
+
+    @staticmethod
     def _normalize_to_2d(frame) -> Optional[np.ndarray]:
         """Coerce any reasonable frame shape into 2D `(H, W)`.
 
@@ -872,8 +1136,22 @@ class MultiAxisViewer(QWidget):
             composite[..., 2] += mapped * (b / 255.0)
 
         result = np.clip(composite, 0, 255).astype(np.uint8)
+
+        # Fill render cache on-demand so the post-process fast-path in
+        # _do_refresh can use it on subsequent refreshes.  This also
+        # benefits the GPU-canvas path, which skips PreRenderWorker but
+        # still needs a cached base when an overlay is active.
+        key = (self._m, self._t)
+        if self._volume is not None and key not in self._render_cache:
+            self._render_cache[key] = result
+
         if self._frame_post_process is not None:
-            result = self._frame_post_process(result, self._t, self._m)
+            processed = self._frame_post_process(result.copy(), self._t, self._m)
+            pp_key = (self._m, self._t, self._pp_version)
+            self._pp_cache[pp_key] = processed
+            self._pp_pixmap_cache[pp_key] = self._numpy_to_pixmap(processed)
+            return processed
+
         return result
 
     def _update_axis_labels(self) -> None:
@@ -946,3 +1224,10 @@ class MultiAxisViewer(QWidget):
         for chip in self._chip_strip:
             self.lut_sidebar.update_swatch(chip.name, chip.color_rgb)
         self._refresh()
+
+    def set_t_playing(self, playing: bool, fps: Optional[float] = None) -> None:
+        """Start or stop T-axis playback; optionally set FPS first."""
+        if fps is not None:
+            self._t_fps.setValue(fps)
+        if self._t_play.isChecked() != playing:
+            self._t_play.setChecked(playing)

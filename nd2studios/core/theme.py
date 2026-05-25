@@ -34,6 +34,47 @@ QToolTip {
     border-radius: 0px;
 }
 
+/* FILE PANEL (multi-file side-by-side on Import page) */
+#filePanelHeader {
+    background-color: #21252b;
+    border-bottom: 1px solid #44475a;
+    border-top: 1px solid #44475a;
+}
+QLabel#filePanelTitle {
+    color: #bd93f9;
+    font: bold 9pt "Helvetica Neue";
+    padding-left: 4px;
+}
+QPushButton#filePanelCollapseBtn {
+    background-color: #343b48;
+    color: #f8f8f2;
+    border: 1px solid #44475a;
+    border-radius: 3px;
+    font: bold 10pt "Helvetica Neue";
+    padding: 0;
+}
+QPushButton#filePanelCollapseBtn:hover {
+    background-color: #50576a;
+    border-color: #6272a4;
+}
+QPushButton#filePanelCloseBtn {
+    background-color: #343b48;
+    color: #f8f8f2;
+    border: 1px solid #44475a;
+    border-radius: 3px;
+    font: bold 10pt "Helvetica Neue";
+    padding: 0;
+}
+QPushButton#filePanelCloseBtn:hover {
+    background-color: #ff5555;
+    color: #f8f8f2;
+    border-color: #ff5555;
+}
+#filePanelControls {
+    background-color: #21252b;
+    border-right: 1px solid #44475a;
+}
+
 /* FRAMES & PANELS */
 #leftMenuBg {
     background-color: #21252b;

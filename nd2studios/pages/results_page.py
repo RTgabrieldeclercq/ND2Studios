@@ -96,6 +96,7 @@ class ResultsPage(QWidget):
         self._measurements: List[Dict[str, Any]] = []
         self._current_pipeline: str = ""
         self._exp: Optional[ND2StudiosRecord] = None
+        self._selected_rec: Optional[ND2StudiosRecord] = None
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -104,6 +105,18 @@ class ResultsPage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
+
+        # ── File selector (hidden when single file) ──
+        self._file_selector_row = QWidget()
+        fs_layout = QHBoxLayout(self._file_selector_row)
+        fs_layout.setContentsMargins(0, 0, 0, 0)
+        fs_layout.setSpacing(4)
+        fs_layout.addWidget(QLabel("File:"))
+        self._combo_file = QComboBox()
+        self._combo_file.currentIndexChanged.connect(self._on_file_selected)
+        fs_layout.addWidget(self._combo_file, stretch=1)
+        self._file_selector_row.hide()
+        root.addWidget(self._file_selector_row)
 
         # ── Top controls row ──
         ctrl_row = QHBoxLayout()
@@ -218,13 +231,15 @@ class ResultsPage(QWidget):
     # ── Page lifecycle ────────────────────────────────────────────────────────
 
     def on_activated(self) -> None:
-        exp = self._exp
+        self._rebuild_file_selector()
+        exp = self._selected_rec or self._exp
         if exp is None and self.main_window is not None:
             exp = self.main_window.exp_manager.active
         self._refresh_pipeline_combo(exp)
 
     def load_from_experiment(self, exp: ND2StudiosRecord) -> None:
         self._exp = exp
+        self._selected_rec = exp
         cfg = exp.results_config
         if cfg.get("pipeline"):
             idx = self._combo_pipeline.findText(cfg["pipeline"])
@@ -237,6 +252,56 @@ class ResultsPage(QWidget):
             "pipeline": self._combo_pipeline.currentText(),
             "image_format": self._combo_img_fmt.currentText().lower(),
         }
+
+    # ── File selector ─────────────────────────────────────────────────────────
+
+    def _rebuild_file_selector(self) -> None:
+        """Populate the file-selector combo from all confirmed records."""
+        if self.main_window is None:
+            return
+        fn = getattr(self.main_window, "get_confirmed_records", None)
+        records: List[ND2StudiosRecord] = fn() if callable(fn) else []
+        if not records:
+            exp = self.main_window.exp_manager.active
+            if exp is not None:
+                records = [exp]
+
+        self._combo_file.blockSignals(True)
+        self._combo_file.clear()
+        for rec in records:
+            import os as _os
+            label = _os.path.basename(
+                (getattr(rec, "import_config", {}) or {}).get("filepath", "")
+                or (getattr(rec, "nd2_metadata", {}) or {}).get("filepath", "")
+            ) or "Untitled"
+            self._combo_file.addItem(label)
+        self._combo_file.blockSignals(False)
+
+        self._file_selector_row.setVisible(len(records) > 1)
+
+        # Default to whichever confirmed record has analysis results, keeping
+        # any existing selection if it's still valid.
+        current_idx = self._combo_file.currentIndex()
+        best_idx = 0
+        for i, rec in enumerate(records):
+            if getattr(rec, "analysis_results", None):
+                best_idx = i
+                break
+        target_idx = current_idx if 0 <= current_idx < len(records) else best_idx
+        self._combo_file.setCurrentIndex(target_idx)
+        self._selected_rec = records[target_idx] if records else None
+
+    def _on_file_selected(self, index: int) -> None:
+        if self.main_window is None:
+            return
+        fn = getattr(self.main_window, "get_confirmed_records", None)
+        records: List[ND2StudiosRecord] = fn() if callable(fn) else []
+        if not records:
+            exp = self.main_window.exp_manager.active
+            if exp is not None:
+                records = [exp]
+        self._selected_rec = records[index] if 0 <= index < len(records) else None
+        self._refresh_pipeline_combo(self._selected_rec)
 
     # ── Pipeline combo ────────────────────────────────────────────────────────
 
@@ -352,7 +417,7 @@ class ResultsPage(QWidget):
         from nd2studios.backend.results_engine import compute_measurements
         from nd2studios.core.analysis_registry import AnalysisResult
 
-        exp = self._exp
+        exp = self._selected_rec or self._exp
         if exp is None and self.main_window is not None:
             exp = self.main_window.exp_manager.active
         if exp is None:
@@ -521,7 +586,7 @@ class ResultsPage(QWidget):
         from nd2studios.backend.results_engine import export_label_masks_tiff
         from nd2studios.core.analysis_registry import AnalysisResult
 
-        exp = self._exp
+        exp = self._selected_rec or self._exp
         if exp is None and self.main_window is not None:
             exp = self.main_window.exp_manager.active
         if exp is None:
@@ -568,7 +633,7 @@ class ResultsPage(QWidget):
         from nd2studios.backend.results_engine import export_overlay_frames
         from nd2studios.core.analysis_registry import AnalysisResult
 
-        exp = self._exp
+        exp = self._selected_rec or self._exp
         if exp is None and self.main_window is not None:
             exp = self.main_window.exp_manager.active
         if exp is None:

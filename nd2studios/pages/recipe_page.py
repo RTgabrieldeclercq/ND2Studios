@@ -14,6 +14,13 @@ Workflow:
 6. "Remove Last" pops the last step from the recipe and reprocesses.
 7. "Save Recipe" / "Load Recipe" persist the recipe (without dataset)
    as `.nd2s_recipe.json` so it can be applied to other ND2 files.
+
+Multi-file layout (V1.1):
+- When 1 confirmed file: Raw | Processed side-by-side (horizontal split).
+- When >1 confirmed files: each file gets a vertical column (Raw over
+  Processed); columns sit side-by-side in the outer horizontal splitter.
+- Trial / Accept / Reject operate on ALL confirmed files in parallel.
+  Crop only affects the primary (index 0) file.
 """
 from __future__ import annotations
 
@@ -42,6 +49,43 @@ from nd2studios.backend.recipes import (
 )
 
 
+class _RecipeColumn:
+    """Per-confirmed-file viewer pair on the Recipe page."""
+
+    def __init__(
+        self,
+        record: ND2StudiosRecord,
+        label: str,
+        vertical: bool,
+    ) -> None:
+        self.record = record
+        self.worker: Optional[RecipeWorker] = None
+
+        raw_w = QWidget()
+        raw_l = QVBoxLayout(raw_w)
+        raw_l.setContentsMargins(0, 0, 0, 0)
+        raw_hdr = f"{label} — Raw" if vertical else "Raw"
+        raw_l.addWidget(QLabel(raw_hdr, objectName="sectionHeader"))
+        self.viewer_raw = MultiAxisViewer(raw_w)
+        raw_l.addWidget(self.viewer_raw, stretch=1)
+
+        proc_w = QWidget()
+        proc_l = QVBoxLayout(proc_w)
+        proc_l.setContentsMargins(0, 0, 0, 0)
+        proc_hdr = "Processed" if vertical else "Processed (current state + trial)"
+        proc_l.addWidget(QLabel(proc_hdr, objectName="sectionHeader"))
+        self.viewer_proc = MultiAxisViewer(proc_w)
+        proc_l.addWidget(self.viewer_proc, stretch=1)
+
+        orientation = (Qt.Orientation.Vertical if vertical
+                       else Qt.Orientation.Horizontal)
+        self.widget = QSplitter(orientation)
+        self.widget.addWidget(raw_w)
+        self.widget.addWidget(proc_w)
+        self.widget.setStretchFactor(0, 1)
+        self.widget.setStretchFactor(1, 1)
+
+
 class RecipePage(QWidget):
     """Page 2: build a processing recipe."""
 
@@ -54,8 +98,15 @@ class RecipePage(QWidget):
         # Trial state.
         self._trial_step: Optional[Tuple[str, Dict[str, Any]]] = None
         self._worker: Optional[RecipeWorker] = None
+        self._extra_workers: List[RecipeWorker] = []
+        self._pending_secondary_recipe: Optional[List[Tuple[str, Dict[str, Any]]]] = None
+        # Per-file columns (populated by _rebuild_columns).
+        self._columns: List[_RecipeColumn] = []
         # Crop state — in-session only, not persisted.
         self._crop_rect: Optional[Tuple[int, int, int, int]] = None  # x, y, w, h
+        # Tracks the M position currently shown in the raw viewer so that
+        # _raw_channels stays in sync when the user moves the M slider.
+        self._current_m: int = 0
 
         self._build_ui()
         self._populate_plugin_list()
@@ -154,40 +205,175 @@ class RecipePage(QWidget):
         ll.addStretch(1)
         outer.addWidget(left)
 
-        # Right column: before / after preview.
-        right = QSplitter(Qt.Orientation.Horizontal)
-        before_w = QWidget()
-        bl = QVBoxLayout(before_w)
-        bl.setContentsMargins(0, 0, 0, 0)
-        bl.addWidget(QLabel("Raw", objectName="sectionHeader"))
-        self.viewer_raw = MultiAxisViewer(before_w)
-        bl.addWidget(self.viewer_raw, stretch=1)
-        right.addWidget(before_w)
+        # Dynamic viewer area — rebuilt in _rebuild_columns().
+        self._viewer_area = QSplitter(Qt.Orientation.Horizontal)
+        outer.addWidget(self._viewer_area, stretch=1)
 
-        after_w = QWidget()
-        al = QVBoxLayout(after_w)
-        al.setContentsMargins(0, 0, 0, 0)
-        al.addWidget(QLabel("Processed (current state + trial)",
-                            objectName="sectionHeader"))
-        self.viewer_proc = MultiAxisViewer(after_w)
-        al.addWidget(self.viewer_proc, stretch=1)
-        right.addWidget(after_w)
-
-        right.setStretchFactor(0, 1)
-        right.setStretchFactor(1, 1)
-        outer.addWidget(right, stretch=1)
-
-        # Crop signal wiring (viewers exist now)
+        # Crop signal wiring is deferred to _rebuild_columns() because the
+        # primary viewer_raw is not created until the columns are built.
         self.btn_crop_mode.toggled.connect(self._on_crop_mode_toggled)
         self.btn_reset_crop.clicked.connect(self._reset_crop)
-        self.viewer_raw.canvas.clicked.connect(self._on_canvas_click)
-        self.viewer_raw.crop_rect_selected.connect(self._on_crop_drag)
+
+    # ── Column helpers ───────────────────────────────────────────────
+
+    @property
+    def viewer_raw(self) -> Optional[MultiAxisViewer]:
+        return self._columns[0].viewer_raw if self._columns else None
+
+    @property
+    def viewer_proc(self) -> Optional[MultiAxisViewer]:
+        return self._columns[0].viewer_proc if self._columns else None
+
+    def _rebuild_columns(self) -> bool:
+        """Rebuild the viewer area to match currently confirmed records.
+
+        Returns True if columns were actually rebuilt (callers may use this
+        to decide whether to repopulate viewers), False on fast-path.
+        """
+        # Collect confirmed records; fall back to primary active record.
+        records: List[ND2StudiosRecord] = []
+        if self.main_window is not None:
+            fn = getattr(self.main_window, "get_confirmed_records", None)
+            if callable(fn):
+                records = fn()
+        if not records and self.main_window is not None:
+            exp = self.main_window.exp_manager.active
+            if exp is not None:
+                records = [exp]
+
+        # Fast path: if records match current columns, skip rebuild.
+        current_recs = [c.record for c in self._columns]
+        if records == current_recs and self._columns:
+            return False
+
+        # Disconnect crop and coord signals from old primary viewer.
+        if self._columns:
+            old_raw = self._columns[0].viewer_raw
+            try:
+                old_raw.canvas.clicked.disconnect(self._on_canvas_click)
+                old_raw.crop_rect_selected.disconnect(self._on_crop_drag)
+                old_raw.coords_changed.disconnect(self._on_raw_coords_changed)
+            except RuntimeError:
+                pass
+
+        # Remove all column widgets from viewer_area.
+        while self._viewer_area.count() > 0:
+            w = self._viewer_area.widget(0)
+            if w is not None:
+                w.setParent(None)  # type: ignore[arg-type]
+
+        self._columns.clear()
+
+        vertical = len(records) > 1
+        for i, rec in enumerate(records):
+            import os as _os
+            label = _os.path.basename(
+                (getattr(rec, "import_config", {}) or {}).get("filepath", "")
+                or (getattr(rec, "nd2_metadata", {}) or {}).get("filepath", "")
+            ) or f"File {i + 1}"
+            col = _RecipeColumn(rec, label, vertical)
+            self._viewer_area.addWidget(col.widget)
+            self._columns.append(col)
+
+        if not self._columns:
+            # No confirmed records: create a blank placeholder column.
+            col = _RecipeColumn(
+                ND2StudiosRecord(),
+                "Raw",
+                vertical=False,
+            )
+            self._viewer_area.addWidget(col.widget)
+            self._columns.append(col)
+
+        # Equal widths.
+        n = max(self._viewer_area.count(), 1)
+        total = max(self._viewer_area.width(), 400)
+        self._viewer_area.setSizes([total // n] * n)
+
+        # Reconnect crop and coord signals to the new primary viewer.
+        primary_raw = self._columns[0].viewer_raw
+        primary_raw.canvas.clicked.connect(self._on_canvas_click)
+        primary_raw.crop_rect_selected.connect(self._on_crop_drag)
+        primary_raw.coords_changed.connect(self._on_raw_coords_changed)
+        return True
+
+    def _populate_viewers_from_records(self) -> None:
+        """Load channel data into each column's viewers from its record."""
+        for col in self._columns:
+            rec = col.record
+            if rec is None:
+                continue
+            if rec._raw_channels or rec._raw_volume is not None:
+                self._populate_column_raw(col, rec)
+                if rec._processed_channels:
+                    col.viewer_proc.set_channels(
+                        rec._processed_channels,
+                        channel_display=rec.channel_display,
+                    )
+                elif rec._processed_view is not None and self._recipe:
+                    try:
+                        processed = rec._processed_view.materialize_all()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    else:
+                        rec._processed_channels = processed
+                        col.viewer_proc.set_channels(
+                            processed, channel_display=rec.channel_display,
+                        )
+
+    def _populate_column_raw(
+        self, col: _RecipeColumn, rec: ND2StudiosRecord
+    ) -> None:
+        if rec._raw_volume is not None and rec.crop_rect is None:
+            col.viewer_raw.set_volume(
+                rec._raw_volume,
+                channel_display=rec.channel_display,
+                z_mode=rec.z_view_mode or "max",
+                z_index=rec.z_view_index or 0,
+                m=rec.m_index, t=0, z=rec.z_view_index or 0,
+            )
+        else:
+            col.viewer_raw.set_channels(
+                rec._raw_channels or {},
+                channel_display=rec.channel_display,
+            )
+
+    def _on_raw_coords_changed(self, m: int, t: int, z: int) -> None:
+        """Sync _raw_channels and m_index when the raw viewer's M slider moves.
+
+        This keeps the recipe worker's input in step with what the user is
+        looking at, so Trial / Reject always operate on the displayed M.
+        """
+        if self._current_m == m:
+            return
+        self._current_m = m
+        if self.main_window is None:
+            return
+        exp = self.main_window.exp_manager.active
+        if exp is None or exp._raw_volume is None:
+            return
+        exp.m_index = m
+        channels = exp._raw_volume.all_channels_as_lazy(
+            m=m,
+            z_mode=exp.z_view_mode or "max",
+            z_index=exp.z_view_index or 0,
+        )
+        if exp.channel_display:
+            enabled = [
+                n for n, cfg in exp.channel_display.items()
+                if cfg.get("enabled", True)
+            ]
+            if enabled:
+                channels = {n: channels[n] for n in enabled if n in channels}
+        exp._raw_channels = channels
 
     # ── Crop ──
     def _on_crop_mode_toggled(self, enabled: bool) -> None:
-        self.viewer_raw.set_crop_mode(enabled)
-        if enabled:
-            self.viewer_raw.zoom_toolbar.btn_pan.setChecked(False)
+        vr = self.viewer_raw
+        if vr is not None:
+            vr.set_crop_mode(enabled)
+            if enabled:
+                vr.zoom_toolbar.btn_pan.setChecked(False)
 
     def _on_canvas_click(self, iy: float, ix: float) -> None:
         if not self.btn_crop_mode.isChecked():
@@ -312,14 +498,19 @@ class RecipePage(QWidget):
         self.btn_reset_crop.setEnabled(True)
         self.lbl_crop_status.setText(f"Crop: x={x}, y={y}, {w}×{h} px")
 
-        # After crop, always show the flat cropped channels (no Z volume path).
-        self.viewer_raw.set_channels(cropped, channel_display=exp.channel_display)
-        if self._recipe:
-            self._run_recipe(exp, list(self._recipe),
-                             label="Re-running recipe on cropped data…",
-                             on_done=self._on_revert_done)
-        else:
-            self.viewer_proc.set_channels(cropped, channel_display=exp.channel_display)
+        primary_col = self._columns[0] if self._columns else None
+        if primary_col:
+            primary_col.viewer_raw.set_channels(
+                cropped, channel_display=exp.channel_display)
+            if self._recipe:
+                self._run_recipe_on(
+                    exp, list(self._recipe),
+                    label="Re-running recipe on cropped data…",
+                    on_done=lambda processed, col=primary_col, e=exp: self._on_revert_done_col(processed, col, e),
+                )
+            else:
+                primary_col.viewer_proc.set_channels(
+                    cropped, channel_display=exp.channel_display)
 
     def _reset_crop(self) -> None:
         if self.main_window is None or self.main_window.exp_manager.active is None:
@@ -336,13 +527,18 @@ class RecipePage(QWidget):
         self.btn_reset_crop.setEnabled(False)
         self.lbl_crop_status.setText("No crop applied")
 
-        self._refresh_raw_viewer(exp)
-        if self._recipe:
-            self._run_recipe(exp, list(self._recipe),
-                             label="Re-running recipe after crop reset…",
-                             on_done=self._on_revert_done)
-        else:
-            self.viewer_proc.set_channels(exp._raw_channels, channel_display=exp.channel_display)
+        primary_col = self._columns[0] if self._columns else None
+        if primary_col:
+            self._populate_column_raw(primary_col, exp)
+            if self._recipe:
+                self._run_recipe_on(
+                    exp, list(self._recipe),
+                    label="Re-running recipe after crop reset…",
+                    on_done=lambda processed, col=primary_col, e=exp: self._on_revert_done_col(processed, col, e),
+                )
+            else:
+                primary_col.viewer_proc.set_channels(
+                    exp._raw_channels, channel_display=exp.channel_display)
 
     def _populate_plugin_list(self) -> None:
         # Force-import to ensure registration.
@@ -359,9 +555,14 @@ class RecipePage(QWidget):
         if self.main_window is None or self.main_window.exp_manager.active is None:
             return
         exp = self.main_window.exp_manager.active
-        # Restore crop UI from the experiment record (survives tab navigation).
-        # exp._original_raw_channels persists on the record for all file types,
-        # so no reconstruction from _raw_volume is needed.
+        self._current_m = int(getattr(exp, "m_index", 0))
+
+        # Rebuild columns to match currently confirmed records.
+        # Only re-populate viewers when the column set actually changed
+        # (avoids redundant set_channels calls on every tab switch).
+        rebuilt = self._rebuild_columns()
+
+        # Restore crop UI from the experiment record.
         self.btn_crop_mode.setChecked(False)
         if exp.crop_rect is not None:
             x, y, w, h = exp.crop_rect
@@ -372,51 +573,14 @@ class RecipePage(QWidget):
             self._crop_rect = None
             self.btn_reset_crop.setEnabled(False)
             self.lbl_crop_status.setText("No crop applied")
-        # Refresh the raw preview from the active experiment.
-        if exp._raw_channels:
-            self._refresh_raw_viewer(exp)
-            # If a processed cache already exists, mirror it on the right.
-            if exp._processed_channels:
-                self.viewer_proc.set_channels(exp._processed_channels,
-                                              channel_display=exp.channel_display)
-            elif exp._processed_view is not None and self._recipe:
-                # V1.38 Phase 6 — re-materialize the committed recipe so
-                # the right viewer is populated when the user navigates
-                # back from a downstream page. The lazy view caches the
-                # result so subsequent re-entries are instant.
-                try:
-                    processed = exp._processed_view.materialize_all()
-                except Exception as exc:  # noqa: BLE001
-                    if self.main_window is not None:
-                        self.main_window.set_status_text(
-                            f"Could not rehydrate recipe: {exc}"
-                        )
-                else:
-                    exp._processed_channels = processed
-                    self.viewer_proc.set_channels(
-                        processed, channel_display=exp.channel_display,
-                    )
+
+        if rebuilt:
+            self._populate_viewers_from_records()
 
     def _refresh_raw_viewer(self, exp: ND2StudiosRecord) -> None:
-        """Wire the raw viewer to the volume (Z-scrollable) or flat channels.
-
-        Volume path: z_mode="none", multi-Z volume, no crop active.
-        Flat path: everything else (projection, TIFF source, or crop active).
-        """
-        if (exp.crop_rect is None
-                and exp._raw_volume is not None
-                and exp.n_zslices > 1
-                and exp.z_view_mode == "none"):
-            self.viewer_raw.set_volume(
-                exp._raw_volume,
-                channel_display=exp.channel_display,
-                z_mode="none",
-                z_index=exp.z_view_index,
-                m=exp.m_index, t=0, z=exp.z_view_index,
-            )
-        else:
-            self.viewer_raw.set_channels(exp._raw_channels,
-                                         channel_display=exp.channel_display)
+        """Refresh the primary column's raw viewer (backward compat)."""
+        if self._columns:
+            self._populate_column_raw(self._columns[0], exp)
 
     def load_from_experiment(self, exp: ND2StudiosRecord) -> None:
         self._recipe = list(exp.recipe)
@@ -454,24 +618,45 @@ class RecipePage(QWidget):
 
         plugin_name = self.combo_plugin.currentText()
         params = self.param_editor.get_values()
-        # Run the full committed recipe + the trial step, on raw channels.
         full_recipe = list(self._recipe) + [(plugin_name, params)]
         self._trial_step = (plugin_name, params)
+        self._pending_secondary_recipe = full_recipe
 
-        self._run_recipe(exp, full_recipe, label="Trial running…",
-                         on_done=self._on_trial_done)
+        # Cancel any running secondary workers before starting a new trial.
+        self._cancel_extra_workers()
 
-    def _on_trial_done(self, processed: Dict[str, Any]) -> None:
+        # Primary column (wired to exp_manager.active).
+        if self.main_window is not None:
+            self.main_window.set_status_text("Trial running…")
+
+        primary_col = self._columns[0] if self._columns else None
+        if primary_col:
+            self._run_recipe_on(
+                exp, full_recipe,
+                label="",
+                on_done=self._on_trial_done_primary,
+                col=primary_col,
+            )
+
+    def _on_trial_done_primary(self, processed: Dict[str, Any]) -> None:
         if self.main_window is None or self.main_window.exp_manager.active is None:
             return
         exp = self.main_window.exp_manager.active
-        # Show in the right viewer; do NOT commit to the recipe yet.
-        self.viewer_proc.set_channels(processed,
-                                      channel_display=exp.channel_display)
-        # Stash on the experiment so Accept can promote it cheaply.
+        primary_col = self._columns[0] if self._columns else None
+        if primary_col:
+            primary_col.viewer_proc.set_channels(
+                processed, channel_display=exp.channel_display)
         exp._processed_channels = processed
         self.btn_accept.setEnabled(True)
         self.btn_reject.setEnabled(True)
+
+        # Start secondary workers only after primary finishes to avoid I/O
+        # contention on large files.
+        recipe = getattr(self, "_pending_secondary_recipe", None)
+        if recipe:
+            for col in self._columns[1:]:
+                if col.record._raw_channels:
+                    self._run_recipe_on_secondary(col, recipe)
 
     def _on_accept(self) -> None:
         if self._trial_step is None:
@@ -484,20 +669,14 @@ class RecipePage(QWidget):
         if self.main_window is not None:
             self.main_window.set_status_text(f"Step accepted ({len(self._recipe)} total).")
             self.main_window.exp_manager.set_status("preprocessed")
-            # V1.38 Phase 6 — flush the accepted recipe to the
-            # per-source workspace. The release of
-            # ``exp._processed_channels`` happens on the page-leave
-            # hook in ``MainWindow._navigate`` so the right-side
-            # preview keeps working while the user is still here.
             self._commit_recipe_stage()
+        # Mark secondary records preprocessed too.
+        for col in self._columns[1:]:
+            if col.record is not None:
+                col.record.status = "preprocessed"
 
     def _commit_recipe_stage(self) -> None:
-        """Persist the committed recipe to the workspace.
-
-        No-op when the workspace is disabled or unavailable (e.g.
-        ``.nd2s`` re-opened on a machine without the source file). The
-        in-memory state continues to work exactly as before.
-        """
+        """Persist the committed recipe to the workspace."""
         stage = self.main_window.recipe_stage() if self.main_window else None
         if stage is None:
             return
@@ -520,27 +699,46 @@ class RecipePage(QWidget):
         self._trial_step = None
         self.btn_accept.setEnabled(False)
         self.btn_reject.setEnabled(False)
-        # Re-run committed recipe to revert the right-side preview.
+        self._cancel_extra_workers()
         if self.main_window is not None and self.main_window.exp_manager.active is not None:
             exp = self.main_window.exp_manager.active
+            self._revert_all_columns(exp)
+
+    def _revert_all_columns(self, primary_exp: ND2StudiosRecord) -> None:
+        """Revert all column viewers to the committed recipe state."""
+        for i, col in enumerate(self._columns):
+            rec = primary_exp if i == 0 else col.record
+            if rec is None or not rec._raw_channels:
+                continue
             if self._recipe:
-                self._run_recipe(exp, list(self._recipe),
-                                 label="Reverting trial…",
-                                 on_done=self._on_revert_done)
+                self._run_recipe_on(
+                    rec, list(self._recipe),
+                    label="Reverting…" if i == 0 else "",
+                    on_done=lambda processed, c=col, r=rec: self._on_revert_done_col(processed, c, r),
+                    col=col,
+                )
             else:
-                # No committed recipe → mirror raw on the right.
-                exp._processed_channels = None
-                if exp._raw_channels:
-                    self.viewer_proc.set_channels(exp._raw_channels,
-                                                  channel_display=exp.channel_display)
+                rec._processed_channels = None
+                if rec._raw_channels:
+                    col.viewer_proc.set_channels(
+                        rec._raw_channels, channel_display=rec.channel_display)
+
+    def _on_revert_done_col(
+        self,
+        processed: Dict[str, Any],
+        col: _RecipeColumn,
+        rec: ND2StudiosRecord,
+    ) -> None:
+        rec._processed_channels = processed
+        col.viewer_proc.set_channels(processed, channel_display=rec.channel_display)
 
     def _on_revert_done(self, processed: Dict[str, Any]) -> None:
+        """Backward-compat single-column revert handler."""
         if self.main_window is None or self.main_window.exp_manager.active is None:
             return
         exp = self.main_window.exp_manager.active
-        exp._processed_channels = processed
-        self.viewer_proc.set_channels(processed,
-                                      channel_display=exp.channel_display)
+        if self._columns:
+            self._on_revert_done_col(processed, self._columns[0], exp)
 
     # ── Remove / Clear ──
     def _on_remove_last(self) -> None:
@@ -548,18 +746,9 @@ class RecipePage(QWidget):
             return
         self._recipe.pop()
         self._refresh_recipe_list()
-        # Reprocess.
         if self.main_window is not None and self.main_window.exp_manager.active is not None:
             exp = self.main_window.exp_manager.active
-            if self._recipe:
-                self._run_recipe(exp, list(self._recipe),
-                                 label="Reprocessing…",
-                                 on_done=self._on_revert_done)
-            else:
-                exp._processed_channels = None
-                if exp._raw_channels:
-                    self.viewer_proc.set_channels(exp._raw_channels,
-                                                  channel_display=exp.channel_display)
+            self._revert_all_columns(exp)
 
     def _on_clear(self) -> None:
         self._recipe.clear()
@@ -569,10 +758,15 @@ class RecipePage(QWidget):
         self._refresh_recipe_list()
         if self.main_window is not None and self.main_window.exp_manager.active is not None:
             exp = self.main_window.exp_manager.active
-            exp._processed_channels = None
-            if exp._raw_channels:
-                self.viewer_proc.set_channels(exp._raw_channels,
-                                              channel_display=exp.channel_display)
+            self._cancel_extra_workers()
+            for i, col in enumerate(self._columns):
+                rec = exp if i == 0 else col.record
+                if rec is None:
+                    continue
+                rec._processed_channels = None
+                if rec._raw_channels:
+                    col.viewer_proc.set_channels(
+                        rec._raw_channels, channel_display=rec.channel_display)
 
     # ── Save / Load recipe ──
     def _on_save_recipe(self) -> None:
@@ -612,13 +806,11 @@ class RecipePage(QWidget):
         self.cb_normalized.setChecked(self._normalized)
         self.cb_normalized.blockSignals(False)
         self._refresh_recipe_list()
-        # Re-apply against current data.
+        # Re-apply against current data on all columns.
         if self.main_window is not None and self.main_window.exp_manager.active is not None:
             exp = self.main_window.exp_manager.active
-            if exp._raw_channels and self._recipe:
-                self._run_recipe(exp, list(self._recipe),
-                                 label="Applying loaded recipe…",
-                                 on_done=self._on_revert_done)
+            if self._recipe:
+                self._revert_all_columns(exp)
 
     # ── Helpers ──
     def _refresh_recipe_list(self) -> None:
@@ -629,10 +821,85 @@ class RecipePage(QWidget):
                 line += f"   ({', '.join(f'{k}={v}' for k, v in params.items())})"
             self.list_recipe.addItem(QListWidgetItem(line))
 
-    def _run_recipe(self, exp: ND2StudiosRecord,
-                    recipe: List[Tuple[str, Dict[str, Any]]],
-                    label: str,
-                    on_done) -> None:
+    def _run_recipe_on(
+        self,
+        rec: ND2StudiosRecord,
+        recipe: List[Tuple[str, Dict[str, Any]]],
+        label: str,
+        on_done,
+        col: Optional[_RecipeColumn] = None,
+    ) -> None:
+        """Run recipe on a record's raw channels; result delivered to on_done."""
+        if col is not None and col.worker is not None and col.worker.isRunning():
+            col.worker.cancel()
+            col.worker.wait(500)
+
+        worker = RecipeWorker(
+            channels=rec._raw_channels or {},
+            recipe=recipe,
+            normalized=self._normalized,
+        )
+        worker.progress.connect(self._on_progress)
+        if label:
+            worker.status.connect(self._on_status)
+        worker.finished.connect(on_done)
+        worker.error.connect(self._on_error)
+        if label and self.main_window is not None:
+            self.main_window.set_status_text(label)
+
+        if col is not None:
+            col.worker = worker
+        else:
+            # Primary worker (backward compat).
+            if self._worker is not None and self._worker.isRunning():
+                self._worker.cancel()
+                self._worker.wait(500)
+            self._worker = worker
+
+        worker.start()
+
+    def _run_recipe_on_secondary(
+        self,
+        col: _RecipeColumn,
+        recipe: List[Tuple[str, Dict[str, Any]]],
+    ) -> None:
+        """Launch a worker for a secondary column; result shown in col.viewer_proc."""
+        rec = col.record
+
+        def on_done(processed: Dict[str, Any]) -> None:
+            rec._processed_channels = processed
+            col.viewer_proc.set_channels(
+                processed, channel_display=rec.channel_display)
+
+        if col.worker is not None and col.worker.isRunning():
+            col.worker.cancel()
+            col.worker.wait(500)
+
+        worker = RecipeWorker(
+            channels=rec._raw_channels or {},
+            recipe=recipe,
+            normalized=self._normalized,
+        )
+        worker.finished.connect(on_done)
+        worker.error.connect(self._on_error)
+        col.worker = worker
+        self._extra_workers.append(worker)
+        worker.start()
+
+    def _cancel_extra_workers(self) -> None:
+        for w in self._extra_workers:
+            if w.isRunning():
+                w.cancel()
+        self._extra_workers.clear()
+
+    # ── Legacy _run_recipe shim (used by crop path) ──
+    def _run_recipe(
+        self,
+        exp: ND2StudiosRecord,
+        recipe: List[Tuple[str, Dict[str, Any]]],
+        label: str,
+        on_done,
+    ) -> None:
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(500)
@@ -661,4 +928,3 @@ class RecipePage(QWidget):
         QMessageBox.warning(self, "Recipe failed", msg)
         if self.main_window is not None:
             self.main_window.set_progress(0)
-

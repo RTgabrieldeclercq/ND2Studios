@@ -21,6 +21,17 @@ from .thresholds import (
 from .validation import validate_bit_depth
 
 
+def _frame_hash(image: np.ndarray) -> str:
+    """Cheap identity tag for provenance — samples 768 pixels instead of copying
+    the whole frame (a 268 M-pixel uint16 frame would be a 536 MB tobytes() copy)."""
+    flat = image.ravel()
+    n = len(flat)
+    probe = np.concatenate([flat[:256], flat[n // 2: n // 2 + 256], flat[-256:]])
+    return hashlib.sha256(
+        f"{image.shape}:{image.dtype}:".encode() + probe.tobytes()
+    ).hexdigest()[:16]
+
+
 @dataclass
 class SegmentationResult:
     """Output from a single-frame HistogramThresholdSegmenter.run() call."""
@@ -50,7 +61,13 @@ class HistogramThresholdSegmenter:
         cfg = self.config
         validate_bit_depth(image, cfg.bit_depth, strict=cfg.bit_depth_strict)
 
-        hist = compute_histogram(image, bit_depth=cfg.bit_depth)
+        # Only run the full bincount for methods that resolve their threshold
+        # from the histogram.  For hysteresis / single / relative the histogram
+        # is not needed — skipping it avoids a 2 GB int64 intermediate on large
+        # stitched frames (268 M px × 8 B = ~2 GB) that would otherwise block
+        # the worker thread for seconds with no effect on the mask.
+        needs_hist = (cfg.method == "percentile")
+        hist = compute_histogram(image, bit_depth=cfg.bit_depth) if needs_hist else None
 
         mask = self._threshold_one(image, hist, reference_mask)
 
@@ -86,7 +103,7 @@ class HistogramThresholdSegmenter:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "input_shape": image.shape,
                 "input_dtype": str(image.dtype),
-                "input_hash": hashlib.sha256(image.tobytes()).hexdigest()[:16],
+                "input_hash": _frame_hash(image),
             },
         )
 
@@ -117,6 +134,7 @@ class HistogramThresholdSegmenter:
                 percentile_high=cfg.percentile_high,
                 sanity_floor=cfg.sanity_floor,
                 sanity_ceiling=cfg.sanity_ceiling,
+                hist=hist,
             )
         if cfg.method == "relative":
             return threshold_relative(

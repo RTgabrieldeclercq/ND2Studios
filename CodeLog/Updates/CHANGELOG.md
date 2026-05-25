@@ -4,6 +4,101 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-05-24 (V1.0 multifile-analysis-perf)
+
+### Added
+
+- **`nd2studios/pages/analysis_page.py`** — file-selector `QComboBox` row (hidden
+  when only one confirmed record exists); populated from
+  `MainWindow.get_confirmed_records()` in `on_activated()`. Selecting a different
+  file calls `_reload_for_selected_record()` which rewires the viewer and restores
+  stored analysis results for that record. `_active_exp()` now returns
+  `self._selected_rec` if set, so all downstream logic (job submission, overlay,
+  export) automatically uses the selected file.
+
+### Changed
+
+- **`nd2studios/pages/recipe_page.py`** — secondary recipe workers now start
+  **after** the primary trial finishes (serialized via `_on_trial_done_primary`)
+  rather than simultaneously, eliminating I/O contention on large files.
+- **`nd2studios/pages/recipe_page.py`** — `_rebuild_columns()` now returns `bool`;
+  `on_activated()` only calls `_populate_viewers_from_records()` when columns
+  actually changed, preventing redundant `set_channels()` calls on every tab
+  switch.
+
+---
+
+## [Unreleased] - 2026-05-24 (V1.0 multifile-recipe-playal)
+
+### Added
+
+- **`nd2studios/widgets/multi_axis_viewer.py`** — `MultiAxisViewer.set_t_playing(playing, fps=None)`:
+  public method to drive T-axis playback from external callers; sets FPS if
+  provided, then toggles `_t_play.setChecked(playing)`.
+- **`nd2studios/pages/import_page.py`** — "> Play All" toggle button and FPS
+  `QDoubleSpinBox` (0.1–60 Hz, default 10 Hz) in the toolbar; `_on_play_all_toggled`
+  calls `panel.viewer.set_t_playing()` on every open panel.
+- **`nd2studios/pages/import_page.py`** — `get_confirmed_records()`: returns list
+  of `ND2StudiosRecord` instances whose `status` is in
+  `{imported, preprocessed, analyzed, exported}`.
+- **`nd2studios/core/main_window.py`** — `get_confirmed_records()`: thin wrapper
+  that queries the ImportPage; falls back to active record if Import page is
+  not yet built.
+- **`nd2studios/pages/recipe_page.py`** — `_RecipeColumn` helper class
+  (per-confirmed-file: `record`, `viewer_raw`, `viewer_proc`, `widget`, `worker`).
+  `_rebuild_columns()` repopulates the viewer area on every `on_activated()` call:
+  1 file → horizontal Raw | Processed; >1 files → vertical Raw / Processed per
+  column, columns side-by-side. Trial / Accept / Reject / Remove Last / Clear all
+  operate on all columns in parallel. Crop still applies to primary file only.
+
+### Changed
+
+- **`nd2studios/widgets/image_viewer.py`** — zoom-out button label changed from
+  `"−"` (Unicode minus, invisible on Windows) to `"-"`.
+- **`nd2studios/widgets/multi_axis_viewer.py`** — play button initial label
+  changed from `"▶"` to `">"`, pause label from `"⏸"` to `"||"`, resume
+  label from `"▶"` to `">"` (all were invisible on Windows).
+- **`nd2studios/pages/recipe_page.py`** — `viewer_raw` and `viewer_proc` are
+  now read-only properties pointing to the primary `_RecipeColumn`; all direct
+  viewer references inside the class use `self._columns[...]` or the properties.
+
+---
+
+## [Unreleased] - 2026-05-24 (V1.0 multifile-sidebyside)
+
+### Added
+
+- **`nd2studios/widgets/file_panel.py`** — new `FilePanel` widget that
+  bundles a collapsible controls sidebar (220 px ↔ 0 px, animated) and a
+  `MultiAxisViewer` for a single file. Signals: `panel_close_requested`,
+  `loaded`. Public helper `fit_viewer()` calls `canvas.reset_zoom()` and is
+  wired to both the inner splitter's `splitterMoved` and the sidebar
+  animation's `finished` signal so images autofit on every resize event.
+  Module-level `release_record_arrays(rec)` replaces the former
+  `_release_experiment_arrays` helper in `import_page.py`.
+- **`ChannelInfoRow`** moved from `import_page.py` into `file_panel.py`
+  (same implementation, now shared).
+
+### Changed
+
+- **`nd2studios/pages/import_page.py`** — rewritten as a multi-panel
+  container.  Hosts a toolbar ("+Add File" button) and a horizontal
+  `QSplitter` of `FilePanel` instances.  The primary panel (index 0) shares
+  its `record` attribute with `exp_manager.active`; secondary panels have
+  standalone records.  `load_from_experiment` / `save_to_experiment` /
+  `on_activated` delegate to `self._panels[0]` for full backward
+  compatibility.  `reset_all_viewers()` and `viewer` property added for
+  `MainWindow` integration.
+- **`nd2studios/core/main_window.py`** —
+  `_reset_active_viewer_zoom` now checks for `reset_all_viewers()` first
+  (ImportPage multi-panel path) and falls back to `viewer.canvas.reset_zoom()`
+  for single-viewer pages.
+- **`nd2studios/core/theme.py`** — added QSS rules for `#filePanelHeader`,
+  `QLabel#filePanelTitle`, `QPushButton#filePanelCollapseBtn`,
+  `QPushButton#filePanelCloseBtn`, `#filePanelControls`.
+
+---
+
 ## [Unreleased] - 2026-05-23 (V1.0 stitch-black-fix)
 
 ### Bug Fixes

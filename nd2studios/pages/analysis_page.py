@@ -143,6 +143,15 @@ class AnalysisPage(QWidget):
         self._edit_shape_idx: int = -1
         self._edit_shape_keys: List[Tuple[Any, int]] = []
 
+        # Rasterized-mask cache: keyed by (m, t, z_slot, raster_version).
+        # Avoids re-running rasterize_shapes() on every frame refresh when
+        # shapes haven't changed (e.g., T-slider scrubbing with masks drawn).
+        self._raster_cache: Dict[Tuple[int, int, Any, int], np.ndarray] = {}
+        self._raster_version: int = 0
+
+        # Multi-file: currently selected record (overrides exp_manager.active).
+        self._selected_rec: Optional[ND2StudiosRecord] = None
+
         self._screen_debounce = QTimer(self)
         self._screen_debounce.setSingleShot(True)
         self._screen_debounce.setInterval(300)
@@ -167,6 +176,22 @@ class AnalysisPage(QWidget):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 4, 0)
         left_layout.setSpacing(8)
+
+        # File selector — hidden when only one confirmed file is loaded.
+        self._file_selector_row = QWidget()
+        fs_layout = QHBoxLayout(self._file_selector_row)
+        fs_layout.setContentsMargins(0, 0, 0, 0)
+        fs_layout.setSpacing(4)
+        fs_layout.addWidget(QLabel("File:"))
+        self._combo_file = QComboBox()
+        self._combo_file.setSizePolicy(
+            self._combo_file.sizePolicy().horizontalPolicy(),
+            self._combo_file.sizePolicy().verticalPolicy(),
+        )
+        self._combo_file.currentIndexChanged.connect(self._on_file_selected)
+        fs_layout.addWidget(self._combo_file, stretch=1)
+        self._file_selector_row.hide()
+        left_layout.addWidget(self._file_selector_row)
 
         # Pipeline selector
         pipeline_group = QGroupBox("Pipeline")
@@ -461,6 +486,7 @@ class AnalysisPage(QWidget):
 
     def on_activated(self) -> None:
         """Wire the viewer to the current experiment and refresh channel choices."""
+        self._rebuild_file_selector()
         exp = self._active_exp()
         if exp is None:
             return
@@ -1066,6 +1092,7 @@ class AnalysisPage(QWidget):
         by_z = per_t.setdefault(t, {})
         by_z.setdefault(z_slot, []).append(shape)
         self._update_draw_status()
+        self._invalidate_mask_cache()
         self._update_overlay()
 
     def _on_clear_current_frame(self) -> None:
@@ -1078,6 +1105,7 @@ class AnalysisPage(QWidget):
         if per_m and t in per_m:
             del per_m[t]
             self._update_draw_status()
+            self._invalidate_mask_cache()
             self._update_overlay()
 
     def _on_copy_from_prev_frame(self) -> None:
@@ -1336,6 +1364,7 @@ class AnalysisPage(QWidget):
         verts = shape.get("vertices") or []
         if 0 <= idx < len(verts):
             verts[idx] = [float(iy), float(ix)]
+            self._invalidate_mask_cache()
             self._update_overlay()
 
     def _on_apply_expand(self) -> None:
@@ -1358,6 +1387,7 @@ class AnalysisPage(QWidget):
         )
         shape["vertices"] = new_verts
         self._push_edit_vertices_to_canvas()
+        self._invalidate_mask_cache()
         self._update_overlay()
 
     # ── Composite overlay ─────────────────────────────────────────────────────
@@ -1388,8 +1418,14 @@ class AnalysisPage(QWidget):
             if not shapes:
                 return rgb
             h, w = rgb.shape[:2]
-            live_mask = np.zeros((h, w), dtype=np.int32)
-            rasterize_shapes(live_mask, shapes, h, w)
+            rkey = (m, t, int(current_z), self._raster_version)
+            live_mask = self._raster_cache.get(rkey)
+            if live_mask is None:
+                live_mask = np.zeros((h, w), dtype=np.int32)
+                rasterize_shapes(live_mask, shapes, h, w)
+                if len(self._raster_cache) >= 200:
+                    self._raster_cache.pop(next(iter(self._raster_cache)))
+                self._raster_cache[rkey] = live_mask
             if live_mask.max() == 0:
                 return rgb
             return _overlay_labels(
@@ -1441,6 +1477,15 @@ class AnalysisPage(QWidget):
                 return out
 
         return rgb
+
+    def _invalidate_mask_cache(self) -> None:
+        """Discard cached rasterized masks and the viewer's overlay composites.
+
+        Call whenever drawn shapes change so stale masks are not displayed.
+        """
+        self._raster_version += 1
+        self._raster_cache.clear()
+        self.viewer.invalidate_post_process_cache()
 
     def _update_overlay(self) -> None:
         """Re-register the composite overlay hook to trigger a viewer re-render."""
@@ -1582,9 +1627,90 @@ class AnalysisPage(QWidget):
         return bool(exp._processed_channels or exp._raw_channels)
 
     def _active_exp(self) -> Optional[ND2StudiosRecord]:
+        if self._selected_rec is not None:
+            return self._selected_rec
         if self.main_window is None:
             return None
         return self.main_window.exp_manager.active
+
+    def _reload_for_selected_record(self) -> None:
+        """Refresh the viewer and result state for self._selected_rec."""
+        exp = self._active_exp()
+        if exp is None:
+            return
+        # Rehydrate processed channels if needed.
+        if exp._processed_channels is None and exp._processed_view is not None:
+            try:
+                exp._processed_channels = exp._processed_view.materialize_all()
+            except Exception:  # noqa: BLE001
+                pass
+        channels = exp._processed_channels or exp._raw_channels or {}
+        if exp._raw_volume is not None:
+            self.viewer.set_volume(
+                exp._raw_volume,
+                channel_display=exp.channel_display,
+                z_mode=exp.z_view_mode or "max",
+                z_index=exp.z_view_index,
+                m=exp.m_index, t=0, z=exp.z_view_index,
+            )
+        elif channels:
+            self.viewer.set_channels(channels, channel_display=exp.channel_display)
+        self.btn_screen.setEnabled(bool(channels))
+        names = list(channels.keys())
+        if names != self._current_channel_names:
+            self._current_channel_names = names
+            self._reload_params(names)
+        # Restore analysis results for this record.
+        pipeline_name = self.combo_pipeline.currentText()
+        self._restore_results_from_exp(exp, pipeline_name)
+        if self._result is not None:
+            self._show_result(self._result, exp)
+        self._update_overlay()
+
+    def _rebuild_file_selector(self) -> None:
+        """Populate the file-selector combo from currently confirmed records."""
+        if self.main_window is None:
+            return
+        fn = getattr(self.main_window, "get_confirmed_records", None)
+        records: List[ND2StudiosRecord] = fn() if callable(fn) else []
+        if not records:
+            exp = self.main_window.exp_manager.active
+            if exp is not None:
+                records = [exp]
+
+        self._combo_file.blockSignals(True)
+        self._combo_file.clear()
+        for rec in records:
+            import os as _os
+            label = _os.path.basename(
+                (getattr(rec, "import_config", {}) or {}).get("filepath", "")
+                or (getattr(rec, "nd2_metadata", {}) or {}).get("filepath", "")
+            ) or "Untitled"
+            self._combo_file.addItem(label)
+        self._combo_file.blockSignals(False)
+
+        # Show row only when multiple files are confirmed.
+        self._file_selector_row.setVisible(len(records) > 1)
+
+        # Set selected record to whichever the combo is pointing at.
+        self._selected_rec = records[self._combo_file.currentIndex()] if records else None
+
+    def _on_file_selected(self, index: int) -> None:
+        """Switch the active record when the user picks a different file."""
+        if self.main_window is None:
+            return
+        fn = getattr(self.main_window, "get_confirmed_records", None)
+        records: List[ND2StudiosRecord] = fn() if callable(fn) else []
+        if not records:
+            exp = self.main_window.exp_manager.active
+            if exp is not None:
+                records = [exp]
+        if 0 <= index < len(records):
+            self._selected_rec = records[index]
+        else:
+            self._selected_rec = None
+        # Reload viewer for the newly selected record.
+        self._reload_for_selected_record()
 
 
 # ── Module-level helpers (no Qt state) ───────────────────────────────────────

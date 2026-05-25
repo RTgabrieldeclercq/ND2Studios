@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
+from nd2studios.compute.parallel.thread_map import thread_map_planes
 from nd2studios.core.analysis_registry import AnalysisPipeline, AnalysisResult
 from nd2studios.core.plugin_registry import ParamSpec
 
@@ -151,33 +152,35 @@ class HistogramThresholdPipeline(AnalysisPipeline):
         if stack.ndim == 2:
             stack = stack[np.newaxis]  # treat as single frame
 
-        n_frames = stack.shape[0]
         pixel_size_um: float = float(metadata.get("pixel_size_um", 0.0))
         voxel_size = (pixel_size_um, pixel_size_um) if pixel_size_um > 0 else None
 
         cfg = self._build_config(params)
         seg = HistogramThresholdSegmenter(cfg)
 
+        def _run_frame(frame: np.ndarray):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return seg.run(frame, voxel_size=voxel_size)
+
+        _progress = (
+            (lambda done, total: progress_cb(int(done / total * 100)))
+            if progress_cb is not None else None
+        )
+
         label_stack = np.zeros(stack.shape, dtype=np.int32)
         measurements: list[dict[str, Any]] = []
 
-        for t in range(n_frames):
-            if cancelled_cb is not None and cancelled_cb():
-                break
-
-            frame = stack[t]
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                result = seg.run(frame, voxel_size=voxel_size)
-
-            # Re-label so IDs are unique across frames (offset by frame * 10000)
-            if result.labels.max() > 0:
-                label_stack[t] = result.labels
-            else:
-                label_stack[t] = result.labels
-
+        raw = thread_map_planes(
+            stack, _run_frame,
+            progress_cb=_progress,
+            cancelled_cb=cancelled_cb,
+        )
+        for t in sorted(raw):
+            result = raw[t]
+            label_stack[t] = result.labels
             for row in result.regions:
-                entry: dict[str, Any] = {
+                measurements.append({
                     "frame": t,
                     "label_id": row["label_id"],
                     "area_px": row["area_px"],
@@ -185,11 +188,7 @@ class HistogramThresholdPipeline(AnalysisPipeline):
                     "centroid_y": row["centroid_y"],
                     "centroid_x": row["centroid_x"],
                     "mean_intensity": row["mean_intensity"],
-                }
-                measurements.append(entry)
-
-            if progress_cb is not None:
-                progress_cb(int((t + 1) / n_frames * 100))
+                })
 
         summary = _build_summary(measurements)
         return AnalysisResult(
