@@ -78,7 +78,7 @@ class _SectionHeader(QFrame):
 class LutSidebar(QFrame):
     """Collapsible right-side panel: Tiles + LUTs."""
 
-    EXPANDED_WIDTH = 300
+    EXPANDED_WIDTH = 340
     COLLAPSED_WIDTH = 28
     ANIMATION_MS = 260
     TILE_WIDGET_HEIGHT = 240   # default vertical room for the tile preview

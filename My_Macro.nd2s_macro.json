@@ -1,0 +1,35 @@
+{
+  "version": "1.0",
+  "name": "My Macro",
+  "created": "2026-05-27T11:54:11",
+  "actions": [
+    {
+      "action_type": "navigate",
+      "label": "Navigate: results",
+      "params": {
+        "page": "results"
+      },
+      "enabled": true,
+      "timestamp": 1779908035.464552
+    },
+    {
+      "action_type": "button_click",
+      "label": "Click: Export CSV",
+      "params": {
+        "page": "results",
+        "widget_id": "attr:_btn_export_csv"
+      },
+      "enabled": true,
+      "timestamp": 1779908037.735615
+    },
+    {
+      "action_type": "export_csv",
+      "label": "Export CSV \u2192 C:/Users/McGheeLab - Analysis/Documents/GitHub/ND2Studios/Control_top_middle_measurements.csv",
+      "params": {
+        "path": "C:/Users/McGheeLab - Analysis/Documents/GitHub/ND2Studios/Control_top_middle_measurements.csv"
+      },
+      "enabled": true,
+      "timestamp": 1779908041.133591
+    }
+  ]
+}

@@ -1,0 +1,220 @@
+{
+  "version": "1.0",
+  "name": "Proliferation_Thresh_CRC_Monolayer",
+  "created": "2026-05-27T12:06:18",
+  "actions": [
+    {
+      "action_type": "channel_state",
+      "label": "Channels: p53-GFP \u2717 green LUT[47\u20132057 \u03b31.00]  |  ERK-mRuby2 \u2713 red LUT[48\u20131027 \u03b31.00]  |  H2B-iRFP670 \u2717 cyan LUT[47\u2013346 \u03b31.00]  |  TD \u2717 magenta LUT[267\u2013854 \u03b31.00]",
+      "params": {
+        "page": "import",
+        "viewer_attr": "viewer",
+        "channels": {
+          "p53-GFP": {
+            "enabled": false,
+            "color": "green",
+            "lut_lo": 47.0,
+            "lut_hi": 2057.0,
+            "lut_gamma": 1.0
+          },
+          "ERK-mRuby2": {
+            "enabled": true,
+            "color": "red",
+            "lut_lo": 48.0,
+            "lut_hi": 1027.0,
+            "lut_gamma": 1.0
+          },
+          "H2B-iRFP670": {
+            "enabled": false,
+            "color": "cyan",
+            "lut_lo": 47.0,
+            "lut_hi": 346.0,
+            "lut_gamma": 1.0
+          },
+          "TD": {
+            "enabled": false,
+            "color": "magenta",
+            "lut_lo": 267.0,
+            "lut_hi": 854.0,
+            "lut_gamma": 1.0
+          }
+        }
+      },
+      "enabled": true,
+      "timestamp": 1779908559.2578373
+    },
+    {
+      "action_type": "channel_state",
+      "label": "Channels: p53-GFP \u2717 green LUT[47\u20132057 \u03b31.00]  |  ERK-mRuby2 \u2713 gray LUT[48\u20131027 \u03b31.00]  |  H2B-iRFP670 \u2717 cyan LUT[47\u2013346 \u03b31.00]  |  TD \u2717 magenta LUT[267\u2013854 \u03b31.00]",
+      "params": {
+        "page": "import",
+        "viewer_attr": "viewer",
+        "channels": {
+          "p53-GFP": {
+            "enabled": false,
+            "color": "green",
+            "lut_lo": 47.0,
+            "lut_hi": 2057.0,
+            "lut_gamma": 1.0
+          },
+          "ERK-mRuby2": {
+            "enabled": true,
+            "color": "gray",
+            "lut_lo": 48.0,
+            "lut_hi": 1027.0,
+            "lut_gamma": 1.0
+          },
+          "H2B-iRFP670": {
+            "enabled": false,
+            "color": "cyan",
+            "lut_lo": 47.0,
+            "lut_hi": 346.0,
+            "lut_gamma": 1.0
+          },
+          "TD": {
+            "enabled": false,
+            "color": "magenta",
+            "lut_lo": 267.0,
+            "lut_hi": 854.0,
+            "lut_gamma": 1.0
+          }
+        }
+      },
+      "enabled": true,
+      "timestamp": 1779908566.0330434
+    },
+    {
+      "action_type": "button_click",
+      "label": "Click: Confirm Import",
+      "params": {
+        "page": "import",
+        "widget_id": "name:successBtn"
+      },
+      "enabled": true,
+      "timestamp": 1779908570.1138465
+    },
+    {
+      "action_type": "load_config",
+      "label": "Load Config: C:/Users/McGheeLab - Analysis/Documents/GitHub/ND2Studios/Simple_threshold.nd2s_cfg",
+      "params": {
+        "path": "C:/Users/McGheeLab - Analysis/Documents/GitHub/ND2Studios/Simple_threshold.nd2s_cfg"
+      },
+      "enabled": true,
+      "timestamp": 1779908582.127166
+    },
+    {
+      "action_type": "navigate",
+      "label": "Navigate: analysis",
+      "params": {
+        "page": "analysis"
+      },
+      "enabled": true,
+      "timestamp": 1779908584.8121943
+    },
+    {
+      "action_type": "analysis_run",
+      "label": "Run: Histogram Threshold Segmenter (channel_name=ERK-mRuby2, method=hysteresis, direction=above, bit_depth=12, strict=160, permissive=80, low=50, high=500, percentile_low=5.0, percentile_high=95.0, fraction_low=0.3, fraction_high=1.5, min_area=2000, max_area=0, opening_radius=1, closing_radius=2, min_hole_size=50)",
+      "params": {
+        "pipeline": "Histogram Threshold Segmenter",
+        "pipeline_params": {
+          "channel_name": "ERK-mRuby2",
+          "method": "hysteresis",
+          "direction": "above",
+          "bit_depth": 12,
+          "strict": 160,
+          "permissive": 80,
+          "low": 50,
+          "high": 500,
+          "percentile_low": 5.0,
+          "percentile_high": 95.0,
+          "fraction_low": 0.3,
+          "fraction_high": 1.5,
+          "min_area": 2000,
+          "max_area": 0,
+          "opening_radius": 1,
+          "closing_radius": 2,
+          "min_hole_size": 50
+        }
+      },
+      "enabled": true,
+      "timestamp": 1779908604.4370403
+    },
+    {
+      "action_type": "navigate",
+      "label": "Navigate: results",
+      "params": {
+        "page": "results"
+      },
+      "enabled": true,
+      "timestamp": 1779908618.194486
+    },
+    {
+      "action_type": "checkbox_change",
+      "label": "Check: _cb_raw_intensity",
+      "params": {
+        "page": "results",
+        "widget_id": "attr:_cb_raw_intensity",
+        "value": true
+      },
+      "enabled": true,
+      "timestamp": 1779908620.096703
+    },
+    {
+      "action_type": "button_click",
+      "label": "Click: Compute Measurements",
+      "params": {
+        "page": "results",
+        "widget_id": "attr:_btn_compute"
+      },
+      "enabled": true,
+      "timestamp": 1779908623.160386
+    },
+    {
+      "action_type": "button_click",
+      "label": "Click: Export CSV",
+      "params": {
+        "page": "results",
+        "widget_id": "attr:_btn_export_csv"
+      },
+      "enabled": true,
+      "timestamp": 1779908677.2503555
+    },
+    {
+      "action_type": "export_csv",
+      "label": "Export CSV \u2192 F:/5.24.26/After/Control/Control_top_middle_measurements.csv",
+      "params": {
+        "path": "F:/5.24.26/After/Control/Control_top_middle_measurements.csv"
+      },
+      "enabled": true,
+      "timestamp": 1779908685.73548
+    },
+    {
+      "action_type": "button_click",
+      "label": "Click: Export Overlay Images",
+      "params": {
+        "page": "results",
+        "widget_id": "attr:_btn_export_images"
+      },
+      "enabled": true,
+      "timestamp": 1779908691.5104825
+    },
+    {
+      "action_type": "export_overlay_images",
+      "label": "Export Overlay Images \u2192 F:/5.24.26/After/Control",
+      "params": {
+        "path": "F:/5.24.26/After/Control"
+      },
+      "enabled": true,
+      "timestamp": 1779908694.0076551
+    },
+    {
+      "action_type": "navigate",
+      "label": "Navigate: export",
+      "params": {
+        "page": "export"
+      },
+      "enabled": true,
+      "timestamp": 1779908764.9883332
+    }
+  ]
+}

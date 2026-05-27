@@ -112,7 +112,9 @@ class MainWindow(QMainWindow):
 
         # Macro recorder — records meaningful user actions for replay.
         from nd2studios.backend.macro_engine import MacroRecorder
+        from nd2studios.core.macro_event_filter import MacroEventFilter
         self.macro_recorder = MacroRecorder()
+        self.macro_event_filter = MacroEventFilter(self)
         self._macro_dialog: Optional[object] = None
 
         self._build_ui()
@@ -524,6 +526,11 @@ class MainWindow(QMainWindow):
         self._title_label.setText(Settings.PAGES[idx][2])
         self._nav_buttons[page_key].setChecked(True)
 
+        # Record page navigation for macro playback.
+        if self.macro_recorder.recording and not self.macro_recorder.replaying:
+            from nd2studios.backend.macro_engine import MacroAction as _MA
+            self.record_macro_action(_MA("navigate", f"Navigate: {page_key}", {"page": page_key}))
+
         # Notify incoming page.
         new_page = self.pages.get(page_key)
         if hasattr(new_page, "on_activated"):
@@ -786,45 +793,204 @@ class MainWindow(QMainWindow):
             self._macro_dialog.raise_()
             self._macro_dialog.activateWindow()
 
+    def start_recording(self) -> None:
+        """Start a new macro recording session (called by MacroDialog)."""
+        self.macro_recorder.start()
+        self.macro_event_filter.install()
+
+    def stop_recording(self, cancel: bool = False):
+        """Stop recording and return the captured actions (called by MacroDialog)."""
+        self.macro_event_filter.uninstall()
+        if cancel:
+            self.macro_recorder.cancel()
+            return []
+        return self.macro_recorder.finish()
+
     def record_macro_action(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
-        """Record *action* if the recorder is active and emit the signal."""
+        """Record *action* and emit signal.  No-op when replaying."""
         from dataclasses import asdict
         if self.macro_recorder.record(action):
+            self.macro_action_recorded.emit(asdict(action))
+
+    def upgrade_last_macro_action(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
+        """Replace the last generic event-filter action with a richer semantic one."""
+        from dataclasses import asdict
+        if self.macro_recorder.record_upgrade(action):
             self.macro_action_recorded.emit(asdict(action))
 
     def replay_macro_action(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
         """Dispatch one macro action to the appropriate page for replay."""
         from PySide6.QtCore import QCoreApplication
-        t = action.action_type
+        from PySide6.QtWidgets import QAbstractSpinBox, QCheckBox, QComboBox, QPushButton
+        from nd2studios.core.macro_event_filter import find_widget
 
-        if t in ("recipe_add_step", "recipe_remove_last", "recipe_clear"):
-            page = self.pages.get("recipe")
-            if page is None:
-                return
-            self._navigate("recipe")
-            QCoreApplication.processEvents()
-            if t == "recipe_add_step":
-                page._replay_add_step(action)
-            elif t == "recipe_remove_last":
-                page._on_remove_last()
-            elif t == "recipe_clear":
-                page._on_clear()
+        self.macro_recorder.start_replay()
+        try:
+            t = action.action_type
 
-        elif t == "analysis_run":
-            page = self.pages.get("analysis")
-            if page is None:
-                return
-            self._navigate("analysis")
-            QCoreApplication.processEvents()
-            page._replay_run(action)
+            # ── Navigation ──
+            if t == "navigate":
+                page_key = action.params.get("page", "")
+                if page_key:
+                    self._navigate(page_key)
 
-        elif t in ("export_tiff", "export_composite", "export_movie"):
-            page = self.pages.get("export")
-            if page is None:
-                return
-            self._navigate("export")
-            QCoreApplication.processEvents()
-            page._replay_export(action)
+            # ── Generic button click ──
+            elif t == "button_click":
+                import time as _time
+                page_key = action.params.get("page", "")
+                widget_id = action.params.get("widget_id", "")
+                page = self.pages.get(page_key)
+                if page is None:
+                    return
+                self._navigate(page_key)
+                QCoreApplication.processEvents()
+                widget = find_widget(page, widget_id)
+                if isinstance(widget, QPushButton):
+                    # Buttons are often temporarily disabled while an async
+                    # operation (analysis, recipe commit) is finishing.
+                    # Retry for up to 3 s before giving up.
+                    if not widget.isEnabled():
+                        deadline = _time.time() + 3.0
+                        while not widget.isEnabled() and _time.time() < deadline:
+                            QCoreApplication.processEvents()
+                    if widget.isEnabled():
+                        widget.click()
+                        # If the click started a worker (progress bar appears),
+                        # wait for it to finish before advancing to the next action.
+                        _time.sleep(0.15)
+                        QCoreApplication.processEvents()
+                        if self._progress_bar.isVisible():
+                            deadline = _time.time() + 120.0
+                            while self._progress_bar.isVisible() and _time.time() < deadline:
+                                QCoreApplication.processEvents()
+
+            # ── Combo box ──
+            elif t == "combo_change":
+                page_key = action.params.get("page", "")
+                widget_id = action.params.get("widget_id", "")
+                value = str(action.params.get("value", ""))
+                page = self.pages.get(page_key)
+                if page is None:
+                    return
+                widget = find_widget(page, widget_id)
+                if isinstance(widget, QComboBox):
+                    widget.setCurrentText(value)
+
+            # ── Spinbox ──
+            elif t == "spinbox_change":
+                page_key = action.params.get("page", "")
+                widget_id = action.params.get("widget_id", "")
+                value = action.params.get("value", 0)
+                page = self.pages.get(page_key)
+                if page is None:
+                    return
+                widget = find_widget(page, widget_id)
+                if isinstance(widget, QAbstractSpinBox):
+                    widget.setValue(float(value))
+
+            # ── Checkbox ──
+            elif t == "checkbox_change":
+                page_key = action.params.get("page", "")
+                widget_id = action.params.get("widget_id", "")
+                value = bool(action.params.get("value", False))
+                page = self.pages.get(page_key)
+                if page is None:
+                    return
+                widget = find_widget(page, widget_id)
+                if isinstance(widget, QCheckBox):
+                    widget.setChecked(value)
+
+            # ── ParamEditor ──
+            elif t == "param_change":
+                page_key = action.params.get("page", "")
+                widget_id = action.params.get("widget_id", "")
+                values = action.params.get("values", {})
+                page = self.pages.get(page_key)
+                if page is None:
+                    return
+                widget = find_widget(page, widget_id)
+                if widget is not None and hasattr(widget, "set_values"):
+                    widget.set_values(values)
+
+            # ── Configuration / recipe / template loading ──
+            elif t == "load_recipe":
+                page = self.pages.get("recipe")
+                if page is None:
+                    return
+                self._navigate("recipe")
+                QCoreApplication.processEvents()
+                page._replay_load_recipe(action)
+
+            elif t == "load_config":
+                self._replay_load_path = action.params.get("path", "")
+                try:
+                    self._load_config()
+                finally:
+                    self._replay_load_path = ""
+
+            elif t == "load_template":
+                page = self.pages.get("batch")
+                if page is None:
+                    return
+                self._navigate("batch")
+                QCoreApplication.processEvents()
+                page._load_template_from_path(action.params.get("path", ""))
+
+            # ── Channel display state (enable/disable, color, LUT) ──
+            elif t == "channel_state":
+                page_key = action.params.get("page", "")
+                viewer_attr = action.params.get("viewer_attr", "viewer")
+                channels = action.params.get("channels", {})
+                page = self.pages.get(page_key)
+                if page is None:
+                    return
+                self._navigate(page_key)
+                QCoreApplication.processEvents()
+                viewer = getattr(page, viewer_attr, None)
+                if viewer is not None and hasattr(viewer, "apply_channel_state"):
+                    viewer.apply_channel_state(channels)
+
+            # ── Semantic actions (rich records from page hooks) ──
+            elif t in ("recipe_add_step", "recipe_remove_last", "recipe_clear"):
+                page = self.pages.get("recipe")
+                if page is None:
+                    return
+                self._navigate("recipe")
+                QCoreApplication.processEvents()
+                if t == "recipe_add_step":
+                    page._replay_add_step(action)
+                elif t == "recipe_remove_last":
+                    page._on_remove_last()
+                elif t == "recipe_clear":
+                    page._on_clear()
+
+            elif t == "analysis_run":
+                page = self.pages.get("analysis")
+                if page is None:
+                    return
+                self._navigate("analysis")
+                QCoreApplication.processEvents()
+                page._replay_run(action)
+
+            elif t in ("export_tiff", "export_composite", "export_movie",
+                       "export_image_sequence", "export_tracked_objects"):
+                page = self.pages.get("export")
+                if page is None:
+                    return
+                self._navigate("export")
+                QCoreApplication.processEvents()
+                page._replay_export(action)
+
+            elif t in ("export_csv", "export_label_masks", "export_overlay_images"):
+                page = self.pages.get("results")
+                if page is None:
+                    return
+                self._navigate("results")
+                QCoreApplication.processEvents()
+                page._replay_result_export(action)
+
+        finally:
+            self.macro_recorder.stop_replay()
 
         QCoreApplication.processEvents()
 
@@ -992,8 +1158,9 @@ class MainWindow(QMainWindow):
             return
         path = preview.save_path
         if not path:
+            from nd2studios.core.settings import Settings
             path, _ = QFileDialog.getSaveFileName(
-                self, "Save Configuration", "",
+                self, "Save Configuration", Settings.PROJECT_DIR,
                 f"ND2Studios Config (*{CONFIG_EXTENSION})",
             )
             if not path:
@@ -1010,10 +1177,12 @@ class MainWindow(QMainWindow):
         from nd2studios.widgets.config_wizard import (
             CONFIG_EXTENSION, apply_config_to_pages,
         )
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Configuration", "",
+        _rp = getattr(self, "_replay_load_path", "")
+        from nd2studios.core.settings import Settings
+        path = _rp or QFileDialog.getOpenFileName(
+            self, "Load Configuration", Settings.PROJECT_DIR,
             f"ND2Studios Config (*{CONFIG_EXTENSION})",
-        )
+        )[0]
         if not path:
             return
         with open(path, encoding="utf-8") as fh:
@@ -1044,6 +1213,10 @@ class MainWindow(QMainWindow):
         self._cfg_path = path
         self._cfg_data = cfg
         self.set_status_text(f"Config loaded: {os.path.basename(path)}")
+        from nd2studios.backend.macro_engine import MacroAction as _MA
+        self.upgrade_last_macro_action(_MA(
+            "load_config", f"Load Config: {path}", {"path": path}
+        ))
 
     # ── Session controls (internal / legacy) ───────────────────────
     def _new_session(self) -> None:
@@ -1058,8 +1231,9 @@ class MainWindow(QMainWindow):
         for page in self.pages.values():
             if hasattr(page, "save_to_experiment"):
                 page.save_to_experiment(self.exp_manager.active)
+        from nd2studios.core.settings import Settings
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Session", "",
+            self, "Save Session", Settings.PROJECT_DIR,
             f"ND2Studios Session (*{SESSION_EXTENSION})",
         )
         if path:
@@ -1067,8 +1241,9 @@ class MainWindow(QMainWindow):
             self.set_status_text(f"Saved: {os.path.basename(path)}")
 
     def _load_session(self) -> None:
+        from nd2studios.core.settings import Settings
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Session", "",
+            self, "Load Session", Settings.PROJECT_DIR,
             f"ND2Studios Session (*{SESSION_EXTENSION})",
         )
         if path:

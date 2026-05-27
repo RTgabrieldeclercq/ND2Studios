@@ -5,9 +5,14 @@ All UI dimensions and colors live here so theming and layout tweaks happen
 in one place.
 """
 from __future__ import annotations
+import os as _os
 
 
 class Settings:
+    # Root of the ND2Studios repository (two levels up from this file).
+    PROJECT_DIR: str = _os.path.abspath(
+        _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..")
+    )
     APP_NAME = "ND2Studios"
     APP_VERSION = "1.0.0"
     APP_DESCRIPTION = "ND2 file processing and export — McGhee Lab"

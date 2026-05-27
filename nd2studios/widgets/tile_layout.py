@@ -46,6 +46,9 @@ _EXPAND_BTN_SIZE = 22
 # Target on-screen pixels per tile when sizing the widget. Comfortable
 # for 2-digit M labels; the user can hit `⤢` for an even bigger view.
 _TARGET_TILE_PX = 50
+# Minimum pixel distance before a press-move is treated as a drag rather
+# than a click; avoids accidental rubber-bands on shaky single clicks.
+_DRAG_THRESHOLD = 4
 
 
 class TileLayoutWidget(QFrame):
@@ -89,6 +92,11 @@ class TileLayoutWidget(QFrame):
         # Cached widget-pixel rects per tile (recomputed on every paint).
         self._tile_rects: List[Tuple[int, QRect]] = []  # [(m, rect), ...]
         self._hovered_m: Optional[int] = None
+
+        # Rubber-band drag state (select mode only).
+        self._drag_start: Optional[QPoint] = None
+        self._drag_current: Optional[QPoint] = None
+        self._drag_active: bool = False
 
         # Optional expand button (a child QPushButton positioned in the
         # top-right corner; cheaper than painting + custom hit-testing).
@@ -207,7 +215,7 @@ class TileLayoutWidget(QFrame):
             f"{len(self._m_indices)} tiles · click to jump"
             if self._mode == "navigate" else
             f"{len(self._selected_indices)} / {len(self._m_indices)}"
-            f" tiles selected · click to toggle"
+            f" tiles selected · click to toggle · drag to select area"
         )
         painter.setPen(QPen(QColor(Settings.FG_SECONDARY)))
         painter.drawText(
@@ -296,6 +304,18 @@ class TileLayoutWidget(QFrame):
                         label,
                     )
 
+        # Rubber-band overlay while the user is dragging a selection rect.
+        if self._drag_active and self._drag_start and self._drag_current:
+            rb_rect = QRect(self._drag_start, self._drag_current).normalized()
+            rb_fill = QColor(Settings.ACCENT_PURPLE)
+            rb_fill.setAlpha(30)
+            painter.setBrush(rb_fill)
+            rb_pen = QPen(QColor(Settings.ACCENT_PURPLE))
+            rb_pen.setWidth(1)
+            rb_pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(rb_pen)
+            painter.drawRect(rb_rect)
+
         painter.end()
 
     # ── Mouse interaction ──
@@ -303,26 +323,78 @@ class TileLayoutWidget(QFrame):
         if event.button() != Qt.LeftButton or not self.is_renderable():
             super().mousePressEvent(event)
             return
-        m = self._tile_at(event.position().toPoint())
-        if m is None:
-            super().mousePressEvent(event)
-            return
-        if self._mode == "navigate":
+        if self._mode == "select":
+            # Defer action to release so we can distinguish click from drag.
+            self._drag_start = event.position().toPoint()
+            self._drag_current = self._drag_start
+            self._drag_active = False
+            event.accept()
+        else:  # navigate — immediate on press
+            m = self._tile_at(event.position().toPoint())
+            if m is None:
+                super().mousePressEvent(event)
+                return
             self.navigate_requested.emit(int(m))
-        else:  # select
-            if m in self._selected_indices:
-                self._selected_indices.remove(m)
-            else:
-                self._selected_indices.add(m)
-            self.update()
-            self.selection_changed.emit(self.selected_indices())
-        event.accept()
+            event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 (Qt naming)
-        m = self._tile_at(event.position().toPoint())
+        pos = event.position().toPoint()
+
+        if self._drag_start is not None:
+            # Rubber-band drag in progress.
+            self._drag_current = pos
+            dx = pos.x() - self._drag_start.x()
+            dy = pos.y() - self._drag_start.y()
+            was_active = self._drag_active
+            self._drag_active = (
+                abs(dx) > _DRAG_THRESHOLD or abs(dy) > _DRAG_THRESHOLD
+            )
+            if self._drag_active or was_active:
+                self._hovered_m = None
+                self.update()
+            return
+
+        m = self._tile_at(pos)
         if m != self._hovered_m:
             self._hovered_m = m
             self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        if event.button() != Qt.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+        if self._mode != "select" or self._drag_start is None:
+            super().mouseReleaseEvent(event)
+            return
+
+        pos = event.position().toPoint()
+
+        if not self._drag_active:
+            # Short movement → treat as a single-tile click toggle.
+            m = self._tile_at(self._drag_start)
+            if m is not None:
+                if m in self._selected_indices:
+                    self._selected_indices.remove(m)
+                else:
+                    self._selected_indices.add(m)
+                self.update()
+                self.selection_changed.emit(self.selected_indices())
+        else:
+            # Rubber-band release: select all tiles intersecting the rect.
+            drag_rect = QRect(self._drag_start, pos).normalized()
+            shift_held = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            if not shift_held:
+                self._selected_indices = set()
+            for m, rect in self._tile_rects:
+                if drag_rect.intersects(rect):
+                    self._selected_indices.add(m)
+            self.update()
+            self.selection_changed.emit(self.selected_indices())
+
+        self._drag_start = None
+        self._drag_current = None
+        self._drag_active = False
+        event.accept()
 
     def leaveEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         if self._hovered_m is not None:

@@ -213,6 +213,7 @@ def export_overlay_frames(
     mask_alpha: float = 0.5,
     frame_timestamps: Optional[np.ndarray] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
+    basename: str = "",
 ) -> List[str]:
     """Export per-frame composite images with per-object colored label masks.
 
@@ -321,14 +322,15 @@ def export_overlay_frames(
                 frame_timestamps=frame_timestamps,
             )
 
-        fname = os.path.join(output_dir, f"frame_{t:04d}.{ext}")
+        prefix = f"{basename}_overlay" if basename else "overlay"
+        fname = os.path.join(output_dir, f"{prefix}_{t:04d}.{ext}")
         if ext == "tiff":
             imageio.imwrite(fname, rgb)
         else:
             imageio.imwrite(fname, rgb, quality=92)
         written.append(fname)
 
-        if progress_cb is not None and (t % 4 == 0 or t == T - 1):
+        if progress_cb is not None:
             progress_cb(int((t + 1) / T * 100))
 
     return written
@@ -337,6 +339,7 @@ def export_overlay_frames(
 def export_label_masks_tiff(
     label_masks: Dict[str, np.ndarray],
     output_dir: str,
+    basename: str = "",
 ) -> List[str]:
     """Export each label mask stack as an int32 TIFF (one file per channel)."""
     import tifffile
@@ -344,7 +347,8 @@ def export_label_masks_tiff(
     written: List[str] = []
     for ch_name, masks in label_masks.items():
         safe = ch_name.replace(" ", "_").replace("/", "_")
-        fpath = os.path.join(output_dir, f"labels_{safe}.tif")
+        prefix = f"{basename}_masks" if basename else "labels"
+        fpath = os.path.join(output_dir, f"{prefix}_{safe}.tif")
         arr = np.asarray(masks, dtype=np.int32)
         tifffile.imwrite(fpath, arr, imagej=True)
         written.append(fpath)
@@ -364,6 +368,7 @@ def export_label_masks_as_overlay(
     show_channel_labels: bool = True,
     mask_alpha: float = 0.5,
     progress_cb: Optional[Callable[[int], None]] = None,
+    basename: str = "",
 ) -> List[str]:
     """Export label masks as colored per-object overlays on top of image data.
 
@@ -458,7 +463,8 @@ def export_label_masks_as_overlay(
                     frame_timestamps=None,
                 )
 
-            fname = os.path.join(output_dir, f"overlay_{safe_seg}_frame_{t:04d}.{ext}")
+            prefix = f"{basename}_masks" if basename else "overlay"
+            fname = os.path.join(output_dir, f"{prefix}_{safe_seg}_{t:04d}.{ext}")
             if ext == "tiff":
                 imageio.imwrite(fname, rgb)
             else:
@@ -466,7 +472,7 @@ def export_label_masks_as_overlay(
             written.append(fname)
 
             done += 1
-            if progress_cb is not None and (done % 4 == 0 or done == total_frames):
+            if progress_cb is not None:
                 progress_cb(int(done / total_frames * 100))
 
     return written

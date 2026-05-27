@@ -286,7 +286,7 @@ def export_movie(
             ),
         )
         rendered.append(rgb_with_overlays)
-        if progress_cb is not None and (t % 4 == 0 or t == n - 1):
+        if progress_cb is not None:
             progress_cb(int((t + 1) / n * 90))
 
     if codec == "gif":

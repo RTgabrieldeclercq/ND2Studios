@@ -4,6 +4,61 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-05-27 (V1.40 Mask Analysis — Custom Mask Creator)
+
+### Added
+
+- **Custom Mask Creator panel** (`nd2studios/pages/analysis_page.py`) — new
+  `QGroupBox` visible whenever the Mask Analysis pipeline is selected.
+  Controls: shape type (Rectangle Strip), direction (Vertical / Horizontal),
+  strip height in px, optional custom width + X offset, start offset in px.
+  **Generate Masks** computes all complete strips from the spec and stores
+  them in `self._tiled_masks`; a count label shows "N strips per frame".
+  **Clear Tiled Masks** resets the state. Both buttons invalidate the raster
+  cache and trigger an immediate overlay refresh so the user sees the yellow
+  bands before running the pipeline.
+
+- **`generate_tiled_label_boxes(tiled_masks, H, W)`**
+  (`nd2studios/backend/analysis/manual_mask.py`) — pure-Python helper that
+  converts a list of tiled-mask spec dicts into a list of
+  `(y0, y1, x0, x1)` bounding boxes, one per complete strip. Strips that
+  would extend past the image boundary are excluded. Supports
+  `direction="vertical"` (tiles in Y) and `direction="horizontal"` (tiles
+  in X). Spec keys: `shape_type`, `direction`, `height_px`, `width_px`
+  (`None` = full image width), `x_offset_px`, `start_offset_px`.
+
+- **`generate_tiled_mask(tiled_masks, H, W)`**
+  (`nd2studios/backend/analysis/manual_mask.py`) — returns a `(H, W)` int32
+  array with label IDs 1..N for tiled strips; convenience wrapper for the
+  live-overlay preview path.
+
+- **`ND2StudiosRecord.tiled_mask_specs`**
+  (`nd2studios/core/experiment_manager.py`) — new serialized field
+  (`List[Dict[str, Any]]`) that persists Custom Mask Creator specs across
+  session save/load. Deserialized from `"tiled_mask_specs"` key in the .nd2s
+  manifest with no migration needed (defaults to empty list).
+
+### Changed
+
+- **"Manual Mask" pipeline renamed to "Mask Analysis"**
+  (`nd2studios/backend/analysis/manual_mask.py`,
+  `nd2studios/pages/analysis_page.py`) — `ManualMaskPipeline.name` is now
+  `"Mask Analysis"`; `MANUAL_MASK_PIPELINE_NAME` constant updated to match.
+  All runtime references use the constant so no hardcoded strings remain.
+
+- **`ManualMaskPipeline.run()`** now applies tiled strips (label IDs 1..N,
+  same in every frame) before hand-drawn shapes (offset IDs N+1, N+2, …).
+  This keeps each tiled region a stable object across all timepoints so
+  per-frame ΔArea and delta columns in the Results tab are meaningful.
+
+- **`rasterize_shapes(frame, shapes, H, W, label_offset=0)`** — new optional
+  `label_offset` parameter so the drawing overlay assigns IDs starting at
+  `label_offset + 1`, preventing collision with tiled-strip label IDs.
+
+- **`_composite_overlay()`** (Analysis page) extended: when Mask Analysis is
+  active and `_tiled_masks` is non-empty, tiled strips are painted first into
+  the live mask, then drawn shapes on top with the correct offset.
+
 ## [Unreleased] - 2026-05-26 (V1.0 macro-recorder)
 
 ### Added

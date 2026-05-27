@@ -34,6 +34,73 @@ from PySide6.QtWidgets import (
 
 CHAIN_AXES = ("T", "M", "Z", "C")
 
+PATTERNS = (
+    "Sequential (ascending)",   # file 0 → file 1 → … → file N (default)
+    "Sequential (descending)",  # file N → … → file 1 → file 0
+    "Interleaved",              # frame 0 from each file, frame 1 from each, …
+    "Custom",                   # manual drag on chain-axis blocks
+)
+
+
+class _DraggableFileTable(QTableWidget):
+    """QTableWidget with drag-and-drop row reordering.
+
+    Rows can be dragged to new positions within the table.  A
+    ``rows_reordered`` signal is emitted after each successful drop so
+    the dialog can sync its internal ``_entries`` list.
+    """
+
+    rows_reordered = Signal()
+
+    def __init__(self, rows: int, cols: int, parent=None) -> None:
+        super().__init__(rows, cols, parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+        self.setDefaultDropAction(Qt.MoveAction)
+
+    def dropEvent(self, event) -> None:  # noqa: D401
+        if event.source() is not self:
+            super().dropEvent(event)
+            return
+        event.accept()
+
+        drop_pos = event.position().toPoint()
+        target_row = self.rowAt(drop_pos.y())
+        if target_row < 0:
+            target_row = self.rowCount()
+
+        selected_rows = sorted({idx.row() for idx in self.selectedIndexes()})
+        if not selected_rows:
+            return
+
+        # Pull selected rows out of the table (reversed so indices stay valid).
+        saved: List[List[QTableWidgetItem | None]] = []
+        for r in reversed(selected_rows):
+            row_items = [self.takeItem(r, c) for c in range(self.columnCount())]
+            saved.insert(0, row_items)
+            self.removeRow(r)
+            if r < target_row:
+                target_row -= 1
+
+        target_row = max(0, min(target_row, self.rowCount()))
+
+        # Re-insert at target position.
+        for i, row_items in enumerate(saved):
+            insert_at = target_row + i
+            self.insertRow(insert_at)
+            for c, item in enumerate(row_items):
+                if item is not None:
+                    self.setItem(insert_at, c, item)
+
+        self.clearSelection()
+        for i in range(len(saved)):
+            self.selectRow(target_row + i)
+
+        self.rows_reordered.emit()
+
+
 # Filename-pattern heuristics: regex → suggested axis. First pattern that
 # matches at least two filenames wins. Order matters — more specific
 # patterns first.
@@ -329,16 +396,18 @@ class ReconstructDialog(QDialog):
         toolbar.addWidget(self.lbl_filetype)
         outer.addLayout(toolbar)
 
-        # File table.
-        self.table = QTableWidget(0, len(self.HEADERS), self)
+        # File table (drag-reorderable rows).
+        self.table = _DraggableFileTable(0, len(self.HEADERS), self)
         self.table.setHorizontalHeaderLabels(self.HEADERS)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setToolTip("Drag rows to reorder files")
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self.COL_NAME, QHeaderView.Stretch)
+        self.table.rows_reordered.connect(self._on_table_rows_moved)
         outer.addWidget(self.table, stretch=1)
 
         # Axis controls + preview.
@@ -349,6 +418,17 @@ class ReconstructDialog(QDialog):
         self.combo_axis.setCurrentText("Z")
         self.combo_axis.currentTextChanged.connect(self._on_axis_changed)
         form.addRow("Chain along axis", self.combo_axis)
+        self.combo_pattern = QComboBox()
+        self.combo_pattern.addItems(list(PATTERNS))
+        self.combo_pattern.setCurrentText("Sequential (ascending)")
+        self.combo_pattern.setToolTip(
+            "How to order frames from the chain axis across files.\n"
+            "Sequential: all frames from each file in file-list order.\n"
+            "Interleaved: frame 0 from all files, then frame 1, etc.\n"
+            "Custom: drag blocks below to set a manual order."
+        )
+        self.combo_pattern.currentTextChanged.connect(self._on_pattern_changed)
+        form.addRow("Frame order pattern", self.combo_pattern)
         self.lbl_suggested = QLabel("Add files to see suggestion.")
         form.addRow("Auto-detected", self.lbl_suggested)
         self.lbl_combined = QLabel("—")
@@ -360,11 +440,10 @@ class ReconstructDialog(QDialog):
         outer.addWidget(ctrl_group)
 
         # Per-axis block rows. Each axis gets its own AxisBlocksWidget;
-        # only the chain-axis row enables drag-and-drop. Rebuilt by
-        # _rebuild_blocks() any time the file set or chain axis change.
+        # drag is enabled on the chain-axis row only when pattern = Custom.
         blocks_group = QGroupBox(
-            "Assembly blocks  —  hover for source · drag the chain-axis "
-            "row to reorder slices"
+            "Assembly blocks  —  hover blocks for source info · "
+            "set pattern to \"Custom\" to drag-reorder slices"
         )
         bl = QVBoxLayout(blocks_group)
         bl.setSpacing(4)
@@ -506,6 +585,8 @@ class ReconstructDialog(QDialog):
                 item = QTableWidgetItem(v)
                 if c == self.COL_INDEX:
                     item.setTextAlignment(Qt.AlignCenter)
+                    # Store filepath so we can recover order after a drag.
+                    item.setData(Qt.UserRole, e.get("filepath", ""))
                 self.table.setItem(r, c, item)
 
     def _suggest_axis_from_filenames(self) -> None:
@@ -526,61 +607,143 @@ class ReconstructDialog(QDialog):
         self._refresh_preview()
 
     def _on_blocks_reordered(self) -> None:
-        """A drop happened on the chain-axis row — refresh dependent UI."""
-        # The combined shape doesn't change when only the order moves,
-        # but the status row still reflects the current state.
+        """A drop happened on the chain-axis row — ensure Custom is active."""
+        if self.combo_pattern.currentText() != "Custom":
+            self.combo_pattern.blockSignals(True)
+            self.combo_pattern.setCurrentText("Custom")
+            self.combo_pattern.blockSignals(False)
         self._refresh_preview()
+
+    def _on_table_rows_moved(self) -> None:
+        """File rows were drag-reordered in the table — sync _entries."""
+        filepath_order: List[str] = []
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, self.COL_INDEX)
+            if item is not None:
+                fp = item.data(Qt.UserRole)
+                if fp:
+                    filepath_order.append(fp)
+
+        entry_map = {e.get("filepath", ""): e for e in self._entries}
+        self._entries = [entry_map[fp] for fp in filepath_order if fp in entry_map]
+
+        # Renumber the # column to reflect new order.
+        for r in range(self.table.rowCount()):
+            num_item = self.table.item(r, self.COL_INDEX)
+            if num_item is not None:
+                num_item.setText(str(r + 1))
+
+        self._rebuild_blocks()
+        self._refresh_preview()
+
+    def _on_pattern_changed(self, _pattern: str) -> None:
+        """User picked a different frame-order pattern."""
+        self._rebuild_blocks()
+        self._refresh_preview()
+
+    def _compute_pattern_mapping(
+        self, pattern: str, entries: List[Dict[str, Any]]
+    ) -> List[Tuple[int, int]]:
+        """Return a chain mapping for the given pattern and current file list."""
+        chain = self.combo_axis.currentText()
+        attr_map = {
+            "T": "n_timepoints", "M": "n_multipoints",
+            "Z": "n_zslices",    "C": "n_channels",
+        }
+        attr = attr_map[chain]
+        sizes = [int(e.get(attr, 1)) for e in entries]
+
+        if pattern == "Sequential (ascending)":
+            return [
+                (fi, li)
+                for fi, sz in enumerate(sizes)
+                for li in range(sz)
+            ]
+        if pattern == "Sequential (descending)":
+            return [
+                (fi, li)
+                for fi in range(len(sizes) - 1, -1, -1)
+                for li in range(sizes[fi])
+            ]
+        if pattern == "Interleaved":
+            max_sz = max(sizes) if sizes else 0
+            return [
+                (fi, li)
+                for li in range(max_sz)
+                for fi, sz in enumerate(sizes)
+                if li < sz
+            ]
+        # Custom — no auto-mapping; caller preserves current block order.
+        return []
 
     def _rebuild_blocks(self) -> None:
         """Refill the T / M / Z block rows from the current file list."""
         entries = [e for e in self._entries
                     if "error" not in e and "filepath" in e]
         chain = self.combo_axis.currentText()
+        pattern = self.combo_pattern.currentText()
+        is_custom = (pattern == "Custom")
         attr = {"T": "n_timepoints", "M": "n_multipoints",
                 "Z": "n_zslices", "C": "n_channels"}
 
         file_colors = file_color_palette(len(entries))
 
         for axis, row in self._block_rows.items():
-            # Reconfigure drag for the chain-axis row each rebuild — the
-            # user can change the chain axis at any time and we need to
-            # flip drag enable on the correct row.
             is_chain = (axis == chain)
+            # Drag is only available on the chain-axis row AND only when
+            # the user has chosen the Custom pattern.
+            drag_ok = is_chain and is_custom
             row.setSelectionMode(
-                QAbstractItemView.ExtendedSelection if is_chain
+                QAbstractItemView.ExtendedSelection if drag_ok
                 else QAbstractItemView.NoSelection
             )
             row.setDragDropMode(
-                QAbstractItemView.InternalMove if is_chain
+                QAbstractItemView.InternalMove if drag_ok
                 else QAbstractItemView.NoDragDrop
             )
-            row.setDragEnabled(is_chain)
-            row.setAcceptDrops(is_chain)
-            row.setDropIndicatorShown(is_chain)
-            row.setFocusPolicy(Qt.StrongFocus if is_chain else Qt.NoFocus)
-            row._draggable = is_chain
+            row.setDragEnabled(drag_ok)
+            row.setAcceptDrops(drag_ok)
+            row.setDropIndicatorShown(drag_ok)
+            row.setFocusPolicy(Qt.StrongFocus if drag_ok else Qt.NoFocus)
+            row._draggable = drag_ok
 
-            # Build the block list. For the chain axis, walk every file
-            # and every native slice on that axis to produce blocks
-            # colored by source file. For non-chain axes, blocks are
-            # uniformly colored and use file 0's native size on that
-            # axis (all files agree, by the consistency check).
             blocks: List[Dict[str, Any]] = []
             if not entries:
                 row.set_blocks([], {}, color_by_file=is_chain)
                 continue
 
             if is_chain:
+                # Build the natural (ascending) block lookup keyed by
+                # (file_idx, local_idx) so any pattern can reorder them.
+                natural: List[Dict[str, Any]] = []
+                block_lookup: Dict[Tuple[int, int], Dict[str, Any]] = {}
                 for fi, e in enumerate(entries):
                     n_local = int(e.get(attr[axis], 1))
                     fname = os.path.basename(e.get("filepath", ""))
                     for li in range(n_local):
-                        blocks.append({
+                        b = {
                             "file_idx": fi,
                             "local_idx": li,
                             "filename": fname,
                             "frame_label": f"{axis}={li}",
-                        })
+                        }
+                        natural.append(b)
+                        block_lookup[(fi, li)] = b
+
+                if is_custom:
+                    # Preserve the current visual order if it still covers
+                    # all the same (file_idx, local_idx) pairs; otherwise
+                    # fall back to ascending so new/removed files are shown.
+                    current_mapping = row.mapping()
+                    current_keys = set(current_mapping)
+                    expected_keys = set(block_lookup.keys())
+                    if current_keys == expected_keys:
+                        blocks = [block_lookup[k] for k in current_mapping]
+                    else:
+                        blocks = natural
+                else:
+                    mapping = self._compute_pattern_mapping(pattern, entries)
+                    blocks = [block_lookup[k] for k in mapping if k in block_lookup]
             else:
                 # Display-only: one block per slice on the (shared) axis.
                 e0 = entries[0]

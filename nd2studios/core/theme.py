@@ -168,6 +168,26 @@ QPushButton {
     font: 10pt "Helvetica Neue";
     min-height: 28px;
 }
+QPushButton#compactBtn {
+    padding: 2px 4px;
+    min-height: 0;
+    font: 9pt "Helvetica Neue";
+}
+QPushButton#playBtn {
+    padding: 2px 6px;
+    min-height: 0;
+    font: 12pt "Helvetica Neue";
+    border-radius: 4px;
+}
+QPushButton#playBtn:hover { background-color: #5a5e72; }
+QPushButton#playBtn:checked {
+    background-color: #50fa7b;
+    color: #282a36;
+}
+QPushButton#playBtn:checked:hover {
+    background-color: #6dffa0;
+    color: #282a36;
+}
 QPushButton:hover {
     background-color: #5a5e72;
 }
@@ -285,6 +305,41 @@ QLineEdit, QSpinBox, QDoubleSpinBox {
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
     border: 1px solid #bd93f9;
 }
+QLineEdit#axisFrameEdit {
+    padding: 2px 4px;
+    min-height: 0;
+    font: 9pt "Helvetica Neue";
+    text-align: center;
+}
+QSpinBox, QDoubleSpinBox {
+    padding-right: 18px;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 16px;
+    background-color: #44475a;
+    border-left: 1px solid #5a5e72;
+    border-top-right-radius: 5px;
+}
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 16px;
+    background-color: #44475a;
+    border-left: 1px solid #5a5e72;
+    border-bottom-right-radius: 5px;
+}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: #5a5e72;
+}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    width: 7px; height: 5px;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    width: 7px; height: 5px;
+}
 QComboBox {
     background-color: #343b48;
     color: #f8f8f2;
@@ -325,12 +380,12 @@ QCheckBox::indicator:checked {
 }
 
 /* SLIDERS */
-QSlider::groove:horizontal { height: 6px; background: #44475a; border-radius: 3px; }
+QSlider::groove:horizontal { height: 8px; background: #44475a; border-radius: 4px; }
 QSlider::handle:horizontal {
-    background: #bd93f9; width: 16px; height: 16px;
-    margin: -5px 0; border-radius: 8px;
+    background: #bd93f9; width: 18px; height: 18px;
+    margin: -5px 0; border-radius: 9px;
 }
-QSlider::sub-page:horizontal { background: #bd93f9; border-radius: 3px; }
+QSlider::sub-page:horizontal { background: #6272a4; border-radius: 4px; }
 
 /* PROGRESS BAR */
 QProgressBar {

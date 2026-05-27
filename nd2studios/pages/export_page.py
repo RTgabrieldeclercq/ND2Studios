@@ -93,6 +93,18 @@ class ExportPage(QWidget):
         self.combo_tiff_bitdepth = QComboBox()
         self.combo_tiff_bitdepth.addItems(["passthrough", "uint16", "uint8"])
         form.addRow("Bit depth", self.combo_tiff_bitdepth)
+
+        self.lbl_tiff_zproj = QLabel("Z-projection")
+        self.combo_tiff_zproj = QComboBox()
+        self.combo_tiff_zproj.addItems(["max", "mean", "min"])
+        self.combo_tiff_zproj.setToolTip(
+            "Re-project the Z stack using the chosen method at export time.\n"
+            "Only available when the file has more than one Z slice."
+        )
+        form.addRow(self.lbl_tiff_zproj, self.combo_tiff_zproj)
+        self.lbl_tiff_zproj.setVisible(False)
+        self.combo_tiff_zproj.setVisible(False)
+
         layout.addLayout(form)
 
         info = QLabel(
@@ -370,9 +382,16 @@ class ExportPage(QWidget):
         exp = self.main_window.exp_manager.active
         channel_display = dict(getattr(exp, "channel_display", None) or {})
 
-        out_dir = QFileDialog.getExistingDirectory(self, "Choose output folder", "")
+        _rp = getattr(self, "_replay_export_path", "")
+        out_dir = _rp or QFileDialog.getExistingDirectory(self, "Choose output folder", "")
         if not out_dir:
             return
+
+        self._record_macro(
+            "export_tracked_objects",
+            f"Export Tracked Objects → {out_dir}",
+            export_dir=out_dir,
+        )
 
         from nd2studios.backend.exporters.tracked_objects_exporter import export_tracked_objects
         objects_per_m = int(self.spin_objects_per_m.value())
@@ -380,6 +399,9 @@ class ExportPage(QWidget):
         with_mask = self.cb_tracked_mask_overlay.isChecked()
         fmt = self.combo_tracked_fmt.currentText().lower()
 
+        _replaying = getattr(
+            getattr(self.main_window, "macro_recorder", None), "replaying", False
+        )
         try:
             if self.main_window:
                 self.main_window.set_status_text("Exporting tracked objects…")
@@ -394,19 +416,32 @@ class ExportPage(QWidget):
                 with_mask_overlay=with_mask,
                 fmt=fmt,
                 progress_cb=lambda p: self.main_window.set_progress(p) if self.main_window else None,
+                basename=self._export_basename(),
             )
             if self.main_window:
                 self.main_window.set_progress(0)
                 self.main_window.set_status_text(
                     f"Exported {len(paths)} tracked object file(s) to {out_dir}")
-            QMessageBox.information(
-                self, "Export complete",
-                f"Wrote {len(paths)} file(s) to:\n{out_dir}"
-            )
+            if not _replaying:
+                QMessageBox.information(
+                    self, "Export complete",
+                    f"Wrote {len(paths)} file(s) to:\n{out_dir}"
+                )
         except Exception as e:
             if self.main_window:
                 self.main_window.set_progress(0)
             QMessageBox.warning(self, "Export failed", str(e))
+
+    # ── Helpers ──
+    def _export_basename(self) -> str:
+        """Return the stem of the imported filename for auto-naming exports."""
+        if self.main_window is None or self.main_window.exp_manager.active is None:
+            return "export"
+        exp = self.main_window.exp_manager.active
+        fp = (exp.import_config or {}).get("filepath", "")
+        if fp:
+            return os.path.splitext(os.path.basename(fp))[0]
+        return exp.name or "export"
 
     # ── Page lifecycle ──
     def on_activated(self) -> None:
@@ -445,14 +480,25 @@ class ExportPage(QWidget):
             f" · {exp.pixel_size_um:.3f} µm/px{z_note}"
         )
 
+        # Z-projection combo: show when file has multi-Z with an active projection.
+        has_z_proj = (
+            exp._raw_volume is not None
+            and exp.n_zslices > 1
+            and exp.z_view_mode in ("max", "mean", "min")
+        )
+        self.lbl_tiff_zproj.setVisible(has_z_proj)
+        self.combo_tiff_zproj.setVisible(has_z_proj)
+        if has_z_proj:
+            self.combo_tiff_zproj.setCurrentText(exp.z_view_mode)
+
         # Image-sequence tab defaults — derive base name from filename, and
         # only enable the multi-axis checkbox when the file actually has
         # multiple M positions or unprojected Z slices.
         if not self.le_seq_basename.text():
             fp = exp.import_config.get("filepath") if exp.import_config else None
-            base = (os.path.splitext(os.path.basename(fp))[0]
+            stem = (os.path.splitext(os.path.basename(fp))[0]
                     if fp else (exp.name or "frame"))
-            self.le_seq_basename.setText(base)
+            self.le_seq_basename.setText(f"{stem}_seq")
         has_multi_m = exp._raw_volume is not None and exp.n_multipoints > 1
         has_multi_z_unprojected = (
             exp._raw_volume is not None
@@ -592,12 +638,18 @@ class ExportPage(QWidget):
                 name: exp.channel_display.get(name, {}).get("enabled", True)
                 for name in exp._raw_volume.channel_names
             }
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Export Z Stack TIFF", "",
-                "TIFF (*.tif *.tiff);;All files (*)",
-            )
+            _rp = getattr(self, "_replay_export_path", "")
+            if _rp:
+                path = os.path.join(_rp, f"{self._export_basename()}_zstack.tif")
+            else:
+                path = QFileDialog.getSaveFileName(
+                    self, "Export Z Stack TIFF",
+                    f"{self._export_basename()}_zstack.tif",
+                    "TIFF (*.tif *.tiff);;All files (*)",
+                )[0]
             if not path:
                 return
+            export_dir = os.path.dirname(path)
             req = ExportRequest(
                 mode="tiff_zstack",
                 filepath=path,
@@ -610,22 +662,52 @@ class ExportPage(QWidget):
                 m_index=exp.m_index,
                 crop_rect=exp.crop_rect,
             )
-            self._record_macro("export_tiff", "Export TIFF Z-Stack",
-                               bit_depth=self.combo_tiff_bitdepth.currentText())
+            self._record_macro("export_tiff",
+                               f"Export TIFF Z-Stack → {export_dir}",
+                               bit_depth=self.combo_tiff_bitdepth.currentText(),
+                               export_dir=export_dir)
             self._run_export(req, "Building Z stack TIFF…")
             return
 
-        # Standard (T, H, W) export — Z already projected.
+        # Standard (T, H, W) export — Z already projected (or re-projected).
         channels, colors, enabled, _lut = self._channels_and_state()
         if not channels:
             QMessageBox.information(self, "Nothing to export", "Import a file first.")
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export TIFF Stack", "",
-            "TIFF (*.tif *.tiff);;All files (*)",
+
+        # Determine projection label and optionally re-project.
+        has_z_proj = (
+            exp._raw_volume is not None
+            and exp.n_zslices > 1
+            and exp.z_view_mode in ("max", "mean", "min")
         )
+        if has_z_proj:
+            chosen_mode = self.combo_tiff_zproj.currentText()
+            if chosen_mode != exp.z_view_mode:
+                vol = exp._raw_volume
+                channels = {
+                    ch_name: vol.to_lazy_channel(
+                        c_idx, m=exp.m_index,
+                        z_mode=chosen_mode, z_index=0,
+                    ).materialize()
+                    for c_idx, ch_name in enumerate(vol.channel_names)
+                }
+            suffix = f"_z{chosen_mode}"
+        else:
+            suffix = "_tiff"
+
+        _rp = getattr(self, "_replay_export_path", "")
+        if _rp:
+            path = os.path.join(_rp, f"{self._export_basename()}{suffix}.tif")
+        else:
+            path = QFileDialog.getSaveFileName(
+                self, "Export TIFF Stack",
+                f"{self._export_basename()}{suffix}.tif",
+                "TIFF (*.tif *.tiff);;All files (*)",
+            )[0]
         if not path:
             return
+        export_dir = os.path.dirname(path)
         req = ExportRequest(
             mode="tiff_stack",
             filepath=path,
@@ -635,8 +717,10 @@ class ExportPage(QWidget):
             pixel_size_um=self._pixel_size_um(),
             bit_depth=self.combo_tiff_bitdepth.currentText(),
         )
-        self._record_macro("export_tiff", "Export TIFF Stack",
-                           bit_depth=self.combo_tiff_bitdepth.currentText())
+        self._record_macro("export_tiff",
+                           f"Export TIFF Stack → {export_dir}",
+                           bit_depth=self.combo_tiff_bitdepth.currentText(),
+                           export_dir=export_dir)
         self._run_export(req, "Writing TIFF…")
 
     def _on_export_composite(self) -> None:
@@ -644,12 +728,18 @@ class ExportPage(QWidget):
         if not channels:
             QMessageBox.information(self, "Nothing to export", "Import a file first.")
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export RGB Composite TIFF", "",
-            "TIFF (*.tif *.tiff);;All files (*)",
-        )
+        _rp = getattr(self, "_replay_export_path", "")
+        if _rp:
+            path = os.path.join(_rp, f"{self._export_basename()}_composite.tif")
+        else:
+            path = QFileDialog.getSaveFileName(
+                self, "Export RGB Composite TIFF",
+                f"{self._export_basename()}_composite.tif",
+                "TIFF (*.tif *.tiff);;All files (*)",
+            )[0]
         if not path:
             return
+        export_dir = os.path.dirname(path)
         req = ExportRequest(
             mode="rgb_composite",
             filepath=path,
@@ -659,7 +749,9 @@ class ExportPage(QWidget):
             pixel_size_um=self._pixel_size_um(),
             lut_settings=lut_settings,
         )
-        self._record_macro("export_composite", "Export RGB Composite TIFF")
+        self._record_macro("export_composite",
+                           f"Export RGB Composite → {export_dir}",
+                           export_dir=export_dir)
         self._run_export(req, "Writing RGB composite…")
 
     def _movie_options_from_ui(self) -> MovieOptions:
@@ -696,7 +788,14 @@ class ExportPage(QWidget):
         opts: MovieOptions,
         title: str,
     ) -> Optional[ImageAdjustments]:
-        """Open the preview dialog and return chosen adjustments, or None on cancel."""
+        """Open the preview dialog and return chosen adjustments, or None on cancel.
+
+        During macro replay ``_replay_adjustments`` is set on self; in that case
+        the dialog is skipped entirely and the stored adjustments are returned.
+        """
+        replay_adj = getattr(self, "_replay_adjustments", None)
+        if replay_adj is not None:
+            return replay_adj
         dlg = ExportPreviewDialog(
             channels=channels,
             colors=colors,
@@ -719,10 +818,15 @@ class ExportPage(QWidget):
             return
         fmt = self.combo_movie_fmt.currentText()
         ext = ".mp4" if fmt == "mp4" else ".gif"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Movie", "",
-            f"{fmt.upper()} (*{ext});;All files (*)",
-        )
+        _rp = getattr(self, "_replay_export_path", "")
+        if _rp:
+            path = os.path.join(_rp, f"{self._export_basename()}_movie{ext}")
+        else:
+            path = QFileDialog.getSaveFileName(
+                self, "Export Movie",
+                f"{self._export_basename()}_movie{ext}",
+                f"{fmt.upper()} (*{ext});;All files (*)",
+            )[0]
         if not path:
             return
         if not path.lower().endswith(ext):
@@ -749,8 +853,10 @@ class ExportPage(QWidget):
             lut_settings=lut_settings,
             image_adjustments=adjustments,
         )
+        export_dir = os.path.dirname(path)
         self._record_macro(
-            "export_movie", f"Export Movie ({opts.codec}, {opts.fps:.0f} fps)",
+            "export_movie",
+            f"Export Movie ({opts.codec}, {opts.fps:.0f} fps) → {export_dir}",
             fps=opts.fps,
             format=opts.codec,
             show_scale_bar=opts.show_scale_bar,
@@ -761,6 +867,12 @@ class ExportPage(QWidget):
             timestamp_position=opts.timestamp_position,
             timestamp_color=opts.timestamp_color,
             show_channel_labels=opts.show_channel_labels,
+            export_dir=export_dir,
+            brightness=adjustments.brightness,
+            contrast=adjustments.contrast,
+            saturation=adjustments.saturation,
+            hue=adjustments.hue,
+            fade=adjustments.fade,
         )
         self._run_export(req, "Rendering movie…")
 
@@ -781,7 +893,8 @@ class ExportPage(QWidget):
             basename = (os.path.splitext(os.path.basename(fp))[0]
                         if fp else (exp.name or "frame"))
 
-        out_dir = QFileDialog.getExistingDirectory(
+        _rp = getattr(self, "_replay_export_path", "")
+        out_dir = _rp or QFileDialog.getExistingDirectory(
             self, "Choose output folder for image sequence", ""
         )
         if not out_dir:
@@ -819,6 +932,15 @@ class ExportPage(QWidget):
             z_view_index=exp.z_view_index,
             crop_rect=exp.crop_rect,
         )
+        self._record_macro("export_image_sequence",
+                           f"Export Image Sequence → {out_dir}",
+                           export_dir=out_dir, basename=basename,
+                           brightness=adjustments.brightness,
+                           contrast=adjustments.contrast,
+                           saturation=adjustments.saturation,
+                           hue=adjustments.hue,
+                           fade=adjustments.fade,
+                           )
         self._run_export(req, "Writing image sequence…")
 
     # ── Macro recording / replay ──────────────────────────────────────────────
@@ -828,42 +950,90 @@ class ExportPage(QWidget):
         if mw is None:
             return
         from nd2studios.backend.macro_engine import MacroAction
-        mw.record_macro_action(MacroAction(action_type, label, params))
+        mw.upgrade_last_macro_action(MacroAction(action_type, label, params))
 
     def _replay_export(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
-        """Apply an export_* macro action to the current file."""
+        """Apply an export_* macro action to the current file.
+
+        The stored ``path`` param bypasses the file-picker dialog so replay
+        writes to the same location as the original recording.
+        """
+        from nd2studios.backend.exporters.composite_exporter import ImageAdjustments
+
         t = action.params if isinstance(action.params, dict) else {}
         action_type = action.action_type
+        # _replay_export_path is set to the OUTPUT DIRECTORY.
+        # Each export method then constructs the full filename from _export_basename().
+        # Fallback: if an old macro stored a full "path", use its dirname.
+        self._replay_export_path = (
+            t.get("export_dir", "")
+            or os.path.dirname(t.get("path", ""))
+        )
+        self._replay_adjustments = None
+        try:
+            if action_type == "export_tiff":
+                bd = t.get("bit_depth", "uint16")
+                if hasattr(self, "combo_tiff_bitdepth"):
+                    idx = self.combo_tiff_bitdepth.findText(str(bd))
+                    if idx >= 0:
+                        self.combo_tiff_bitdepth.setCurrentIndex(idx)
+                self._on_export_tiff()
 
-        if action_type == "export_tiff":
-            bd = t.get("bit_depth", "uint16")
-            if hasattr(self, "combo_tiff_bitdepth"):
-                idx = self.combo_tiff_bitdepth.findText(str(bd))
-                if idx >= 0:
-                    self.combo_tiff_bitdepth.setCurrentIndex(idx)
-            self._on_export_tiff()
+            elif action_type == "export_composite":
+                self._on_export_composite()
 
-        elif action_type == "export_composite":
-            self._on_export_composite()
-
-        elif action_type == "export_movie":
-            if hasattr(self, "spin_fps") and "fps" in t:
-                self.spin_fps.setValue(float(t["fps"]))
-            if hasattr(self, "combo_movie_fmt") and "format" in t:
-                idx = self.combo_movie_fmt.findText(str(t["format"]))
-                if idx >= 0:
-                    self.combo_movie_fmt.setCurrentIndex(idx)
-            if hasattr(self, "cb_scalebar"):
-                self.cb_scalebar.setChecked(bool(t.get("show_scale_bar", False)))
-            if hasattr(self, "spin_scalebar_um") and "scale_bar_um" in t:
-                self.spin_scalebar_um.setValue(float(t["scale_bar_um"]))
-            if hasattr(self, "cb_timestamp"):
-                self.cb_timestamp.setChecked(bool(t.get("show_timestamp", False)))
-            if hasattr(self, "cb_channel_labels"):
-                self.cb_channel_labels.setChecked(
-                    bool(t.get("show_channel_labels", False))
+            elif action_type == "export_movie":
+                if hasattr(self, "spin_fps") and "fps" in t:
+                    self.spin_fps.setValue(float(t["fps"]))
+                if hasattr(self, "combo_movie_fmt") and "format" in t:
+                    idx = self.combo_movie_fmt.findText(str(t["format"]))
+                    if idx >= 0:
+                        self.combo_movie_fmt.setCurrentIndex(idx)
+                if hasattr(self, "cb_scalebar"):
+                    self.cb_scalebar.setChecked(bool(t.get("show_scale_bar", False)))
+                if hasattr(self, "spin_scalebar_um") and "scale_bar_um" in t:
+                    self.spin_scalebar_um.setValue(float(t["scale_bar_um"]))
+                if hasattr(self, "cb_timestamp"):
+                    self.cb_timestamp.setChecked(bool(t.get("show_timestamp", False)))
+                if hasattr(self, "cb_channel_labels"):
+                    self.cb_channel_labels.setChecked(
+                        bool(t.get("show_channel_labels", False))
+                    )
+                self._replay_adjustments = ImageAdjustments(
+                    brightness=float(t.get("brightness", 0.0)),
+                    contrast=float(t.get("contrast", 0.0)),
+                    saturation=float(t.get("saturation", 0.0)),
+                    hue=float(t.get("hue", 0.0)),
+                    fade=float(t.get("fade", 0.0)),
                 )
-            self._on_export_movie()
+                self._on_export_movie()
+
+            elif action_type == "export_image_sequence":
+                self._replay_adjustments = ImageAdjustments(
+                    brightness=float(t.get("brightness", 0.0)),
+                    contrast=float(t.get("contrast", 0.0)),
+                    saturation=float(t.get("saturation", 0.0)),
+                    hue=float(t.get("hue", 0.0)),
+                    fade=float(t.get("fade", 0.0)),
+                )
+                self._on_export_image_sequence()
+
+            elif action_type == "export_tracked_objects":
+                self._on_export_tracked_objects()
+
+        finally:
+            self._replay_export_path = ""
+            self._replay_adjustments = None
+
+        # Wait for the export worker to finish before returning to the caller.
+        import time as _time
+        from PySide6.QtCore import QCoreApplication
+        _time.sleep(0.2)
+        QCoreApplication.processEvents()
+        deadline = _time.time() + 600.0
+        while (self._worker is not None and self._worker.isRunning()
+               and _time.time() < deadline):
+            QCoreApplication.processEvents()
 
     # ── Worker plumbing ──
     def _run_export(self, request: ExportRequest, label: str) -> None:
@@ -898,8 +1068,12 @@ class ExportPage(QWidget):
             self.main_window.set_progress(0)
             self.main_window.set_status_text(f"Saved: {result}")
             self.main_window.exp_manager.set_status("ready_to_export")
-        QMessageBox.information(self, "Export complete",
-                                f"Wrote:\n{result}")
+        _replaying = getattr(
+            getattr(self.main_window, "macro_recorder", None), "replaying", False
+        )
+        if not _replaying:
+            QMessageBox.information(self, "Export complete",
+                                    f"Wrote:\n{result}")
 
     def _on_error(self, msg: str) -> None:
         QMessageBox.warning(self, "Export failed", msg)

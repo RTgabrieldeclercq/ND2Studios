@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 import cv2
 import numpy as np
+from scipy.ndimage import maximum_filter1d, minimum_filter1d
 
 from nd2studios.core.plugin_registry import EnhancementPlugin, ParamSpec, PluginBase
 
@@ -38,7 +39,7 @@ class NormalizePlugin(EnhancementPlugin):
             hi = np.percentile(frame, p_high)
             frame = np.clip((frame - lo) / (hi - lo + 1e-10), 0, 1)
             result[t] = (frame * 65535).astype(volume.dtype) if volume.dtype == np.uint16 else (frame * 255).astype(volume.dtype)
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -70,7 +71,7 @@ class CLAHEPlugin(EnhancementPlugin):
                 result[t] = clahe.apply(frame)
             else:
                 result[t] = clahe.apply(frame.astype(np.uint8))
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -92,7 +93,7 @@ class GaussianBlurPlugin(EnhancementPlugin):
         result = np.zeros_like(volume)
         for t in range(T):
             result[t] = cv2.GaussianBlur(volume[t].astype(np.float32), (0, 0), sigma).astype(volume.dtype)
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -117,7 +118,7 @@ class MedianFilterPlugin(EnhancementPlugin):
         result = np.zeros_like(volume)
         for t in range(T):
             result[t] = cv2.medianBlur(volume[t], ksize)
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -134,22 +135,26 @@ class BackgroundSubtractPlugin(EnhancementPlugin):
                       tooltip="Rolling Ball: morphological opening-based estimation (robust to bright objects).\n"
                               "Gaussian Blur: fast Gaussian-smoothed background estimate."),
             ParamSpec("radius", "Ball radius (px)", "float", 50.0, 5.0, 500.0, 5.0,
+                      visible_when={"mode": "Rolling Ball"},
                       tooltip="Radius of the rolling ball. Larger values capture broader background variations.\n"
                               "Typical range: 50–100 px for wide-field, 10–30 px for confocal."),
             ParamSpec("sigma", "Gaussian sigma (px)", "float", 100.0, 10.0, 500.0, 10.0,
-                      tooltip="Gaussian blur sigma for background estimation (Gaussian Blur mode only)."),
+                      visible_when={"mode": "Gaussian Blur"},
+                      tooltip="Gaussian blur sigma for background estimation."),
         ]
 
     @staticmethod
     def _rolling_ball_bg(frame: np.ndarray, radius: float) -> np.ndarray:
-        """Estimate background via morphological opening with a disk-shaped kernel."""
-        r = max(1, int(np.round(radius)))
-        y, x = np.ogrid[-r:r + 1, -r:r + 1]
-        kernel = np.where(x ** 2 + y ** 2 <= r ** 2, 1, 0).astype(np.uint8)
-        # erosion then dilation (opening) approximates rolling-ball background
-        eroded = cv2.erode(frame, kernel)
-        background = cv2.dilate(eroded, kernel)
-        return background
+        # Separable morphological opening: erode then dilate along each axis.
+        # minimum_filter1d/maximum_filter1d use the O(n) sliding-window algorithm,
+        # so this is O(H*W) regardless of radius — safe for large microscopy images.
+        size = 2 * max(1, int(np.round(radius))) + 1
+        f = frame.astype(np.float32)
+        bg = minimum_filter1d(f, size, axis=0)
+        bg = minimum_filter1d(bg, size, axis=1)
+        bg = maximum_filter1d(bg, size, axis=0)
+        bg = maximum_filter1d(bg, size, axis=1)
+        return bg
 
     def execute(self, volume: np.ndarray, params: Dict[str, Any],
                 progress_cb=None) -> np.ndarray:
@@ -166,7 +171,7 @@ class BackgroundSubtractPlugin(EnhancementPlugin):
                 bg = cv2.GaussianBlur(frame, (0, 0), sigma)
             diff = np.clip(frame - bg, 0, None)
             result[t] = diff.astype(volume.dtype)
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -192,7 +197,7 @@ class GammaCorrectionPlugin(EnhancementPlugin):
             frame = volume[t].astype(np.float64) / max_val
             frame = np.power(frame, gamma)
             result[t] = (frame * max_val).astype(volume.dtype)
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -287,7 +292,7 @@ class TemporalFoldCorrectionPlugin(EnhancementPlugin):
                 ).astype(volume.dtype)
             else:
                 result[t] = volume[t]
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -351,7 +356,7 @@ class TemporalFoldCorrectionPlugin(EnhancementPlugin):
                             volume[t, y, x].astype(np.float32) * ratios[t], 0, 65535
                         ).astype(volume.dtype)
 
-            if progress_cb and (y % 50 == 0):
+            if progress_cb:
                 progress_cb(int((y + 1) / H * 100))
 
         return result
@@ -406,7 +411,7 @@ class SpatialFlatnessPlugin(EnhancementPlugin):
                 else:
                     corrected = f - bg_avg + global_mean
                 result[t] = np.clip(corrected, 0, 65535).astype(volume.dtype)
-                if progress_cb and (t % 10 == 0):
+                if progress_cb:
                     progress_cb(int((t + 1) / T * 100))
         else:
             for t in range(T):
@@ -419,7 +424,7 @@ class SpatialFlatnessPlugin(EnhancementPlugin):
                 else:
                     corrected = f - bg + frame_mean
                 result[t] = np.clip(corrected, 0, 65535).astype(volume.dtype)
-                if progress_cb and (t % 10 == 0):
+                if progress_cb:
                     progress_cb(int((t + 1) / T * 100))
 
         return result
@@ -456,7 +461,7 @@ class TopHatPlugin(EnhancementPlugin):
                 result[t] = white_tophat(volume[t], selem)
             else:
                 result[t] = black_tophat(volume[t], selem)
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -489,7 +494,7 @@ class DoGPlugin(EnhancementPlugin):
             if diff.max() > 0:
                 diff = diff / diff.max() * np.iinfo(volume.dtype).max
             result[t] = diff.astype(volume.dtype)
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -518,7 +523,7 @@ class UnsharpMaskPlugin(EnhancementPlugin):
             blurred = cv2.GaussianBlur(f, (0, 0), sigma)
             sharpened = f + amount * (f - blurred)
             result[t] = np.clip(sharpened, 0, max_val).astype(volume.dtype)
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -554,7 +559,7 @@ class BilateralDenoisePlugin(EnhancementPlugin):
                 result[t] = (filtered * 65535).astype(np.uint16)
             else:
                 result[t] = cv2.bilateralFilter(volume[t].astype(np.float32), d, sc, ss).astype(volume.dtype)
-            if progress_cb and (t % 5 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -587,7 +592,7 @@ class MorphGradientPlugin(EnhancementPlugin):
                 g = g / g.max() * max_val
             mixed = blend * volume[t].astype(np.float32) + (1 - blend) * g
             result[t] = np.clip(mixed, 0, max_val).astype(volume.dtype)
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -616,7 +621,7 @@ class LocalContrastPlugin(EnhancementPlugin):
             enhanced = (f / bg)
             enhanced = np.clip((enhanced - 0.5) / 1.5, 0, 1) * max_val
             result[t] = enhanced.astype(volume.dtype)
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -679,7 +684,7 @@ class BlobSubtractPlugin(EnhancementPlugin):
                                  threshold=thresh)
 
             if len(blobs) == 0:
-                if progress_cb and (t % 10 == 0):
+                if progress_cb:
                     progress_cb(int((t + 1) / T * 100))
                 continue
 
@@ -709,7 +714,7 @@ class BlobSubtractPlugin(EnhancementPlugin):
                 med = cv2.medianBlur(frame, 15)
                 result[t][mask] = med[mask]
 
-            if progress_cb and (t % 10 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
 
         return result
@@ -759,7 +764,7 @@ class NLMDenoisePlugin(EnhancementPlugin):
                 result[t] = cv2.fastNlMeansDenoising(frame, None, h=h,
                                                       templateWindowSize=patch,
                                                       searchWindowSize=search)
-            if progress_cb and (t % 5 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -809,7 +814,7 @@ class WaveletDenoisePlugin(EnhancementPlugin):
                                         mode=mode, rescale_sigma=True)
             result[t] = np.clip(denoised * max_val, 0, max_val).astype(volume.dtype)
 
-            if progress_cb and (t % 5 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result
 
@@ -840,6 +845,6 @@ class TVDenoisePlugin(EnhancementPlugin):
             f = volume[t].astype(np.float64) / max_val
             denoised = denoise_tv_chambolle(f, weight=weight)
             result[t] = np.clip(denoised * max_val, 0, max_val).astype(volume.dtype)
-            if progress_cb and (t % 5 == 0):
+            if progress_cb:
                 progress_cb(int((t + 1) / T * 100))
         return result

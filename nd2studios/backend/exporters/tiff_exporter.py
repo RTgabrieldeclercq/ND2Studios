@@ -118,7 +118,7 @@ def export_tiff_stack(
                     resolutionunit=None,
                     metadata=metadata if t == 0 else None,
                 )
-                if progress_cb is not None and (t % 10 == 0 or t == n - 1):
+                if progress_cb is not None:
                     progress_cb(int((t + 1) / n * 100))
     else:
         # (T, Z, H, W) — ImageJ TZYX hyperstack.

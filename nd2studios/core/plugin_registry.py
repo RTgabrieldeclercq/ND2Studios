@@ -38,6 +38,7 @@ class ParamSpec:
     step: Any = None
     choices: List[str] = field(default_factory=list)
     tooltip: str = ""
+    visible_when: Optional[Dict[str, Any]] = None
 
 
 class PluginBase(ABC):

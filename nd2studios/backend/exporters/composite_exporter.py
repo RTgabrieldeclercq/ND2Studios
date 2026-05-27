@@ -312,5 +312,5 @@ def export_rgb_composite_tiff(
                 resolutionunit=None,
                 metadata=metadata if t == 0 else None,
             )
-            if progress_cb is not None and (t % 5 == 0 or t == n - 1):
+            if progress_cb is not None:
                 progress_cb(int((t + 1) / n * 100))

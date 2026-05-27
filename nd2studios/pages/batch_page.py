@@ -257,6 +257,14 @@ class BatchPage(QWidget):
             )
         except Exception as exc:
             QMessageBox.warning(self, "Template Load Failed", str(exc))
+            return
+        mw = getattr(self, "main_window", None)
+        if mw is not None:
+            from nd2studios.backend.macro_engine import MacroAction
+            mw.upgrade_last_macro_action(MacroAction(
+                "load_template", f"Load Template: {path}",
+                {"path": path},
+            ))
 
     def _on_save_template(self) -> None:
         from nd2studios.backend.template import (

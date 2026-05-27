@@ -17,7 +17,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import numpy as np
-from PySide6.QtCore import Qt, QSortFilterProxyModel, QAbstractTableModel, QModelIndex
+from PySide6.QtCore import Qt, QSortFilterProxyModel, QAbstractTableModel, QModelIndex, QCoreApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -226,6 +226,12 @@ class ResultsPage(QWidget):
         self._btn_compute.setObjectName("primaryBtn")
         self._btn_compute.clicked.connect(self._on_compute)
         ctrl_row.addWidget(self._btn_compute)
+
+        self._compute_progress_bar = QProgressBar()
+        self._compute_progress_bar.setRange(0, 100)
+        self._compute_progress_bar.setMaximumHeight(14)
+        self._compute_progress_bar.setVisible(False)
+        ctrl_row.addWidget(self._compute_progress_bar)
 
         self._cb_raw_intensity = QCheckBox("Use raw image for intensity")
         self._cb_raw_intensity.setToolTip(
@@ -762,6 +768,20 @@ class ResultsPage(QWidget):
                 result[k] = np.asarray(v)
         return result
 
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _export_basename(self) -> str:
+        """Return the stem of the imported filename for auto-naming exports."""
+        exp = self._selected_rec or self._exp
+        if exp is None and self.main_window is not None:
+            exp = self.main_window.exp_manager.active
+        if exp is None:
+            return "export"
+        fp = (getattr(exp, "import_config", {}) or {}).get("filepath", "")
+        if fp:
+            return os.path.splitext(os.path.basename(fp))[0]
+        return getattr(exp, "name", None) or "export"
+
     # ── V1.38 Phase 6 — workspace rehydrate ──────────────────────────────────
 
     def _rehydrate_released_label_masks(
@@ -823,25 +843,44 @@ class ResultsPage(QWidget):
         metadata.setdefault("pixel_size_um", exp.pixel_size_um)
 
         multi_m = len(results_by_m) > 1
+        total_m = max(len(results_by_m), 1)
         all_rows: List[Dict[str, Any]] = []
 
-        for m, result in sorted(results_by_m.items()):
-            channels_for_m = self._channels_for_m(exp, m)
-            try:
-                rows = compute_measurements(
-                    result.label_masks,
-                    channels_for_m,
-                    metadata,
-                    m_index=m,
-                    volumetric_voxel_counts=result.volumetric_voxel_counts,
-                )
-            except Exception as exc:
-                QMessageBox.warning(self, "Compute Error", str(exc))
-                return
-            if multi_m:
-                for row in rows:
-                    row["m_position"] = m
-            all_rows.extend(rows)
+        self._compute_progress_bar.setValue(0)
+        self._compute_progress_bar.setVisible(True)
+        self._btn_compute.setEnabled(False)
+        if self.main_window is not None:
+            self.main_window.set_progress(1)
+
+        try:
+            for idx, (m, result) in enumerate(sorted(results_by_m.items())):
+                channels_for_m = self._channels_for_m(exp, m)
+                try:
+                    rows = compute_measurements(
+                        result.label_masks,
+                        channels_for_m,
+                        metadata,
+                        m_index=m,
+                        volumetric_voxel_counts=result.volumetric_voxel_counts,
+                    )
+                except Exception as exc:
+                    QMessageBox.warning(self, "Compute Error", str(exc))
+                    return
+                if multi_m:
+                    for row in rows:
+                        row["m_position"] = m
+                all_rows.extend(rows)
+                pct = int((idx + 1) / total_m * 90)
+                self._compute_progress_bar.setValue(pct)
+                if self.main_window is not None:
+                    self.main_window.set_progress(pct)
+                QCoreApplication.processEvents()
+        finally:
+            self._compute_progress_bar.setValue(100)
+            if self.main_window is not None:
+                self.main_window.set_progress(0)
+            self._compute_progress_bar.setVisible(False)
+            self._btn_compute.setEnabled(True)
 
         self._measurements = all_rows
 
@@ -1000,15 +1039,30 @@ class ResultsPage(QWidget):
 
     # ── Export: CSV ───────────────────────────────────────────────────────────
 
+    def _record_macro(self, action_type: str, label: str, **params) -> None:
+        mw = self.main_window
+        if mw is None:
+            return
+        from nd2studios.backend.macro_engine import MacroAction
+        mw.upgrade_last_macro_action(MacroAction(action_type, label, params))
+
     def _on_export_csv(self) -> None:
         if not self._measurements:
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Measurements CSV", "measurements.csv",
-            "CSV files (*.csv)",
-        )
+        _rp = getattr(self, "_replay_result_export_path", "")
+        if _rp:
+            path = os.path.join(_rp, f"{self._export_basename()}_measurements.csv")
+        else:
+            path = QFileDialog.getSaveFileName(
+                self, "Export Measurements CSV",
+                f"{self._export_basename()}_measurements.csv",
+                "CSV files (*.csv)",
+            )[0]
         if not path:
             return
+        export_dir = os.path.dirname(path)
+        self._record_macro("export_csv", f"Export CSV → {export_dir}",
+                           export_dir=export_dir)
         fieldnames = list(self._measurements[0].keys())
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
@@ -1058,15 +1112,20 @@ class ResultsPage(QWidget):
             )
             return
 
-        out_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        _rp = getattr(self, "_replay_result_export_path", "")
+        out_dir = _rp or QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if not out_dir:
             return
+
+        self._record_macro("export_label_masks", f"Export Label Masks → {out_dir}", export_dir=out_dir)
 
         include_image = self._cb_mask_overlay.isChecked()
         fmt = self._combo_img_fmt.currentText().lower()
         metadata = dict(exp.nd2_metadata or {})
         pixel_size_um = float(exp.pixel_size_um or 0.0)
         multi_m = len(results_by_m) > 1
+
+        basename = self._export_basename()
 
         def _run(progress_cb, status_cb):
             total_paths: List[str] = []
@@ -1092,9 +1151,11 @@ class ResultsPage(QWidget):
                         progress_cb=lambda p: progress_cb(
                             int(idx / len(items) * 100 + p / len(items))
                         ),
+                        basename=basename,
                     )
                 else:
-                    paths = export_label_masks_tiff(result.label_masks, target)
+                    paths = export_label_masks_tiff(result.label_masks, target,
+                                                    basename=basename)
                 total_paths.extend(paths)
             return total_paths
 
@@ -1125,14 +1186,20 @@ class ResultsPage(QWidget):
         if not results_by_m:
             return
 
-        out_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        _rp = getattr(self, "_replay_result_export_path", "")
+        out_dir = _rp or QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if not out_dir:
             return
+
+        self._record_macro("export_overlay_images", f"Export Overlay Images → {out_dir}",
+                           export_dir=out_dir)
 
         fmt = self._combo_img_fmt.currentText().lower()
         metadata = dict(exp.nd2_metadata or {})
         pixel_size_um = float(exp.pixel_size_um or 0.0)
         multi_m = len(results_by_m) > 1
+
+        basename = self._export_basename()
 
         def _run(progress_cb, status_cb):
             total_paths: List[str] = []
@@ -1157,6 +1224,7 @@ class ResultsPage(QWidget):
                     progress_cb=lambda p: progress_cb(
                         int(idx / len(items) * 100 + p / len(items))
                     ),
+                    basename=basename,
                 )
                 total_paths.extend(paths)
             return total_paths
@@ -1229,10 +1297,46 @@ class ResultsPage(QWidget):
         msg = f"Saved {n} file(s)."
         if self.main_window is not None:
             self.main_window.set_status_text(msg)
-        QMessageBox.information(self, "Export Complete", msg)
+        _replaying = getattr(
+            getattr(self.main_window, "macro_recorder", None), "replaying", False
+        )
+        if not _replaying:
+            QMessageBox.information(self, "Export Complete", msg)
 
     def _on_export_error(self, msg: str) -> None:
         self._progress_bar.setVisible(False)
         self._btn_cancel_export.setVisible(False)
         self._set_export_buttons_enabled(True)
         QMessageBox.warning(self, "Export Failed", msg)
+
+    # ── Macro replay ──────────────────────────────────────────────────────────
+
+    def _replay_result_export(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
+        """Replay export_csv / export_label_masks / export_overlay_images actions."""
+        import time as _time
+
+        t = action.params if isinstance(action.params, dict) else {}
+        # _replay_result_export_path is the output directory; each export method
+        # constructs the full filename via _export_basename().
+        # Fallback: old macros stored a full "path" — use its dirname.
+        self._replay_result_export_path = (
+            t.get("export_dir", "")
+            or os.path.dirname(t.get("path", ""))
+        )
+        try:
+            if action.action_type == "export_csv":
+                self._on_export_csv()
+            elif action.action_type == "export_label_masks":
+                self._on_export_masks()
+            elif action.action_type == "export_overlay_images":
+                self._on_export_images()
+        finally:
+            self._replay_result_export_path = ""
+
+        # Wait for the async worker (masks / overlay are threaded; CSV is not).
+        _time.sleep(0.2)
+        QCoreApplication.processEvents()
+        deadline = _time.time() + 600.0
+        while (self._worker is not None and self._worker.isRunning()
+               and _time.time() < deadline):
+            QCoreApplication.processEvents()

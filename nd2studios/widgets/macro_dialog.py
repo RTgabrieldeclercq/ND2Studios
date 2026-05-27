@@ -16,19 +16,37 @@ import json
 import os
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from PySide6.QtCore import QMimeData, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QMimeData, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
-    QSizePolicy, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from nd2studios.backend.macro_engine import (
     MACRO_EXTENSION, MacroAction, load_macro, save_macro,
 )
 from nd2studios.core.settings import Settings
+
+# Maps action_type → (path_param_key, picker_mode)
+# picker_mode: "save_file" | "open_file" | "open_dir"
+_PATH_BROWSE: Dict[str, tuple] = {
+    # All exports: store output directory — filename is auto-named from the loaded file.
+    "export_tiff":             ("export_dir", "open_dir"),
+    "export_composite":        ("export_dir", "open_dir"),
+    "export_movie":            ("export_dir", "open_dir"),
+    "export_image_sequence":   ("export_dir", "open_dir"),
+    "export_csv":              ("export_dir", "open_dir"),
+    "export_label_masks":      ("export_dir", "open_dir"),
+    "export_overlay_images":   ("export_dir", "open_dir"),
+    "export_tracked_objects":  ("export_dir", "open_dir"),
+    # Config / recipe / template loading: full file path required.
+    "load_recipe":             ("path", "open_file"),
+    "load_config":             ("path", "open_file"),
+    "load_template":           ("path", "open_file"),
+}
 
 if TYPE_CHECKING:
     pass
@@ -48,6 +66,7 @@ class _ActionRowWidget(QFrame):
         self.setObjectName("actionRow")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFixedHeight(36)
+        self.setAutoFillBackground(True)  # opaque — prevents list item text from bleeding through
         self._action = action
 
         h = QHBoxLayout(self)
@@ -115,7 +134,7 @@ class _ActionEditDialog(QDialog):
     def __init__(self, action: MacroAction, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("Edit Action")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(480)
         self._action = action
         self._editors: Dict[str, QLineEdit] = {}
 
@@ -134,14 +153,42 @@ class _ActionEditDialog(QDialog):
         sep.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(sep)
 
+        # Determine if this action type has a browseable path param.
+        path_key, picker_mode = _PATH_BROWSE.get(action.action_type, (None, None))
+
         # Params
         if action.params:
             form = QFormLayout()
             for key, value in action.params.items():
-                edit = QLineEdit(json.dumps(value, ensure_ascii=False))
-                edit.setToolTip(f"JSON value for '{key}'")
+                # Decode JSON so paths display without surrounding quotes.
+                raw_json = json.dumps(value, ensure_ascii=False)
+                try:
+                    display = json.loads(raw_json)
+                    display_text = display if isinstance(display, str) else raw_json
+                except Exception:
+                    display_text = raw_json
+
+                edit = QLineEdit(display_text)
+                edit.setToolTip(f"Value for '{key}'")
                 self._editors[key] = edit
-                form.addRow(f"{key}:", edit)
+
+                if key == path_key and picker_mode is not None:
+                    # Browse row: line-edit + Browse button side by side.
+                    row_w = QWidget()
+                    row_l = QHBoxLayout(row_w)
+                    row_l.setContentsMargins(0, 0, 0, 0)
+                    row_l.setSpacing(4)
+                    row_l.addWidget(edit, stretch=1)
+                    btn = QPushButton("Browse…")
+                    btn.setMaximumWidth(80)
+                    btn.clicked.connect(
+                        lambda checked=False, e=edit, m=picker_mode:
+                        self._browse_path(e, m)
+                    )
+                    row_l.addWidget(btn)
+                    form.addRow(f"{key}:", row_w)
+                else:
+                    form.addRow(f"{key}:", edit)
             layout.addLayout(form)
         else:
             layout.addWidget(QLabel("(no editable parameters)"))
@@ -159,6 +206,19 @@ class _ActionEditDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+    def _browse_path(self, edit: QLineEdit, mode: str) -> None:
+        current = edit.text().strip()
+        if mode == "save_file":
+            path, _ = QFileDialog.getSaveFileName(self, "Choose output file", current)
+        elif mode == "open_file":
+            path, _ = QFileDialog.getOpenFileName(self, "Choose file", current)
+        elif mode == "open_dir":
+            path = QFileDialog.getExistingDirectory(self, "Choose directory", current)
+        else:
+            return
+        if path:
+            edit.setText(path)
+
     def _on_accept(self) -> None:
         new_params: Dict[str, Any] = {}
         for key, edit in self._editors.items():
@@ -166,7 +226,7 @@ class _ActionEditDialog(QDialog):
             try:
                 new_params[key] = json.loads(raw)
             except json.JSONDecodeError:
-                new_params[key] = raw  # keep as string if not valid JSON
+                new_params[key] = raw  # keep as plain string (e.g. file paths)
         self._action.params = new_params
         self._action.label = self._edit_label.text().strip() or self._action.label
         self.accept()
@@ -212,6 +272,18 @@ class _ActionListWidget(QWidget):
     def get_actions(self) -> List[MacroAction]:
         return list(self._actions)
 
+    def highlight_step(self, idx: int) -> None:
+        """Highlight row *idx* as the currently-replaying action; -1 clears all."""
+        for i, rw in enumerate(self._row_widgets):
+            if i == idx:
+                rw.setStyleSheet(
+                    "background: #283593; border: 1px solid #8be9fd; border-radius: 3px;"
+                )
+            else:
+                rw.setStyleSheet("")
+        if 0 <= idx < self._list.count():
+            self._list.scrollToItem(self._list.item(idx))
+
     # ── internals ────────────────────────────────────────────────────
 
     def _rebuild_list(self) -> None:
@@ -221,8 +293,8 @@ class _ActionListWidget(QWidget):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, i)
             item.setSizeHint(QSize(0, 38))
-            # Item text is used for the drag visual
-            item.setText(action.label)
+            # Keep item text empty — the _ActionRowWidget renders the label.
+            # Populated text bleeds through the widget's transparent edges.
             item.setFlags(
                 Qt.ItemFlag.ItemIsEnabled
                 | Qt.ItemFlag.ItemIsSelectable
@@ -283,10 +355,10 @@ class MacroDialog(QDialog):
 
         self.setWindowTitle("Macro Recorder")
         self.setMinimumSize(480, 560)
-        self.setWindowFlags(
-            self.windowFlags()
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
+        # Use a plain Window so it floats freely alongside the app without
+        # sitting on top of OS file pickers or other pop-ups.
+        self.setWindowFlags(Qt.WindowType.Window)
+        self.setWindowModality(Qt.WindowModality.NonModal)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -435,6 +507,19 @@ class MacroDialog(QDialog):
         self._action_list_widget = _ActionListWidget()
         v.addWidget(self._action_list_widget, stretch=1)
 
+        # Replay progress (hidden until Run Macro is clicked)
+        self._replay_step_label = QLabel("")
+        self._replay_step_label.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: 8pt;"
+        )
+        self._replay_step_label.setVisible(False)
+        v.addWidget(self._replay_step_label)
+
+        self._replay_progress_bar = QProgressBar()
+        self._replay_progress_bar.setMaximumHeight(14)
+        self._replay_progress_bar.setVisible(False)
+        v.addWidget(self._replay_progress_bar)
+
         # Run macro button
         run_row = QHBoxLayout()
         self._btn_run_macro = QPushButton("▶  Run Macro on Current File")
@@ -473,8 +558,10 @@ class MacroDialog(QDialog):
         self._blink_state = True
         self._lbl_rec_indicator.setStyleSheet("color: #ff5555; font-weight: bold;")
 
-        # Tell the recorder to start
-        if hasattr(self._mw, "macro_recorder"):
+        # Tell the recorder to start (installs event filter too)
+        if hasattr(self._mw, "start_recording"):
+            self._mw.start_recording()
+        elif hasattr(self._mw, "macro_recorder"):
             self._mw.macro_recorder.start()
 
         self._blink_timer.start()
@@ -498,29 +585,67 @@ class MacroDialog(QDialog):
 
     # ── Panel 1 — Record actions ──────────────────────────────────────────────
 
+    _ICON_MAP = {
+        "navigate":               "↗",
+        "button_click":           "🖱",
+        "combo_change":           "▾",
+        "spinbox_change":         "🔢",
+        "checkbox_change":        "☑",
+        "param_change":           "⚙",
+        "channel_state":          "🎨",
+        "load_recipe":            "📥",
+        "load_config":            "📥",
+        "load_template":          "📥",
+        "recipe_add_step":        "🧪",
+        "recipe_remove_last":     "↩",
+        "recipe_clear":           "🗑",
+        "analysis_run":           "🔬",
+        "export_tiff":            "📄",
+        "export_composite":       "🖼",
+        "export_movie":           "🎬",
+        "export_image_sequence":  "🖼",
+        "export_csv":             "📊",
+        "export_label_masks":     "🏷",
+        "export_overlay_images":  "🖼",
+        "export_tracked_objects": "🔬",
+    }
+
     def _on_action_recorded(self, action_dict: dict) -> None:
-        """Slot connected to MainWindow.macro_action_recorded signal."""
+        """Slot connected to MainWindow.macro_action_recorded signal.
+
+        Uses a full-refresh so in-place upgrades (button_click → recipe_add_step)
+        are immediately reflected without leaving a stale entry in the list.
+        """
         if self._stack.currentIndex() != 1:
             return
-        label = action_dict.get("label", action_dict.get("action_type", "Action"))
-        item = QListWidgetItem(f"  {label}")
-        action_type = action_dict.get("action_type", "")
-        icon_map = {
-            "recipe_add_step": "🧪",
-            "recipe_remove_last": "↩",
-            "recipe_clear": "🗑",
-            "analysis_run": "🔬",
-            "export_tiff": "📄",
-            "export_composite": "🖼",
-            "export_movie": "🎬",
-        }
-        icon = icon_map.get(action_type, "•")
-        item.setText(f"  {icon}  {label}")
-        self._rec_list.addItem(item)
+        recorder = getattr(self._mw, "macro_recorder", None)
+        if recorder is not None:
+            actions = recorder.actions
+        else:
+            self._recorded_actions.append(MacroAction.from_dict(action_dict))
+            actions = self._recorded_actions
+
+        self._rec_list.clear()
+        texts = []
+        for a in actions:
+            icon = self._ICON_MAP.get(a.action_type, "•")
+            text = f"  {icon}  {a.label}"
+            self._rec_list.addItem(text)
+            texts.append(text)
         self._rec_list.scrollToBottom()
-        self._recorded_actions.append(MacroAction.from_dict(action_dict))
-        n = len(self._recorded_actions)
+        n = len(actions)
         self._lbl_rec_count.setText(f"{n} action{'s' if n != 1 else ''} recorded")
+        self._auto_resize_width(texts, extra=48)
+
+    def _auto_resize_width(self, texts: List[str], extra: int = 48) -> None:
+        """Grow the dialog width to fit the longest *texts* entry if needed."""
+        from PySide6.QtGui import QFontMetrics
+        fm = QFontMetrics(self._rec_list.font())
+        needed = self.minimumWidth()
+        for t in texts:
+            needed = max(needed, fm.horizontalAdvance(t) + extra)
+        if needed > self.width():
+            self.resize(needed, self.height())
 
     def _on_toggle_pause(self) -> None:
         recorder = getattr(self._mw, "macro_recorder", None)
@@ -552,17 +677,23 @@ class MacroDialog(QDialog):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        recorder = getattr(self._mw, "macro_recorder", None)
-        if recorder is not None:
-            recorder.cancel()
+        if hasattr(self._mw, "stop_recording"):
+            self._mw.stop_recording(cancel=True)
+        else:
+            recorder = getattr(self._mw, "macro_recorder", None)
+            if recorder is not None:
+                recorder.cancel()
         self._blink_timer.stop()
         self._recorded_actions = []
         self._rec_list.clear()
         self._stack.setCurrentIndex(0)
 
     def _on_finish_recording(self) -> None:
-        recorder = getattr(self._mw, "macro_recorder", None)
-        actions = recorder.finish() if recorder is not None else list(self._recorded_actions)
+        if hasattr(self._mw, "stop_recording"):
+            actions = self._mw.stop_recording(cancel=False)
+        else:
+            recorder = getattr(self._mw, "macro_recorder", None)
+            actions = recorder.finish() if recorder is not None else list(self._recorded_actions)
         self._blink_timer.stop()
 
         if not actions:
@@ -616,6 +747,9 @@ class MacroDialog(QDialog):
         self._lbl_edit_path.setText(path or "(unsaved)")
         self._action_list_widget.set_actions(actions)
         self._stack.setCurrentIndex(2)
+        # Row widgets include drag handle + checkbox + Edit + Delete (~140 px overhead).
+        texts = [f"  ⠿  {a.label}" for a in actions]
+        self._auto_resize_width(texts, extra=140)
 
     def _on_save_as(self) -> None:
         actions = self._action_list_widget.get_actions()
@@ -636,9 +770,9 @@ class MacroDialog(QDialog):
             QMessageBox.warning(self, "Save Failed", str(exc))
 
     def _on_run_macro(self) -> None:
-        actions = self._action_list_widget.get_actions()
-        enabled = [a for a in actions if a.enabled]
-        if not enabled:
+        all_actions = self._action_list_widget.get_actions()
+        enabled_pairs = [(i, a) for i, a in enumerate(all_actions) if a.enabled]
+        if not enabled_pairs:
             QMessageBox.information(
                 self, "Nothing to Run",
                 "No actions are enabled. Check the boxes next to each step.",
@@ -655,12 +789,36 @@ class MacroDialog(QDialog):
             QMessageBox.warning(self, "Not Supported", "Replay not available.")
             return
 
-        for action in enabled:
-            self._mw.replay_macro_action(action)
+        n = len(enabled_pairs)
+        self._replay_progress_bar.setRange(0, n)
+        self._replay_progress_bar.setValue(0)
+        self._replay_progress_bar.setVisible(True)
+        self._replay_step_label.setVisible(True)
+        self._btn_run_macro.setEnabled(False)
+
+        try:
+            for step, (list_idx, action) in enumerate(enabled_pairs):
+                short = action.label[:70] + ("…" if len(action.label) > 70 else "")
+                self._replay_step_label.setText(
+                    f"Step {step + 1}/{n}: {short}"
+                )
+                self._action_list_widget.highlight_step(list_idx)
+                QCoreApplication.processEvents()
+
+                self._mw.replay_macro_action(action)
+
+                self._replay_progress_bar.setValue(step + 1)
+                QCoreApplication.processEvents()
+        finally:
+            self._action_list_widget.highlight_step(-1)
+            self._replay_progress_bar.setVisible(False)
+            self._replay_step_label.setVisible(False)
+            self._replay_step_label.setText("")
+            self._btn_run_macro.setEnabled(True)
 
         if hasattr(self._mw, "set_status_text"):
             self._mw.set_status_text(
-                f"Macro '{self._macro_name}' applied ({len(enabled)} steps)."
+                f"Macro '{self._macro_name}' applied ({n} steps)."
             )
 
     def _on_record_again(self) -> None:

@@ -90,7 +90,7 @@ class LutHistogramWidget(QWidget):
         self.spin_lo.setRange(0.0, 1e9)
         self.spin_lo.setDecimals(0)
         self.spin_lo.setMaximumWidth(80)
-        self.spin_lo.valueChanged.connect(self._on_spin_changed)
+        self.spin_lo.editingFinished.connect(self._on_spin_changed)
         row.addWidget(self.spin_lo)
 
         row.addWidget(QLabel("…"))
@@ -99,7 +99,7 @@ class LutHistogramWidget(QWidget):
         self.spin_hi.setRange(0.0, 1e9)
         self.spin_hi.setDecimals(0)
         self.spin_hi.setMaximumWidth(80)
-        self.spin_hi.valueChanged.connect(self._on_spin_changed)
+        self.spin_hi.editingFinished.connect(self._on_spin_changed)
         row.addWidget(self.spin_hi)
 
         row.addWidget(QLabel("γ"))
@@ -111,11 +111,13 @@ class LutHistogramWidget(QWidget):
         row.addWidget(self.slider_gamma)
 
         self.btn_auto = QPushButton("Auto")
+        self.btn_auto.setObjectName("compactBtn")
         self.btn_auto.setFixedWidth(48)
         self.btn_auto.clicked.connect(self._on_auto)
         row.addWidget(self.btn_auto)
 
         self.btn_reset = QPushButton("Reset")
+        self.btn_reset.setObjectName("compactBtn")
         self.btn_reset.setFixedWidth(54)
         self.btn_reset.clicked.connect(self._on_reset)
         row.addWidget(self.btn_reset)
@@ -254,7 +256,7 @@ class LutHistogramWidget(QWidget):
         self._emit()
 
     # ── Buttons / spinboxes ──
-    def _on_spin_changed(self, _v: float) -> None:
+    def _on_spin_changed(self) -> None:
         lo = float(self.spin_lo.value())
         hi = float(self.spin_hi.value())
         if hi <= lo:
@@ -284,6 +286,10 @@ class LutHistogramWidget(QWidget):
         hi_idx = max(lo_idx + 1, min(hi_idx, len(edges) - 1))
         self._lo = float(edges[lo_idx])
         self._hi = float(edges[hi_idx])
+        self._gamma = 1.0
+        self.slider_gamma.blockSignals(True)
+        self.slider_gamma.setValue(100)
+        self.slider_gamma.blockSignals(False)
         self._sync_spinboxes()
         self._redraw()
         self._emit()

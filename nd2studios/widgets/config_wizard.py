@@ -496,8 +496,9 @@ class ConfigWizard(QDialog):
             RECIPE_EXTENSION,
             load_recipe as _load,
         )
+        from nd2studios.core.settings import Settings
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Recipe", "",
+            self, "Load Recipe", Settings.PROJECT_DIR,
             f"ND2Studios Recipe (*{RECIPE_EXTENSION});;All files (*)",
         )
         if not path:
@@ -708,9 +709,10 @@ class ConfigWizard(QDialog):
     # ── Path picker ───────────────────────────────────────────────────────────
 
     def _browse_path(self) -> None:
+        from nd2studios.core.settings import Settings
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Configuration As",
-            self._cfg_path or "",
+            self._cfg_path or Settings.PROJECT_DIR,
             f"ND2Studios Config (*{CONFIG_EXTENSION})",
         )
         if path:
@@ -724,8 +726,9 @@ class ConfigWizard(QDialog):
     def _on_accept(self) -> None:
         # Require a file path — prompt if none has been browsed to yet.
         if not self._cfg_path:
+            from nd2studios.core.settings import Settings
             path, _ = QFileDialog.getSaveFileName(
-                self, "Save Configuration As", "",
+                self, "Save Configuration As", Settings.PROJECT_DIR,
                 f"ND2Studios Config (*{CONFIG_EXTENSION})",
             )
             if not path:
@@ -1028,10 +1031,11 @@ class SavePreviewDialog(QDialog):
         return page
 
     def _browse_path(self) -> None:
+        from nd2studios.core.settings import Settings
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Configuration As",
-            self._save_path,
+            self._save_path or Settings.PROJECT_DIR,
             f"ND2Studios Config (*{CONFIG_EXTENSION})",
         )
         if path:

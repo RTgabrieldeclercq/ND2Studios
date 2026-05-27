@@ -76,7 +76,7 @@ def normalize_timeseries(
 
     for t in range(T):
         result[t] = normalize_frame(timeseries[t], frame_means[t], grand_mean)
-        if progress_cb and (t % 10 == 0 or t == T - 1):
+        if progress_cb:
             progress_cb(int((t + 1) / T * 100))
 
     return result

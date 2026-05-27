@@ -112,18 +112,21 @@ class ZoomToolbar(QWidget):
         BTN_W, BTN_H = 56, 26
 
         self.btn_home = QPushButton("Home")
+        self.btn_home.setObjectName("compactBtn")
         self.btn_home.setToolTip("Reset view (fit image to window)")
         self.btn_home.setFixedSize(BTN_W, BTN_H)
         self.btn_home.clicked.connect(self._on_home)
         layout.addWidget(self.btn_home)
 
         self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setObjectName("compactBtn")
         self.btn_zoom_in.setToolTip("Zoom in")
         self.btn_zoom_in.setFixedSize(BTN_H, BTN_H)
         self.btn_zoom_in.clicked.connect(self._on_zoom_in)
         layout.addWidget(self.btn_zoom_in)
 
         self.btn_zoom_out = QPushButton("-")
+        self.btn_zoom_out.setObjectName("compactBtn")
         self.btn_zoom_out.setToolTip("Zoom out")
         self.btn_zoom_out.setFixedSize(BTN_H, BTN_H)
         self.btn_zoom_out.clicked.connect(self._on_zoom_out)
@@ -131,6 +134,7 @@ class ZoomToolbar(QWidget):
 
         # Pan toggle — left-click-drag to pan when active.
         self.btn_pan = QPushButton("Pan")
+        self.btn_pan.setObjectName("compactBtn")
         self.btn_pan.setToolTip(
             "Toggle pan tool. When on, left-click and drag to move the image.\n"
             "When off, click reports pixel coordinates."

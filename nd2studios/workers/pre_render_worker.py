@@ -49,6 +49,8 @@ class PreRenderWorker(QThread):
         chip_snapshot: Dict[str, Tuple[bool, Tuple[int, int, int]]],
         priority_m: int,
         cache: Dict[Tuple[int, int], np.ndarray],
+        z_mode: str = "max",
+        z_index: int = 0,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -57,6 +59,8 @@ class PreRenderWorker(QThread):
         self._chip_snapshot = chip_snapshot
         self._priority_m = priority_m
         self._cache = cache
+        self._z_mode = z_mode
+        self._z_index = int(z_index)
         self._cancelled = False
         self._finished_emitted = False
         PreRenderWorker._running.append(self)
@@ -140,13 +144,20 @@ class PreRenderWorker(QThread):
             if arr is None:
                 continue
             try:
-                plane = arr[m, t]  # (H, W) — zero-copy ndarray view from (M,T,H,W)
+                zstack = arr[m, t]  # (Z, H, W)
             except IndexError:
                 continue
-
-            # Squeeze any residual leading axes (e.g. Z=1 not yet collapsed).
-            while plane.ndim > 2:
-                plane = plane[0]
+            n_z = zstack.shape[0]
+            if n_z <= 1:
+                plane = zstack[0]
+            elif self._z_mode == "none":
+                plane = zstack[max(0, min(self._z_index, n_z - 1))]
+            elif self._z_mode == "max":
+                plane = zstack.max(axis=0)
+            elif self._z_mode == "min":
+                plane = zstack.min(axis=0)
+            else:
+                plane = zstack.mean(axis=0).astype(zstack.dtype)
             if plane.ndim != 2:
                 continue
 

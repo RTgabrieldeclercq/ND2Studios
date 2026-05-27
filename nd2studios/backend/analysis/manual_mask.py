@@ -1,4 +1,4 @@
-"""Manual Mask — AnalysisPipeline that rasterizes user-drawn shapes.
+"""Mask Analysis — AnalysisPipeline that rasterizes user-drawn shapes and tiled strips.
 
 The Analysis page collects shapes (rectangle, ellipse, free-polygon) drawn
 on the viewer canvas and stores them keyed by (M position, frame index,
@@ -53,20 +53,22 @@ DEFAULT_EDIT_VERTEX_COUNT = 24
 
 @AnalysisPipeline.register
 class ManualMaskPipeline(AnalysisPipeline):
-    """User-drawn binary masks.
+    """User-drawn and auto-tiled binary masks.
 
     Draw rectangles, ellipses, or free-polygons on each frame in the viewer
-    while this pipeline is active; the page collects the shapes and the
-    pipeline rasterizes them to a label stack.  Each shape becomes its own
-    ``label_id`` so the Results tab reports per-shape area and centroid.
+    while this pipeline is active, and/or generate a grid of tiled rectangular
+    strips via the Custom Mask Creator panel.  Each shape or strip becomes its
+    own ``label_id`` so the Results tab reports per-region area and centroid.
+    Tiled strips receive stable IDs (1..N) across every frame; hand-drawn
+    shapes are offset above that range.
     """
 
-    name = "Manual Mask"
+    name = "Mask Analysis"
     description = (
-        "User-drawn binary masks. Draw rectangles, ellipses, or free-polygons "
-        "on each frame using the drawing tools that appear below the "
-        "parameters; the pipeline rasterizes them into a label stack. "
-        "Each shape on a frame becomes its own label_id."
+        "User-drawn and auto-tiled binary masks. Draw rectangles, ellipses, "
+        "or free-polygons on each frame using the drawing tools, or generate "
+        "evenly-spaced rectangular strips with the Custom Mask Creator. "
+        "Each region becomes its own label_id in the Results tab."
     )
 
     def get_params(self) -> List[ParamSpec]:
@@ -74,15 +76,18 @@ class ManualMaskPipeline(AnalysisPipeline):
             ParamSpec(
                 "channel_name", "Channel", "choice", "",
                 choices=[],
-                tooltip="Channel the manual mask is associated with. "
+                tooltip="Channel the mask is associated with. "
                         "The mask's frame count comes from this channel's "
                         "(T, H, W) shape.",
             ),
-            # Internal state injected by AnalysisPage at run time. Hidden from
-            # the ParamEditor UI — the user manipulates it via the canvas.
-            # Schema: {t: {z_key: [shapes]}} where z_key is an int Z index or
-            # the string "all" meaning "every Z slice".
+            # Injected at run time from the drawing canvas (per-frame shapes).
+            # Schema: {t: {z_key: [shapes]}} where z_key is int or "all".
             ParamSpec("frame_shapes", "", "hidden", default={}),
+            # Injected at run time from the Custom Mask Creator panel.
+            # Schema: [{"shape_type": "rect_strip", "direction": "vertical"|"horizontal",
+            #           "height_px": int, "width_px": int|None, "x_offset_px": int,
+            #           "start_offset_px": int}, ...]
+            ParamSpec("tiled_masks", "", "hidden", default=[]),
         ]
 
     def run(
@@ -123,6 +128,12 @@ class ManualMaskPipeline(AnalysisPipeline):
             if any(k != "all" for k in by_z):
                 any_per_z = True
 
+        # Tiled masks — generate boxes once and apply to every frame with
+        # stable IDs 1..N so each strip is the same object across time.
+        tiled_specs: List[Dict[str, Any]] = params.get("tiled_masks") or []
+        tiled_boxes = generate_tiled_label_boxes(tiled_specs, H, W)
+        n_tiled = len(tiled_boxes)
+
         label_stack = np.zeros((T, H, W), dtype=np.int32)
         voxel_counts: Dict[Tuple[int, int], int] = {}
 
@@ -130,18 +141,20 @@ class ManualMaskPipeline(AnalysisPipeline):
         for t in range(T):
             if cancelled_cb is not None and cancelled_cb():
                 break
+            # Paint tiled strips first (label IDs 1..n_tiled, same every frame).
+            for label_id, (y0, y1, x0, x1) in enumerate(tiled_boxes, start=1):
+                label_stack[t, y0:y1, x0:x1] = label_id
+            # Paint hand-drawn shapes with IDs offset above the tiled range.
             by_z = normalised.get(t, {})
             if by_z:
                 ordered = _ordered_shapes(by_z)  # [(label_id, z_key, shape), ...]
-                # 2D union for visualization. Paint in label order — later
-                # shapes overwrite earlier where they overlap.
-                for label_id, _z_key, shape in ordered:
-                    _rasterize(label_stack[t], shape, label_id, H, W)
-                # Per-label voxel counts — needed only when at least one
-                # shape lives on a specific Z slice. Otherwise the uniform-Z
-                # fallback in results_engine is exact.
+                for rel_id, z_key, shape in ordered:
+                    _rasterize(label_stack[t], shape, n_tiled + rel_id, H, W)
                 if any_per_z and n_zslices > 1:
-                    counts = _voxel_counts_for_frame(ordered, n_zslices, H, W)
+                    counts = _voxel_counts_for_frame(
+                        [(n_tiled + lid, zk, sh) for lid, zk, sh in ordered],
+                        n_zslices, H, W,
+                    )
                     for label_id, vox in counts.items():
                         voxel_counts[(t, label_id)] = vox
             if progress_cb is not None:
@@ -149,10 +162,12 @@ class ManualMaskPipeline(AnalysisPipeline):
 
         n_frames_with = int(sum(1 for t in range(T) if label_stack[t].max() > 0))
         pixel_size = float(metadata.get("pixel_size_um") or 1.0)
-        total_objects = sum(
+        # Count: tiled strips appear in every frame; drawn shapes vary per frame.
+        n_drawn = sum(
             sum(len(shapes) for shapes in by_z.values())
             for by_z in normalised.values()
         )
+        total_objects = n_tiled + n_drawn
         areas_px: List[int] = []
         for t in range(T):
             n_labels = int(label_stack[t].max())
@@ -184,16 +199,93 @@ class ManualMaskPipeline(AnalysisPipeline):
         return result
 
 
-def rasterize_shapes(frame: np.ndarray,
-                     shapes: List[Dict[str, Any]],
-                     H: int, W: int) -> None:
-    """Paint each shape into ``frame`` with label_id 1..N (in place).
+def rasterize_shapes(
+    frame: np.ndarray,
+    shapes: List[Dict[str, Any]],
+    H: int,
+    W: int,
+    label_offset: int = 0,
+) -> None:
+    """Paint each shape into ``frame`` with label_id (offset+1)..(offset+N) in place.
 
-    Public helper so the Analysis page can render a live preview of the
-    drawn-but-not-yet-run shapes onto the viewer.
+    ``label_offset`` lets callers reserve lower IDs for tiled masks so drawn
+    shapes never collide with tiled-strip label IDs.
     """
-    for label_id, shape in enumerate(shapes, start=1):
-        _rasterize(frame, shape, label_id, H, W)
+    for rel_id, shape in enumerate(shapes, start=1):
+        _rasterize(frame, shape, label_offset + rel_id, H, W)
+
+
+def generate_tiled_label_boxes(
+    tiled_masks: List[Dict[str, Any]],
+    H: int,
+    W: int,
+) -> List[Tuple[int, int, int, int]]:
+    """Return ``(y0, y1, x0, x1)`` bounding boxes for each complete tiled strip.
+
+    Strips that would extend past the image boundary are excluded (i.e. only
+    full-sized strips are kept).  Label IDs should be assigned as 1..len(result)
+    so every strip is a distinct, stable object.
+
+    Spec dict keys (all optional except those noted):
+        shape_type       "rect_strip" (required, currently the only type)
+        direction        "vertical" (tiles in Y) | "horizontal" (tiles in X)
+        height_px        strip height in pixels (required for vertical)
+        width_px         strip width in pixels; None → full image width (W)
+        x_offset_px      x-start for non-full-width strips (default 0)
+        start_offset_px  pixel offset of the first strip from the image edge
+    """
+    boxes: List[Tuple[int, int, int, int]] = []
+    for spec in tiled_masks:
+        if spec.get("shape_type", "rect_strip") != "rect_strip":
+            continue
+        direction = spec.get("direction", "vertical")
+        if direction == "vertical":
+            strip_h = int(spec.get("height_px") or 0)
+            if strip_h <= 0:
+                continue
+            strip_w_raw = spec.get("width_px")
+            strip_w = int(strip_w_raw) if strip_w_raw else W
+            x0 = int(spec.get("x_offset_px") or 0)
+            x1 = min(x0 + strip_w, W)
+            if x1 <= x0:
+                continue
+            y = int(spec.get("start_offset_px") or 0)
+            while y + strip_h <= H:
+                boxes.append((y, y + strip_h, x0, x1))
+                y += strip_h
+        elif direction == "horizontal":
+            strip_w = int(spec.get("width_px") or 0)
+            if strip_w <= 0:
+                continue
+            strip_h_raw = spec.get("height_px")
+            strip_h = int(strip_h_raw) if strip_h_raw else H
+            y0 = int(spec.get("x_offset_px") or 0)  # reuse x_offset as y-start
+            y1 = min(y0 + strip_h, H)
+            if y1 <= y0:
+                continue
+            x = int(spec.get("start_offset_px") or 0)
+            while x + strip_w <= W:
+                boxes.append((y0, y1, x, x + strip_w))
+                x += strip_w
+    return boxes
+
+
+def generate_tiled_mask(
+    tiled_masks: List[Dict[str, Any]],
+    H: int,
+    W: int,
+) -> np.ndarray:
+    """Return ``(H, W)`` int32 array with label IDs 1..N for tiled strips.
+
+    Convenience wrapper around :func:`generate_tiled_label_boxes` for the
+    live-overlay preview in the Analysis page.
+    """
+    out = np.zeros((H, W), dtype=np.int32)
+    for label_id, (y0, y1, x0, x1) in enumerate(
+        generate_tiled_label_boxes(tiled_masks, H, W), start=1
+    ):
+        out[y0:y1, x0:x1] = label_id
+    return out
 
 
 def _normalise_frame_slot(value: Any) -> Dict[Any, List[Dict[str, Any]]]:

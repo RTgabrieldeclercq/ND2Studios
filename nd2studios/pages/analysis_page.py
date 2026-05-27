@@ -49,7 +49,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QScrollArea,
+    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -61,6 +63,8 @@ from PySide6.QtWidgets import (
 from nd2studios.backend.analysis.manual_mask import (
     DEFAULT_EDIT_VERTEX_COUNT,
     expand_polygon_uniformly,
+    generate_tiled_label_boxes,
+    generate_tiled_mask,
     rasterize_shapes,
     shape_to_editable_polygon,
 )
@@ -77,7 +81,7 @@ from nd2studios.widgets.common import ParamEditor
 from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
 
 
-MANUAL_MASK_PIPELINE_NAME = "Manual Mask"
+MANUAL_MASK_PIPELINE_NAME = "Mask Analysis"
 
 # V1.37 Phase 5 — coalescing keys for the project-wide JobRunner. Each
 # value is shared across every submission of the same tier on this
@@ -133,6 +137,9 @@ class AnalysisPage(QWidget):
         # {m: {frame_idx: [{"type": str, "vertices": [[y, x], ...]}, ...]}}
         self._manual_shapes: Dict[int, Dict[int, List[Dict[str, Any]]]] = {}
         self._current_draw_mode: Optional[str] = None
+
+        # Custom Mask Creator — tiled strip specs injected into the pipeline.
+        self._tiled_masks: List[Dict[str, Any]] = []
 
         # Mask-edit state — when active, one shape on the current (m, t) frame
         # is being edited with draggable vertex handles.
@@ -350,6 +357,103 @@ class AnalysisPage(QWidget):
         self._draw_group.hide()
         left_layout.addWidget(self._draw_group)
 
+        # ── Custom Mask Creator (visible only when Mask Analysis is active) ──
+        self._custom_mask_group = QGroupBox("Custom Mask Creator")
+        cmg = QVBoxLayout(self._custom_mask_group)
+        cmg.setContentsMargins(8, 8, 8, 8)
+        cmg.setSpacing(4)
+
+        # Shape type
+        shape_row = QHBoxLayout()
+        shape_row.addWidget(QLabel("Shape type:"))
+        self._combo_tiled_shape_type = QComboBox()
+        self._combo_tiled_shape_type.addItem("Rectangle Strip")
+        shape_row.addWidget(self._combo_tiled_shape_type)
+        shape_row.addStretch(1)
+        cmg.addLayout(shape_row)
+
+        # Direction
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("Direction:"))
+        self._radio_vertical = QRadioButton("Vertical")
+        self._radio_vertical.setChecked(True)
+        self._radio_horizontal = QRadioButton("Horizontal")
+        dir_row.addWidget(self._radio_vertical)
+        dir_row.addWidget(self._radio_horizontal)
+        dir_row.addStretch(1)
+        cmg.addLayout(dir_row)
+
+        # Strip dimension
+        dim_row = QHBoxLayout()
+        self._lbl_strip_dim = QLabel("Strip height (px):")
+        dim_row.addWidget(self._lbl_strip_dim)
+        self._spin_strip_height = QSpinBox()
+        self._spin_strip_height.setRange(1, 999999)
+        self._spin_strip_height.setValue(4096)
+        self._spin_strip_height.setFixedWidth(80)
+        dim_row.addWidget(self._spin_strip_height)
+        dim_row.addStretch(1)
+        cmg.addLayout(dim_row)
+
+        # Full-width toggle + optional width/offset fields
+        self._chk_full_width = QCheckBox("Full image width")
+        self._chk_full_width.setChecked(True)
+        self._chk_full_width.toggled.connect(self._on_full_width_toggled)
+        cmg.addWidget(self._chk_full_width)
+
+        self._custom_width_row = QWidget()
+        cwr_layout = QHBoxLayout(self._custom_width_row)
+        cwr_layout.setContentsMargins(0, 0, 0, 0)
+        cwr_layout.addWidget(QLabel("Width (px):"))
+        self._spin_strip_width = QSpinBox()
+        self._spin_strip_width.setRange(1, 999999)
+        self._spin_strip_width.setValue(512)
+        self._spin_strip_width.setFixedWidth(80)
+        cwr_layout.addWidget(self._spin_strip_width)
+        cwr_layout.addWidget(QLabel("X offset (px):"))
+        self._spin_x_offset = QSpinBox()
+        self._spin_x_offset.setRange(0, 999999)
+        self._spin_x_offset.setValue(0)
+        self._spin_x_offset.setFixedWidth(80)
+        cwr_layout.addWidget(self._spin_x_offset)
+        cwr_layout.addStretch(1)
+        self._custom_width_row.hide()
+        cmg.addWidget(self._custom_width_row)
+
+        # Start offset
+        offset_row = QHBoxLayout()
+        offset_row.addWidget(QLabel("Start offset (px):"))
+        self._spin_start_offset = QSpinBox()
+        self._spin_start_offset.setRange(0, 999999)
+        self._spin_start_offset.setValue(0)
+        self._spin_start_offset.setFixedWidth(80)
+        offset_row.addWidget(self._spin_start_offset)
+        offset_row.addStretch(1)
+        cmg.addLayout(offset_row)
+
+        # Direction radio change updates label
+        self._radio_vertical.toggled.connect(self._on_tiled_direction_changed)
+
+        # Generate / clear row
+        gen_row = QHBoxLayout()
+        self._btn_generate_tiled = QPushButton("Generate Masks")
+        self._btn_generate_tiled.clicked.connect(self._on_generate_tiled_masks)
+        self._lbl_tiled_count = QLabel("—")
+        self._lbl_tiled_count.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;"
+        )
+        gen_row.addWidget(self._btn_generate_tiled)
+        gen_row.addWidget(self._lbl_tiled_count)
+        gen_row.addStretch(1)
+        cmg.addLayout(gen_row)
+
+        self._btn_clear_tiled = QPushButton("Clear Tiled Masks")
+        self._btn_clear_tiled.clicked.connect(self._on_clear_tiled_masks)
+        cmg.addWidget(self._btn_clear_tiled)
+
+        self._custom_mask_group.hide()
+        left_layout.addWidget(self._custom_mask_group)
+
         # Run row (full analysis)
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("▶  Run Analysis")
@@ -496,9 +600,12 @@ class AnalysisPage(QWidget):
         if exp is None:
             return
 
-        # Adopt the record's manual-mask shapes so live overlay + drawing
-        # tools operate on the right per-experiment state.
+        # Adopt the record's manual-mask shapes and tiled specs so live overlay
+        # and drawing tools operate on the right per-experiment state.
         self._manual_shapes = copy.deepcopy(getattr(exp, "manual_mask_shapes", {}) or {})
+        self._tiled_masks = list(getattr(exp, "tiled_mask_specs", None) or [])
+        self._raster_version += 1
+        self._refresh_tiled_count_label()
 
         # V1.38 Phase 6 — if the Recipe page released
         # ``_processed_channels`` after committing the recipe, ask the
@@ -566,9 +673,11 @@ class AnalysisPage(QWidget):
 
     def load_from_experiment(self, exp: ND2StudiosRecord) -> None:
         """Restore pipeline selection and params from a loaded session."""
-        # Restore manual-mask shapes first so they are ready before the pipeline
-        # change handler triggers a status / overlay refresh.
+        # Restore manual-mask shapes and tiled specs before the pipeline change
+        # handler triggers a status / overlay refresh.
         self._manual_shapes = copy.deepcopy(getattr(exp, "manual_mask_shapes", {}) or {})
+        self._tiled_masks = list(getattr(exp, "tiled_mask_specs", None) or [])
+        self._refresh_tiled_count_label()
 
         cfg = exp.analysis_config if hasattr(exp, "analysis_config") else {}
         if not cfg:
@@ -599,6 +708,7 @@ class AnalysisPage(QWidget):
             if per_t_clean:
                 cleaned[m] = per_t_clean
         exp.manual_mask_shapes = cleaned
+        exp.tiled_mask_specs = list(self._tiled_masks)
 
     # ── Pipeline / param wiring ───────────────────────────────────────────────
 
@@ -618,11 +728,11 @@ class AnalysisPage(QWidget):
         self.btn_export_tiff.setEnabled(False)
         self.btn_export_csv.setEnabled(False)
 
-        # Drawing tools are pipeline-conditional. When leaving Manual Mask,
-        # also tell the viewer to drop any active draw mode so the cursor
-        # returns to normal.
+        # Drawing tools and Custom Mask Creator are pipeline-conditional.
+        # When leaving Mask Analysis, drop any active draw mode.
         is_manual = (name == MANUAL_MASK_PIPELINE_NAME)
         self._draw_group.setVisible(is_manual)
+        self._custom_mask_group.setVisible(is_manual)
         if not is_manual:
             self._set_draw_mode(None)
             if self._edit_active:
@@ -726,9 +836,11 @@ class AnalysisPage(QWidget):
                     return
 
         # Record this run for macro replay.
+        param_str = ", ".join(f"{k}={v}" for k, v in params.items())
+        _run_label = f"Run: {pipeline_name}" + (f" ({param_str})" if param_str else "")
         self._record_macro_action(
             "analysis_run",
-            f"Run: {pipeline_name}",
+            _run_label,
             pipeline=pipeline_name,
             pipeline_params=params,
         )
@@ -830,6 +942,7 @@ class AnalysisPage(QWidget):
             params_for_job["frame_shapes"] = copy.deepcopy(
                 self._manual_shapes.get(m, {})
             )
+            params_for_job["tiled_masks"] = list(self._tiled_masks)
 
         # V1.37 Phase 5 — replaces the legacy AnalysisWorker QThread.
         # The runner coalesces by key, so submitting a new commit while
@@ -948,16 +1061,24 @@ class AnalysisPage(QWidget):
         if mw is None:
             return
         from nd2studios.backend.macro_engine import MacroAction
-        mw.record_macro_action(MacroAction(action_type, label, params))
+        mw.upgrade_last_macro_action(MacroAction(action_type, label, params))
 
     def _replay_run(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
         """Apply an analysis_run macro action to the current file."""
+        import time as _time
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtWidgets import QMessageBox
+
         pipeline_name = action.params.get("pipeline", "")
         pipeline_params = action.params.get("pipeline_params", {})
         if not pipeline_name:
+            QMessageBox.warning(self, "Macro Replay",
+                                "Run Analysis: no pipeline name stored in action.")
             return
         idx = self.combo_pipeline.findText(pipeline_name)
         if idx < 0:
+            QMessageBox.warning(self, "Macro Replay",
+                                f"Run Analysis: pipeline '{pipeline_name}' not found.")
             return
         self.combo_pipeline.blockSignals(True)
         self.combo_pipeline.setCurrentIndex(idx)
@@ -965,7 +1086,24 @@ class AnalysisPage(QWidget):
         self._on_pipeline_changed(pipeline_name)
         if pipeline_params:
             self.param_editor.set_values(pipeline_params)
+        # Wait for btn_run to become enabled (it may be disabled if a prior
+        # async operation such as recipe commit hasn't finished yet).
+        if not self.btn_run.isEnabled():
+            deadline = _time.time() + 30.0
+            while not self.btn_run.isEnabled() and _time.time() < deadline:
+                QCoreApplication.processEvents()
+
         self._on_run()
+
+        # _on_run() disables btn_run while the worker is active.
+        # Wait a moment for that to propagate, then block until _set_idle()
+        # re-enables btn_run to signal that the analysis worker has finished.
+        _time.sleep(0.3)
+        QCoreApplication.processEvents()
+        if not self.btn_run.isEnabled():
+            deadline = _time.time() + 600.0
+            while not self.btn_run.isEnabled() and _time.time() < deadline:
+                QCoreApplication.processEvents()
 
     # ── V1.37 Phase 5 — JobRunner signal dispatch ────────────────────────────
 
@@ -1108,6 +1246,10 @@ class AnalysisPage(QWidget):
         # V1.37 Phase 5 — replaces the hand-rolled cancel-and-replace
         # logic. The runner cancels any in-flight preview under the
         # same key before scheduling this one.
+        if pipeline_name == MANUAL_MASK_PIPELINE_NAME:
+            params["frame_shapes"] = copy.deepcopy(self._manual_shapes.get(m, {}))
+            params["tiled_masks"] = list(self._tiled_masks)
+
         job = PipelinePreviewJob(
             key=_PREVIEW_KEY,
             pipeline_cls=pipeline_cls,
@@ -1302,6 +1444,58 @@ class AnalysisPage(QWidget):
                 continue
         return None
 
+    # ── Custom Mask Creator slots ────────────────────────────────────────────
+
+    def _on_tiled_direction_changed(self, vertical: bool) -> None:
+        """Update the height-label text to match the selected tiling direction."""
+        self._lbl_strip_dim.setText(
+            "Strip height (px):" if vertical else "Strip width (px):"
+        )
+
+    def _on_full_width_toggled(self, checked: bool) -> None:
+        self._custom_width_row.setVisible(not checked)
+
+    def _on_generate_tiled_masks(self) -> None:
+        """Build a tiled-strip spec from the panel values and store it."""
+        direction = "vertical" if self._radio_vertical.isChecked() else "horizontal"
+        strip_dim = self._spin_strip_height.value()
+        full_w = self._chk_full_width.isChecked()
+        width_px = None if full_w else self._spin_strip_width.value()
+        x_offset = 0 if full_w else self._spin_x_offset.value()
+        start_offset = self._spin_start_offset.value()
+
+        spec: Dict[str, Any] = {
+            "shape_type": "rect_strip",
+            "direction": direction,
+            "height_px": strip_dim,
+            "width_px": width_px,
+            "x_offset_px": x_offset,
+            "start_offset_px": start_offset,
+        }
+        self._tiled_masks = [spec]
+        self._raster_version += 1
+        self._refresh_tiled_count_label()
+        self._update_overlay()
+
+    def _on_clear_tiled_masks(self) -> None:
+        self._tiled_masks = []
+        self._raster_version += 1
+        self._lbl_tiled_count.setText("—")
+        self._update_overlay()
+
+    def _refresh_tiled_count_label(self) -> None:
+        """Recompute and display the strip count from _tiled_masks + current image size."""
+        if not self._tiled_masks:
+            self._lbl_tiled_count.setText("—")
+            return
+        hw = self._frame_hw()
+        if hw is None:
+            self._lbl_tiled_count.setText("— (no image loaded)")
+            return
+        H, W = hw
+        n = len(generate_tiled_label_boxes(self._tiled_masks, H, W))
+        self._lbl_tiled_count.setText(f"{n} strip{'s' if n != 1 else ''} per frame")
+
     # ── Edit-mode handlers ───────────────────────────────────────────────────
 
     def _on_edit_toggled(self, checked: bool) -> None:
@@ -1486,15 +1680,20 @@ class AnalysisPage(QWidget):
         # those visible at the current Z slice.
         if self.combo_pipeline.currentText() == MANUAL_MASK_PIPELINE_NAME:
             _, _, current_z = self.viewer.coords()
-            shapes = self._shapes_visible_at(m, t, int(current_z))
-            if not shapes:
-                return rgb
             h, w = rgb.shape[:2]
             rkey = (m, t, int(current_z), self._raster_version)
             live_mask = self._raster_cache.get(rkey)
             if live_mask is None:
                 live_mask = np.zeros((h, w), dtype=np.int32)
-                rasterize_shapes(live_mask, shapes, h, w)
+                # Tiled strips first (label IDs 1..N_tiled, same every frame).
+                if self._tiled_masks:
+                    tiled_layer = generate_tiled_mask(self._tiled_masks, h, w)
+                    live_mask[:] = tiled_layer
+                # Drawn shapes on top, label IDs offset above tiled range.
+                shapes = self._shapes_visible_at(m, t, int(current_z))
+                if shapes:
+                    n_tiled = int(live_mask.max())
+                    rasterize_shapes(live_mask, shapes, h, w, label_offset=n_tiled)
                 if len(self._raster_cache) >= 200:
                     self._raster_cache.pop(next(iter(self._raster_cache)))
                 self._raster_cache[rkey] = live_mask

@@ -4,15 +4,17 @@ MaterializedDataset — all pixel data resident in RAM, keyed by channel.
 Replaces the LazyND2Volume + LazyND2Channel + FrameCache + IOWorker +
 PrefetchManager stack used through V1.40 for the viewer hot path. After
 the eager parallel materialization at file open, channel access is
-direct ndarray indexing — no Dask, no disk, no projection, no cache
-misses, no GIL contention on the GUI thread.
+direct ndarray indexing — no Dask, no disk, no cache misses, no GIL
+contention on the GUI thread.
 
-Z is collapsed at load time using the user-chosen mode (max / mean /
-min); the resulting per-channel shape is (M, T, H, W). The class
-preserves the LazyND2Volume API the viewer + downstream pipelines
-already speak (get_frame, to_lazy_channel, all_channels_as_lazy,
-reopen, shape) so callers do not need to be rewritten — they just get
-faster.
+Each channel is stored as ``(M, T, Z, H, W)`` so the user can switch Z
+projection modes (max / mean / min / none) dynamically without reloading.
+``get_frame`` and ``to_lazy_channel`` project or slice the Z axis on the
+fly from in-RAM data — still sub-millisecond since no disk I/O is needed.
+
+The class preserves the LazyND2Volume API the viewer + downstream
+pipelines already speak (get_frame, to_lazy_channel, all_channels_as_lazy,
+reopen, shape) so callers do not need to be rewritten.
 """
 from __future__ import annotations
 
@@ -44,29 +46,33 @@ def _as_channel_view(arr: np.ndarray) -> "_ChannelView":
 
 @dataclass
 class MaterializedDataset:
-    """In-RAM dataset; channels keyed by name, each shape (M, T, H, W).
+    """In-RAM dataset; channels keyed by name, each shape (M, T, Z, H, W).
 
     The MaterializedDataset replaces LazyND2Volume on the viewer hot
-    path. Z is already collapsed (the per-channel array has no Z axis).
-    ``z_mode`` is recorded for metadata / export; ``get_frame`` ignores
-    its z_mode argument since the projection is baked in.
+    path. Z is stored in full so the user can switch projection modes
+    (max / mean / min / none) dynamically without reloading. All
+    projection and Z-slice selection happens on the fly from in-RAM
+    data — no disk reads after the initial load.
+
+    ``z_mode`` records the projection mode that was active when the file
+    was loaded (used as the initial display default). The actual mode
+    applied to any given frame access is determined by the caller via
+    the ``z_mode`` argument to ``get_frame`` / ``to_lazy_channel``.
 
     Attributes
     ----------
     filepath : str
         Path of the source file (or first file of a multi-file set).
     channels : Dict[str, np.ndarray]
-        channel_name -> array of shape (M, T, H, W).
+        channel_name -> array of shape (M, T, Z, H, W).
     channel_names : List[str]
         Ordered channel names.
     dtype : np.dtype
         Per-pixel dtype.
     pixel_size_um, z_step_um : float
-    n_multipoints, n_timepoints, n_channels, height, width : int
-    n_zslices : int
-        Always 1 after materialization (Z is collapsed).
+    n_multipoints, n_timepoints, n_channels, n_zslices, height, width : int
     z_mode : str
-        "max" | "mean" | "min" — projection applied at load.
+        Projection mode active at load time ("max" | "mean" | "min" | "none").
     """
 
     filepath: str
@@ -81,13 +87,14 @@ class MaterializedDataset:
     height: int = 0
     width: int = 0
     z_mode: str = "max"
-    n_zslices: int = 1  # always 1 post-materialization
+    n_zslices: int = 1
     extra: Dict[str, object] = field(default_factory=dict)
 
     @property
     def shape(self) -> Tuple[int, int, int, int, int]:
-        """LazyND2Volume-compatible (M, T, Z, H, W). Z is always 1."""
-        return (self.n_multipoints, self.n_timepoints, 1, self.height, self.width)
+        """LazyND2Volume-compatible (M, T, Z, H, W)."""
+        return (self.n_multipoints, self.n_timepoints, self.n_zslices,
+                self.height, self.width)
 
     # ── frame access ──
     def get_frame(self, c: int, m: int = 0, t: int = 0, z: int = 0,
@@ -96,17 +103,35 @@ class MaterializedDataset:
                   z_end: Optional[int] = None) -> np.ndarray:
         """Return a single (H, W) frame.
 
-        The z, z_mode, z_start, z_end arguments are accepted for API
-        compatibility with LazyND2Volume but ignored — Z projection
-        was applied at materialization time. The mode used at load is
-        available as ``self.z_mode``.
+        Parameters
+        ----------
+        c, m, t : int — channel / multipoint / timepoint indices.
+        z : int — Z slice index (used when ``z_mode == 'none'``).
+        z_mode : 'none' | 'max' | 'mean' | 'min' — Z handling.
+        z_start, z_end : int — optional range for projection.
         """
-        del z, z_mode, z_start, z_end  # ignored — Z already collapsed
         name = self.channel_names[int(c)]
-        return self.channels[name][int(m), int(t)]
+        arr = self.channels[name][int(m), int(t)]  # (Z, H, W)
+        n_z = arr.shape[0]
+
+        if z_mode == "none" or n_z <= 1:
+            zi = max(0, min(int(z), n_z - 1))
+            return arr[zi]  # (H, W)
+
+        z_s = int(z_start) if z_start is not None else 0
+        z_e = int(z_end) if z_end is not None else n_z
+        z_s = max(0, min(z_s, n_z))
+        z_e = max(z_s, min(z_e, n_z))
+        stack = arr[z_s:z_e]  # (Z', H, W)
+        if z_mode == "max":
+            return stack.max(axis=0)
+        if z_mode == "min":
+            return stack.min(axis=0)
+        # mean
+        return stack.mean(axis=0).astype(self.dtype)
 
     def channel_array(self, name: str, m: Optional[int] = None) -> np.ndarray:
-        """Return (T, H, W) for one channel at fixed M, or (M, T, H, W) if m is None."""
+        """Return (T, Z, H, W) for one channel at fixed M, or (M, T, Z, H, W) if m is None."""
         arr = self.channels[name]
         return arr if m is None else arr[int(m)]
 
@@ -121,36 +146,51 @@ class MaterializedDataset:
                         t_stride: int = 1) -> "_ChannelView":
         """Return a (T, H, W) ndarray view of channel ``c`` at M=m.
 
-        Originally returned a LazyND2Channel proxy. After materialization
-        the slice is a zero-copy view of the in-RAM array. We cast it
-        to a :class:`_ChannelView` so legacy callers that do
-        ``...to_lazy_channel(...).materialize()`` (analysis, results,
-        batch, recipe workers) keep working unchanged — the view's
-        ``materialize()`` is a no-op that returns the array.
+        Z projection or slice selection is applied on the fly from the
+        in-RAM ``(M, T, Z, H, W)`` array. Legacy callers that call
+        ``.materialize()`` on the result keep working unchanged — the
+        view's ``materialize()`` is a no-op that returns the array.
         """
-        del z_mode, z_index, z_start, z_end  # ignored — Z collapsed
         name = self.channel_names[int(c)]
-        view = self.channels[name][int(m)]                  # (T, H, W)
+        vol = self.channels[name][int(m)]   # (T, Z, H, W)
+        n_z = vol.shape[1]
+
         if t_end is None:
-            t_end = view.shape[0]
-        if t_stride > 1 or t_start != 0 or t_end != view.shape[0]:
-            view = view[int(t_start):int(t_end):max(1, int(t_stride))]
-        return _as_channel_view(view)
+            t_end = vol.shape[0]
+        if t_stride > 1 or t_start != 0 or t_end != vol.shape[0]:
+            vol = vol[int(t_start):int(t_end):max(1, int(t_stride))]  # (T', Z, H, W)
+
+        if n_z <= 1:
+            result = vol[:, 0]  # (T, H, W)
+        elif z_mode == "none":
+            z_i = max(0, min(int(z_index), n_z - 1))
+            result = vol[:, z_i]  # (T, H, W)
+        else:
+            z_e = int(z_end) if z_end is not None else n_z
+            z_s = int(z_start)
+            stack = vol[:, z_s:z_e]   # (T, Z', H, W)
+            if z_mode == "max":
+                result = stack.max(axis=1)
+            elif z_mode == "min":
+                result = stack.min(axis=1)
+            else:  # mean
+                result = stack.mean(axis=1).astype(self.dtype)
+
+        return _as_channel_view(result)
 
     def all_channels_as_lazy(self, m: int = 0,
                              z_mode: str = "max",
                              z_index: int = 0) -> "_OD[str, _ChannelView]":
         """Return an OrderedDict of channel_name -> (T, H, W) view at M=m.
 
-        Each view is a :class:`_ChannelView` (ndarray subclass) so
-        legacy callers that expect ``.materialize()`` on the per-channel
-        proxy keep working.
+        Each view applies z_mode / z_index against the stored (T, Z, H, W)
+        block. Legacy callers that expect ``.materialize()`` keep working.
         """
         from collections import OrderedDict
-        del z_mode, z_index  # ignored
         out: "_OD[str, _ChannelView]" = OrderedDict()
-        for name in self.channel_names:
-            out[name] = _as_channel_view(self.channels[name][int(m)])
+        for i, name in enumerate(self.channel_names):
+            out[name] = self.to_lazy_channel(i, m=m, z_mode=z_mode,
+                                             z_index=z_index)
         return out
 
     def reopen(self) -> "MaterializedDataset":

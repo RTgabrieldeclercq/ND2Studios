@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "kind": "nd2studios.recipe",
+  "name": "Monolayer brightness.nd2s_recipe.json",
+  "notes": "Saved from ND2Studios",
+  "normalized": false,
+  "pipeline": [
+    {
+      "name": "Bleach Correction",
+      "params": {
+        "method": "ratio"
+      }
+    },
+    {
+      "name": "Temporal Fold Correction",
+      "params": {
+        "window": 11,
+        "threshold": 0.1,
+        "mode": "local-gaussian",
+        "tile_x": 64,
+        "tile_y": 64,
+        "local_sigma": 100.0
+      }
+    },
+    {
+      "name": "Spatial Flatness",
+      "params": {
+        "method": "divide",
+        "sigma": 100.0,
+        "temporal": "per-frame"
+      }
+    },
+    {
+      "name": "Bilateral Denoise",
+      "params": {
+        "d": 9,
+        "sigma_color": 75.0,
+        "sigma_space": 75.0
+      }
+    },
+    {
+      "name": "Local Contrast",
+      "params": {
+        "sigma": 100.0
+      }
+    }
+  ]
+}

@@ -326,7 +326,7 @@ class PyramidStage(PipelineStage):
                         # Propagate any exception from the worker.
                         fut.result()
                         done = worker_done.increment()
-                        if progress_cb is not None and done % 4 == 0:
+                        if progress_cb is not None:
                             progress_cb(int(done / total_planes * 100))
         finally:
             # Close every per-thread reader we opened — ``volume.reopen()``

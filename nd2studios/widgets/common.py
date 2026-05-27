@@ -94,6 +94,8 @@ class ParamEditor(QWidget):
                 widget.setToolTip(spec.tooltip)
             self._layout.addRow(label, widget)
 
+        self._update_visibility()
+
     def _make_widget(self, spec: ParamSpec) -> QWidget:
         if spec.param_type == "float":
             w = QDoubleSpinBox()
@@ -128,12 +130,28 @@ class ParamEditor(QWidget):
             w.addItems(spec.choices)
             if spec.default in spec.choices:
                 w.setCurrentText(spec.default)
-            w.currentTextChanged.connect(lambda: self._emit_changed())
+            w.currentTextChanged.connect(lambda *_: self._update_visibility())
+            w.currentTextChanged.connect(lambda *_: self._emit_changed())
             return w
         else:
             w = QLineEdit(str(spec.default))
             w.textChanged.connect(lambda: self._emit_changed())
             return w
+
+    def _update_visibility(self):
+        current_choices = {
+            spec.name: self._widgets[spec.name].currentText()
+            for spec in self._specs
+            if spec.param_type == "choice" and spec.name in self._widgets
+        }
+        for spec in self._specs:
+            if spec.param_type == "hidden" or spec.visible_when is None:
+                continue
+            w = self._widgets.get(spec.name)
+            if w is None:
+                continue
+            visible = all(current_choices.get(k) == v for k, v in spec.visible_when.items())
+            self._layout.setRowVisible(w, visible)
 
     def _emit_changed(self):
         self.params_changed.emit(self.get_values())
@@ -182,6 +200,7 @@ class ParamEditor(QWidget):
             else:
                 w.setText(str(val))
             w.blockSignals(False)
+        self._update_visibility()
 
 
 class StatusIndicator(QLabel):

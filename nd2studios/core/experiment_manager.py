@@ -120,6 +120,12 @@ class ND2StudiosRecord:
         default_factory=dict
     )
 
+    # Analysis page — Custom Mask Creator tiled-strip specs (serialized).
+    # Schema: [{"shape_type": "rect_strip", "direction": "vertical"|"horizontal",
+    #           "height_px": int, "width_px": int|None, "x_offset_px": int,
+    #           "start_offset_px": int}, ...]
+    tiled_mask_specs: List[Dict[str, Any]] = field(default_factory=list)
+
     def to_dict(self) -> dict:
         """Serialize the JSON-safe portion of the record."""
         return {
@@ -160,6 +166,7 @@ class ND2StudiosRecord:
                 }
                 for m, per_t in self.manual_mask_shapes.items()
             },
+            "tiled_mask_specs": list(self.tiled_mask_specs),
         }
 
     @classmethod
@@ -170,6 +177,8 @@ class ND2StudiosRecord:
                 rec.recipe = [(item["name"], dict(item.get("params", {}))) for item in val]
             elif key == "manual_mask_shapes" and isinstance(val, dict):
                 rec.manual_mask_shapes = _load_manual_mask_shapes(val)
+            elif key == "tiled_mask_specs" and isinstance(val, list):
+                rec.tiled_mask_specs = val
             elif hasattr(rec, key) and not key.startswith("_"):
                 setattr(rec, key, val)
         return rec

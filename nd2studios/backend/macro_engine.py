@@ -62,6 +62,7 @@ class MacroRecorder:
     def __init__(self) -> None:
         self._recording: bool = False
         self._paused: bool = False
+        self._replaying: bool = False
         self._actions: List[MacroAction] = []
 
     # -- public state ---
@@ -105,14 +106,49 @@ class MacroRecorder:
         self._actions = []
         return result
 
+    # -- replay flag (suppresses all recording during replay) ---
+
+    @property
+    def replaying(self) -> bool:
+        return self._replaying
+
+    def start_replay(self) -> None:
+        self._replaying = True
+
+    def stop_replay(self) -> None:
+        self._replaying = False
+
     # -- recording ---
 
     def record(self, action: MacroAction) -> bool:
         """Append action if currently recording and not paused.  Returns True if added."""
+        if self._replaying:
+            return False
         if self._recording and not self._paused:
             self._actions.append(action)
             return True
         return False
+
+    def record_upgrade(self, action: MacroAction) -> bool:
+        """Record a rich action, replacing the immediately preceding generic action if any.
+
+        When the event filter records a generic ``button_click`` and then a
+        semantic hook fires within 300 ms for the same button press, calling
+        this method swaps the placeholder for the richer record so the live
+        list and saved macro both show the meaningful label.
+        """
+        if self._replaying:
+            return False
+        if not (self._recording and not self._paused):
+            return False
+        _GENERIC = {"button_click", "combo_change", "spinbox_change", "checkbox_change"}
+        if (self._actions
+                and self._actions[-1].action_type in _GENERIC
+                and (action.timestamp - self._actions[-1].timestamp) < 0.5):
+            self._actions[-1] = action
+        else:
+            self._actions.append(action)
+        return True
 
 
 # ---------------------------------------------------------------------------

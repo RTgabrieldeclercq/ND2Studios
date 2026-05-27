@@ -172,7 +172,7 @@ def load_nd2_timeseries(
                 else:
                     result[i] = frame.squeeze()
 
-            if progress_cb and (i % 5 == 0 or i == n_frames - 1):
+            if progress_cb:
                 progress_cb(int((i + 1) / n_frames * 100))
 
     return result

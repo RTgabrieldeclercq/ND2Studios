@@ -34,6 +34,7 @@ def export_tracked_objects(
     with_mask_overlay: bool = True,
     fmt: str = "tiff",
     progress_cb: Optional[Callable[[int], None]] = None,
+    basename: str = "",
 ) -> List[str]:
     """Export tracked objects as cropped TIFF or PNG tiles.
 
@@ -141,7 +142,8 @@ def export_tracked_objects(
                              else np.zeros((pad_h, pad_w, 3), dtype=np.uint8))
             frames_out.append(np.concatenate(tiles, axis=1))
 
-        fname = f"tracked_objects_M{gi:03d}{ext}"
+        prefix = f"{basename}_tracked" if basename else "tracked_objects"
+        fname = f"{prefix}_M{gi:03d}{ext}"
         fpath = os.path.join(output_dir, fname)
 
         if fmt in ("tiff", "tif"):

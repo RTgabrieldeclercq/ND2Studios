@@ -867,7 +867,7 @@ class RecipePage(QWidget):
         if self.main_window is None:
             return
         from nd2studios.backend.macro_engine import MacroAction
-        self.main_window.record_macro_action(MacroAction(action_type, label, params))
+        self.main_window.upgrade_last_macro_action(MacroAction(action_type, label, params))
 
     def _on_accept(self) -> None:
         if self._trial_step is None:
@@ -887,10 +887,8 @@ class RecipePage(QWidget):
             self.main_window.exp_manager.set_status("preprocessed")
             self._commit_recipe_stage()
         # Record the accepted step for macro.
-        param_preview = ", ".join(
-            f"{k}={v}" for k, v in list(plugin_params.items())[:2]
-        )
-        label = f"Recipe: {plugin_name}" + (f" ({param_preview})" if param_preview else "")
+        param_str = ", ".join(f"{k}={v}" for k, v in plugin_params.items())
+        label = f"Recipe: {plugin_name}" + (f" ({param_str})" if param_str else "")
         self._record(
             "recipe_add_step", label,
             plugin=plugin_name,
@@ -1011,6 +1009,9 @@ class RecipePage(QWidget):
     # ── Macro replay ──
     def _replay_add_step(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
         """Apply one recipe_add_step action during macro replay."""
+        import time as _time
+        from PySide6.QtCore import QCoreApplication
+
         plugin = action.params.get("plugin", "")
         plugin_params = action.params.get("plugin_params", {})
         normalized = bool(action.params.get("normalized", False))
@@ -1028,12 +1029,30 @@ class RecipePage(QWidget):
         self.cb_normalized.blockSignals(True)
         self.cb_normalized.setChecked(normalized)
         self.cb_normalized.blockSignals(False)
+
         self._on_trial()
+
+        # Wait for the trial worker to finish (btn_accept becomes enabled).
+        deadline = _time.time() + 60.0
+        while not self.btn_accept.isEnabled() and _time.time() < deadline:
+            QCoreApplication.processEvents()
+
+        self._on_accept()
+
+        # Wait for the commit worker to finish (main window progress bar clears).
+        if self.main_window is not None:
+            pb = self.main_window._progress_bar
+            _time.sleep(0.15)
+            QCoreApplication.processEvents()
+            deadline = _time.time() + 60.0
+            while pb.isVisible() and _time.time() < deadline:
+                QCoreApplication.processEvents()
 
     # ── Save / Load recipe ──
     def _on_save_recipe(self) -> None:
+        from nd2studios.core.settings import Settings
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Recipe", "",
+            self, "Save Recipe", Settings.PROJECT_DIR,
             f"ND2Studios Recipe (*{RECIPE_EXTENSION})",
         )
         if not path:
@@ -1051,12 +1070,17 @@ class RecipePage(QWidget):
             self.main_window.set_status_text(f"Saved recipe: {os.path.basename(path)}")
 
     def _on_load_recipe(self) -> None:
+        from nd2studios.core.settings import Settings
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Recipe", "",
+            self, "Load Recipe", Settings.PROJECT_DIR,
             f"ND2Studios Recipe (*{RECIPE_EXTENSION});;All files (*)",
         )
         if not path:
             return
+        self._apply_recipe_from_path(path)
+
+    def _apply_recipe_from_path(self, path: str) -> None:
+        """Load and apply a recipe file; records the action for the macro system."""
         try:
             data = load_recipe_json(path)
         except Exception as e:
@@ -1073,6 +1097,13 @@ class RecipePage(QWidget):
             exp = self.main_window.exp_manager.active
             if self._recipe:
                 self._revert_all_columns(exp)
+        import os as _os
+        self._record("load_recipe", f"Load Recipe: {path}", path=path)
+
+    def _replay_load_recipe(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
+        path = action.params.get("path", "")
+        if path:
+            self._apply_recipe_from_path(path)
 
     def _on_apply_recipe(self) -> None:
         """Apply the current recipe to all loaded files and commit the result."""

@@ -28,7 +28,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel,
-    QPushButton, QSlider, QSplitter, QVBoxLayout, QWidget,
+    QLineEdit, QPushButton, QSlider, QSplitter, QVBoxLayout, QWidget,
 )
 
 from nd2studios.backend.materialized_dataset import MaterializedDataset
@@ -183,6 +183,13 @@ class MultiAxisViewer(QWidget):
         self._m_debounce.setInterval(80)
         self._m_debounce.timeout.connect(self._do_m_refresh)
 
+        # Debounce for LUT/color changes: refresh the current frame instantly,
+        # but defer the full render-cache rebuild until the user stops adjusting.
+        self._lut_rebuild_timer = QTimer(self)
+        self._lut_rebuild_timer.setSingleShot(True)
+        self._lut_rebuild_timer.setInterval(250)
+        self._lut_rebuild_timer.timeout.connect(self._rebuild_render_cache_after_lut)
+
         self._hist_cache: dict = {}  # (m, z_mode) -> True
         self._frame_post_process: Optional[Callable] = None
 
@@ -272,15 +279,18 @@ class MultiAxisViewer(QWidget):
         slider_layout = QVBoxLayout(slider_box)
         slider_layout.setContentsMargins(8, 4, 8, 4)
         slider_layout.setSpacing(2)
-        self._m_row, self.m_slider, self.m_label, self._m_play, self._m_fps = \
+        self._m_row, self.m_slider, self.m_label, self._m_total, self._m_play, self._m_fps = \
             self._make_axis_row("M")
-        self._t_row, self.t_slider, self.t_label, self._t_play, self._t_fps = \
+        self._t_row, self.t_slider, self.t_label, self._t_total, self._t_play, self._t_fps = \
             self._make_axis_row("T")
-        self._z_row, self.z_slider, self.z_label, self._z_play, self._z_fps = \
+        self._z_row, self.z_slider, self.z_label, self._z_total, self._z_play, self._z_fps = \
             self._make_axis_row("Z")
         self.m_slider.valueChanged.connect(self._on_m_changed)
         self.t_slider.valueChanged.connect(self._on_t_changed)
         self.z_slider.valueChanged.connect(self._on_z_changed)
+        self.m_label.editingFinished.connect(lambda: self._on_axis_label_edited("m"))
+        self.t_label.editingFinished.connect(lambda: self._on_axis_label_edited("t"))
+        self.z_label.editingFinished.connect(lambda: self._on_axis_label_edited("z"))
         self._m_play.toggled.connect(lambda on: self._set_axis_playing("m", on))
         self._t_play.toggled.connect(lambda on: self._set_axis_playing("t", on))
         self._z_play.toggled.connect(lambda on: self._set_axis_playing("z", on))
@@ -321,19 +331,31 @@ class MultiAxisViewer(QWidget):
     def _make_axis_row(self, label: str):
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
+        row.setSpacing(4)
         lbl = QLabel(label + ":")
         lbl.setFixedWidth(20)
         row.addWidget(lbl)
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(0, 0)
         row.addWidget(slider, stretch=1)
-        info = QLabel("0/0")
-        info.setMinimumWidth(60)
-        row.addWidget(info)
-        play_btn = QPushButton(">")
+        # Editable current-frame number (user can type to jump).
+        info_edit = QLineEdit("1")
+        info_edit.setObjectName("axisFrameEdit")
+        info_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info_edit.setFixedWidth(36)
+        info_edit.setToolTip("Current frame — type a number and press Enter to jump")
+        row.addWidget(info_edit)
+        # Static total — plain text, not editable.
+        info_total = QLabel("/1")
+        info_total.setFixedWidth(28)
+        info_total.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        info_total.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt 'Helvetica Neue';")
+        row.addWidget(info_total)
+        play_btn = QPushButton("▶")
+        play_btn.setObjectName("playBtn")
         play_btn.setCheckable(True)
-        play_btn.setFixedSize(28, 22)
+        play_btn.setFixedSize(30, 24)
         play_btn.setToolTip(f"Play / pause {label} axis")
         row.addWidget(play_btn)
         fps_spin = QDoubleSpinBox()
@@ -344,7 +366,7 @@ class MultiAxisViewer(QWidget):
         fps_spin.setFixedWidth(72)
         fps_spin.setToolTip("Playback speed")
         row.addWidget(fps_spin)
-        return row, slider, info, play_btn, fps_spin
+        return row, slider, info_edit, info_total, play_btn, fps_spin
 
     def invalidate_post_process_cache(self) -> None:
         """Discard cached overlay composites so the next refresh recomputes them.
@@ -434,17 +456,20 @@ class MultiAxisViewer(QWidget):
             return
 
         # Slider configuration.
-        self._configure_slider(self.m_slider, self.m_label, self._m_row,
+        self._configure_slider(self.m_slider, self.m_label, self._m_total,
+                                self._m_row,
                                 volume.n_multipoints, self._m,
                                 visible=volume.n_multipoints > 1,
                                 play_btn=self._m_play, fps_spin=self._m_fps)
-        self._configure_slider(self.t_slider, self.t_label, self._t_row,
+        self._configure_slider(self.t_slider, self.t_label, self._t_total,
+                                self._t_row,
                                 volume.n_timepoints, self._t, visible=True,
                                 play_btn=self._t_play, fps_spin=self._t_fps)
-        # V1.41: Z is collapsed at load time; the Z slider is always
-        # hidden. The user re-loads to switch Z mode.
-        self._configure_slider(self.z_slider, self.z_label, self._z_row,
-                                1, 0, visible=False,
+        n_z = int(getattr(volume, "n_zslices", 1))
+        z_visible = (z_mode == "none") and n_z > 1
+        self._configure_slider(self.z_slider, self.z_label, self._z_total,
+                                self._z_row,
+                                n_z, max(0, min(z, n_z - 1)), visible=z_visible,
                                 play_btn=self._z_play, fps_spin=self._z_fps)
         self._update_axis_labels()
 
@@ -537,15 +562,17 @@ class MultiAxisViewer(QWidget):
         # Reset to 0 only when the new T count is smaller.
         prev_t = self._t
         new_t = min(prev_t, max(0, n - 1))
-        # Show M slider when the file has multiple positions; hide Z (collapsed).
-        self._configure_slider(self.m_slider, self.m_label, self._m_row,
+        self._configure_slider(self.m_slider, self.m_label, self._m_total,
+                                self._m_row,
                                 n_multipoints, self._m,
                                 visible=n_multipoints > 1,
                                 play_btn=self._m_play, fps_spin=self._m_fps)
-        self._configure_slider(self.z_slider, self.z_label, self._z_row,
+        self._configure_slider(self.z_slider, self.z_label, self._z_total,
+                                self._z_row,
                                 1, 0, visible=False,
                                 play_btn=self._z_play, fps_spin=self._z_fps)
-        self._configure_slider(self.t_slider, self.t_label, self._t_row,
+        self._configure_slider(self.t_slider, self.t_label, self._t_total,
+                                self._t_row,
                                 n, new_t, visible=True,
                                 play_btn=self._t_play, fps_spin=self._t_fps)
         self._t = new_t
@@ -577,7 +604,8 @@ class MultiAxisViewer(QWidget):
         )
         self._refresh()
 
-    def _configure_slider(self, slider: QSlider, label: QLabel, row,
+    def _configure_slider(self, slider: QSlider, label: QLineEdit,
+                           total_label: QLabel, row,
                            total: int, value: int, visible: bool,
                            play_btn: Optional[QPushButton] = None,
                            fps_spin: Optional[QDoubleSpinBox] = None) -> None:
@@ -591,6 +619,7 @@ class MultiAxisViewer(QWidget):
             prefix.setVisible(visible)
         slider.setVisible(visible)
         label.setVisible(visible)
+        total_label.setVisible(visible)
         if play_btn is not None:
             play_btn.setVisible(visible)
             if not visible and play_btn.isChecked():
@@ -722,6 +751,13 @@ class MultiAxisViewer(QWidget):
 
     def _on_z_changed(self, v: int) -> None:
         self._z = int(v)
+        # Render caches are keyed by (m, t) without Z — stale for a new Z position.
+        self._render_cache.clear()
+        self._pixmap_cache.clear()
+        self._pp_cache.clear()
+        self._pp_pixmap_cache.clear()
+        self._cache_m = -1
+        self._cache_ready = False
         self._update_axis_labels()
         self.coords_changed.emit(self._m, self._t, self._z)
         self._z_debounce.start()
@@ -739,10 +775,10 @@ class MultiAxisViewer(QWidget):
                 min_interval = 50
             interval = max(min_interval, int(1000 / fps_spin.value()))
             timer.start(interval)
-            play_btn.setText("||")  
+            play_btn.setText("⏸")
         else:
             timer.stop()
-            play_btn.setText(">")
+            play_btn.setText("▶")
 
     def _axis_tick(self, slider: QSlider) -> None:
         if slider.maximum() <= 0:
@@ -776,9 +812,26 @@ class MultiAxisViewer(QWidget):
 
     def _on_lut_contrast_changed(self, _name: str, _lo: float,
                                   _hi: float, _gamma: float) -> None:
-        self._invalidate_render_cache()
+        # Fast path: flag the pre-render worker to stop writing stale frames,
+        # evict only the current frame from the caches, then re-compose it
+        # immediately from RAM. The debounce timer handles the full cache
+        # rebuild + worker restart 250 ms after the user stops adjusting.
+        if self._pre_render_worker is not None:
+            self._pre_render_worker.cancel()
+        key = (self._m, self._t)
+        self._render_cache.pop(key, None)
+        self._pixmap_cache.pop(self._t, None)
+        self._pp_cache.clear()
+        self._pp_pixmap_cache.clear()
+        self._cache_m = -1
+        self._cache_ready = False
         self._do_refresh()
+        self._lut_rebuild_timer.start()
         self.channels_changed.emit()
+
+    def _rebuild_render_cache_after_lut(self) -> None:
+        """Full cache rebuild triggered 250 ms after the last LUT change."""
+        self._invalidate_render_cache()
 
     # ── Pre-render cache management ──
 
@@ -816,6 +869,8 @@ class MultiAxisViewer(QWidget):
             chip_snapshot=chip_snapshot,
             priority_m=self._m,
             cache=self._render_cache,
+            z_mode=self._z_mode,
+            z_index=self._z,
         )
         worker.frame_cached.connect(self._on_frame_cached)
         worker.finished.connect(self._on_pre_render_finished)
@@ -1058,10 +1113,9 @@ class MultiAxisViewer(QWidget):
         """Fetch the current (m, t) plane for channel ``c_idx`` from RAM.
 
         Fast path: if the dataset is a MaterializedDataset we index the
-        per-channel (M, T, H, W) array directly — zero copy. Otherwise
-        we fall back to the LazyND2Volume.get_frame interface for
-        backwards compatibility with any callers still wiring a lazy
-        volume in.
+        per-channel (M, T, Z, H, W) array directly and apply Z projection
+        or slice selection in-place. Otherwise we fall back to the
+        LazyND2Volume.get_frame interface for backwards compatibility.
         """
         volume = self._volume
         if volume is None:
@@ -1073,9 +1127,21 @@ class MultiAxisViewer(QWidget):
             if arr is None:
                 return None
             try:
-                return arr[self._m, self._t]
+                zstack = arr[self._m, self._t]  # (Z, H, W)
             except IndexError:
                 return None
+            n_z = zstack.shape[0]
+            if n_z <= 1:
+                return zstack[0]
+            if self._z_mode == "none":
+                zi = max(0, min(self._z, n_z - 1))
+                return zstack[zi]
+            if self._z_mode == "max":
+                return zstack.max(axis=0)
+            if self._z_mode == "min":
+                return zstack.min(axis=0)
+            # mean
+            return zstack.mean(axis=0).astype(zstack.dtype)
         # Compatibility path — call the LazyND2Volume API.
         try:
             plane = volume.get_frame(
@@ -1211,18 +1277,34 @@ class MultiAxisViewer(QWidget):
 
     def _update_axis_labels(self) -> None:
         if self._volume is not None:
-            self.m_label.setText(f"{self._m + 1}/{self._volume.n_multipoints}")
-            self.t_label.setText(f"{self._t + 1}/{self._volume.n_timepoints}")
-            # V1.41: Z is collapsed at load; the label is informational only.
-            self.z_label.setText(
-                f"{self._z + 1}/{getattr(self._volume, 'n_zslices', 1)}"
-            )
+            self.m_label.setText(str(self._m + 1))
+            self._m_total.setText(f"/{self._volume.n_multipoints}")
+            self.t_label.setText(str(self._t + 1))
+            self._t_total.setText(f"/{self._volume.n_timepoints}")
+            self.z_label.setText(str(self._z + 1))
+            self._z_total.setText(f"/{getattr(self._volume, 'n_zslices', 1)}")
         else:
             n_t = self.t_slider.maximum() + 1 if self.t_slider.maximum() >= 0 else 0
-            self.t_label.setText(f"{self._t + 1}/{n_t}")
-            # M label is driven by the slider range in flat-channel mode.
+            self.t_label.setText(str(self._t + 1))
+            self._t_total.setText(f"/{n_t}")
             n_m = self.m_slider.maximum() + 1 if self.m_slider.maximum() >= 0 else 1
-            self.m_label.setText(f"{self._m + 1}/{n_m}")
+            self.m_label.setText(str(self._m + 1))
+            self._m_total.setText(f"/{n_m}")
+
+    def _on_axis_label_edited(self, axis: str) -> None:
+        """Parse a manually entered frame number and jump the slider."""
+        label_map = {"m": self.m_label, "t": self.t_label, "z": self.z_label}
+        slider_map = {"m": self.m_slider, "t": self.t_slider, "z": self.z_slider}
+        label = label_map[axis]
+        slider = slider_map[axis]
+        try:
+            frame = int(label.text().strip())
+        except ValueError:
+            self._update_axis_labels()
+            return
+        value = max(0, min(frame - 1, slider.maximum()))
+        label.clearFocus()
+        slider.setValue(value)
 
     # ── Read-out / round-tripping ──
     def channel_state(self) -> Dict[str, Dict[str, Any]]:

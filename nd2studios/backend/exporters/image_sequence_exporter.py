@@ -175,7 +175,7 @@ def export_image_sequence(
             n_t=n_t, n_m=1, n_z=1,
         )
         Image.fromarray(rgb).save(os.path.join(request.output_dir, fname))
-        if progress_cb is not None and (t % 4 == 0 or t == n_t - 1):
+        if progress_cb is not None:
             progress_cb(int((t + 1) / n_t * 100))
     return request.output_dir
 
@@ -259,7 +259,7 @@ def _export_from_volume(
                     os.path.join(request.output_dir, fname)
                 )
                 written += 1
-                if progress_cb is not None and (written % 4 == 0 or written == total):
+                if progress_cb is not None:
                     progress_cb(int(written / total * 100))
 
     return request.output_dir

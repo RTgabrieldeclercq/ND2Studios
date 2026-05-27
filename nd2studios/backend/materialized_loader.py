@@ -5,7 +5,7 @@ The viewer hot path used to read planes through Dask + IOWorker +
 FrameCache + PrefetchManager, paying tens to hundreds of milliseconds
 per slider tick. We replace that with a single parallel decode at file
 open: read everything, apply the user's Z-projection mode once, and
-hand the GUI a plain ``Dict[channel_name, np.ndarray(M, T, H, W)]``.
+hand the GUI a plain ``Dict[channel_name, np.ndarray(M, T, Z, H, W)]``.
 
 The decode itself uses Dask's threaded scheduler — chunks are
 decompressed in parallel by the ``nd2`` / ``tifffile`` C extensions
@@ -23,28 +23,21 @@ from nd2studios.backend.materialized_dataset import MaterializedDataset
 from nd2studios.utils.resources import recommended_worker_count
 
 
-# Z-projection modes the materializer accepts. "none" is only valid for
-# files with a single Z slice; if n_z > 1 with mode="none" we raise to
-# avoid silently dropping data.
 _VALID_Z_MODES = ("max", "mean", "min", "none")
 
 
-def _project_z(stack: np.ndarray, z_mode: str, dtype: np.dtype) -> np.ndarray:
-    """Project a (Z, H, W) stack into (H, W) using the chosen mode."""
+def _normalize_z_stack(stack: np.ndarray, n_z: int, h: int, w: int) -> np.ndarray:
+    """Ensure a decoded block is (Z, H, W), padding/squeezing as needed."""
     if stack.ndim == 2:
+        return stack[np.newaxis]   # single Z: (1, H, W)
+    if stack.ndim == 3:
+        return stack               # already (Z, H, W)
+    stack = np.squeeze(stack)
+    if stack.ndim == 2:
+        return stack[np.newaxis]
+    if stack.ndim == 3:
         return stack
-    if stack.ndim != 3:
-        stack = np.squeeze(stack)
-        if stack.ndim != 3:
-            return stack.reshape(stack.shape[-2:]) if stack.size else stack
-    if z_mode == "max":
-        return stack.max(axis=0)
-    if z_mode == "min":
-        return stack.min(axis=0)
-    if z_mode == "mean":
-        return stack.mean(axis=0).astype(dtype)
-    # z_mode == "none" → take z=0 (caller guards against n_z > 1)
-    return stack[0]
+    return stack.reshape(n_z, h, w)
 
 
 def materialize_nd2(
@@ -60,8 +53,8 @@ def materialize_nd2(
     filepath : str
         Path to the .nd2 file.
     z_mode : str
-        One of "max" | "mean" | "min" | "none". "none" is only allowed
-        for files with a single Z slice.
+        One of "max" | "mean" | "min" | "none". Recorded as metadata;
+        the full Z stack is always stored so modes can be switched later.
     progress_cb : callable, optional
         Called with int percent (0..100) as work proceeds.
     cancel_cb : callable, optional
@@ -71,6 +64,8 @@ def materialize_nd2(
     Returns
     -------
     MaterializedDataset
+        ``channels`` shape is ``(M, T, Z, H, W)``.  Z projection is
+        applied on demand by ``get_frame`` / ``to_lazy_channel``.
     """
     import nd2
 
@@ -88,12 +83,6 @@ def materialize_nd2(
         h = sizes.get("Y", 0)
         w = sizes.get("X", 0)
         dtype = np.dtype(f.dtype)
-
-        if n_z > 1 and z_mode == "none":
-            raise ValueError(
-                f"file has {n_z} Z-slices but z_mode='none' was requested. "
-                "Pick 'max', 'mean', or 'min' to collapse Z at load."
-            )
 
         try:
             channel_names: List[str] = [
@@ -115,9 +104,9 @@ def materialize_nd2(
             pixel_size_um = 1.0
             z_step_um = 1.0
 
-        out_dtype = np.float32 if z_mode == "mean" else dtype
+        # Store full Z stack; shape (M, T, Z, H, W).
         channels: Dict[str, np.ndarray] = {
-            name: np.empty((n_m, n_t, h, w), dtype=out_dtype)
+            name: np.empty((n_m, n_t, n_z, h, w), dtype=dtype)
             for name in channel_names
         }
 
@@ -141,9 +130,9 @@ def materialize_nd2(
             return tuple(idx)
 
         def decode_one(c: int, m: int, t: int) -> None:
-            stack = np.asarray(dask_arr[_build_index(c, m, t)])
-            projected = _project_z(stack, z_mode, out_dtype)
-            channels[channel_names[c]][m, t] = projected
+            raw = np.asarray(dask_arr[_build_index(c, m, t)])
+            stack = _normalize_z_stack(raw, n_z, h, w)
+            channels[channel_names[c]][m, t] = stack
 
         work: List[Tuple[int, int, int]] = [
             (c, m, t)
@@ -155,10 +144,10 @@ def materialize_nd2(
         if total == 0:
             return MaterializedDataset(
                 filepath=filepath, channels=channels,
-                channel_names=channel_names, dtype=out_dtype,
+                channel_names=channel_names, dtype=dtype,
                 pixel_size_um=pixel_size_um, z_step_um=z_step_um,
                 n_multipoints=n_m, n_timepoints=n_t, n_channels=n_c,
-                height=h, width=w, z_mode=z_mode,
+                n_zslices=n_z, height=h, width=w, z_mode=z_mode,
             )
 
         n_workers = recommended_worker_count()
@@ -187,21 +176,19 @@ def materialize_nd2(
                             progress_cb(pct)
                             last_pct = pct
             finally:
-                # Wake any still-blocked workers — they'll exit once their
-                # current decode returns. ThreadPoolExecutor's context
-                # manager waits for them.
                 pass
 
     return MaterializedDataset(
         filepath=filepath,
         channels=channels,
         channel_names=channel_names,
-        dtype=out_dtype,
+        dtype=dtype,
         pixel_size_um=pixel_size_um,
         z_step_um=z_step_um,
         n_multipoints=n_m,
         n_timepoints=n_t,
         n_channels=n_c,
+        n_zslices=n_z,
         height=h,
         width=w,
         z_mode=z_mode,
@@ -245,15 +232,9 @@ def materialize_from_volume(
     z_step_um = float(getattr(volume, "z_step_um", 1.0))
     filepath = str(getattr(volume, "filepath", "") or "")
 
-    if n_z > 1 and z_mode == "none":
-        raise ValueError(
-            f"file has {n_z} Z-slices but z_mode='none' was requested. "
-            "Pick 'max', 'mean', or 'min' to collapse Z at load."
-        )
-
-    out_dtype = np.float32 if z_mode == "mean" else dtype
+    # Store full Z stack; shape (M, T, Z, H, W).
     channels: Dict[str, np.ndarray] = {
-        name: np.empty((n_m, n_t, h, w), dtype=out_dtype)
+        name: np.empty((n_m, n_t, n_z, h, w), dtype=dtype)
         for name in channel_names
     }
 
@@ -269,28 +250,28 @@ def materialize_from_volume(
             tls.reader = r
         return r
 
-    def decode_one(c: int, m: int, t: int) -> None:
-        r = _reader()
-        if n_z > 1 and z_mode != "none":
-            plane = r.get_frame(c=c, m=m, t=t, z=0, z_mode=z_mode,
-                                z_start=0, z_end=n_z)
-        else:
-            plane = r.get_frame(c=c, m=m, t=t, z=0, z_mode="none")
-        plane = np.asarray(plane)
+    def _read_plane(r, c: int, m: int, t: int, zi: int) -> np.ndarray:
+        plane = np.asarray(r.get_frame(c=c, m=m, t=t, z=zi, z_mode="none"))
         if plane.ndim != 2:
             plane = np.squeeze(plane)
             if plane.ndim == 3 and plane.shape[-1] in (3, 4):
-                # RGB/RGBA frame — extract the color component that matches
-                # this channel index.  When the volume reports n_channels=3
-                # for an RGB TIFF (set by read_tiff_meta_fast), c=0/1/2
-                # maps to R/G/B, preserving per-object color in the viewer.
+                # RGB/RGBA frame — extract the colour component that matches
+                # this channel index so per-channel colour is preserved.
                 comp = min(int(c), plane.shape[-1] - 1)
                 plane = plane[..., comp]
             elif plane.ndim != 2:
                 plane = plane.reshape(h, w)
-        if plane.dtype != out_dtype:
-            plane = plane.astype(out_dtype)
-        channels[channel_names[c]][m, t] = plane
+        if plane.dtype != dtype:
+            plane = plane.astype(dtype)
+        return plane
+
+    def decode_one(c: int, m: int, t: int) -> None:
+        r = _reader()
+        if n_z > 1:
+            for zi in range(n_z):
+                channels[channel_names[c]][m, t, zi] = _read_plane(r, c, m, t, zi)
+        else:
+            channels[channel_names[c]][m, t, 0] = _read_plane(r, c, m, t, 0)
 
     work: List[Tuple[int, int, int]] = [
         (c, m, t)
@@ -322,12 +303,13 @@ def materialize_from_volume(
         filepath=filepath,
         channels=channels,
         channel_names=channel_names,
-        dtype=out_dtype,
+        dtype=dtype,
         pixel_size_um=pixel_size_um,
         z_step_um=z_step_um,
         n_multipoints=n_m,
         n_timepoints=n_t,
         n_channels=n_c,
+        n_zslices=n_z,
         height=h,
         width=w,
         z_mode=z_mode,
