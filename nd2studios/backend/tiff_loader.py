@@ -356,8 +356,15 @@ def read_tiff_meta_fast(filepath: str) -> Dict[str, Any]:
     ij = read_imagej_tiff_metadata(filepath)
     info = get_tiff_info(filepath)
     page_shape = info["page_shape"]
-    h = int(page_shape[-2])
-    w = int(page_shape[-1])
+    # RGB/RGBA TIFFs: page_shape = (H, W, samples) where samples is 3 or 4.
+    # Grayscale TIFFs: page_shape = (H, W).
+    # Using [-2]/[-1] on an RGB page gives w=3 (samples), not the true width.
+    if len(page_shape) == 3 and page_shape[-1] in (3, 4):
+        h = int(page_shape[0])
+        w = int(page_shape[1])
+    else:
+        h = int(page_shape[-2])
+        w = int(page_shape[-1])
     if ij:
         return {
             "filepath": filepath,
@@ -373,6 +380,23 @@ def read_tiff_meta_fast(filepath: str) -> Dict[str, Any]:
         }
     # Flat or non-ImageJ TIFF: treat as a (T, H, W) single-channel stack
     # where T == n_pages. Z and M are 1.
+    # RGB TIFFs (page_shape = (H, W, 3)) are split into 3 channels so the
+    # viewer preserves the per-channel color information rather than
+    # collapsing everything to a single grayscale via max.
+    is_rgb = len(page_shape) == 3 and page_shape[-1] in (3, 4)
+    if is_rgb:
+        return {
+            "filepath": filepath,
+            "n_timepoints": int(info["n_pages"]),
+            "n_zslices": 1,
+            "n_channels": 3,
+            "n_multipoints": 1,
+            "height": h,
+            "width": w,
+            "dtype": str(info["dtype"]),
+            "channel_names": ["red", "green", "blue"],
+            "pixel_size_um": 1.0,
+        }
     return {
         "filepath": filepath,
         "n_timepoints": int(info["n_pages"]),

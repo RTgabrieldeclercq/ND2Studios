@@ -152,6 +152,11 @@ class AnalysisPage(QWidget):
         # Multi-file: currently selected record (overrides exp_manager.active).
         self._selected_rec: Optional[ND2StudiosRecord] = None
 
+        # Saved restore-values from the most recent _on_pipeline_changed call.
+        # Used by _reload_params to recover choice-param values that couldn't
+        # be applied when channel names weren't populated yet.
+        self._last_restore_values: Optional[Dict] = None
+
         self._screen_debounce = QTimer(self)
         self._screen_debounce.setSingleShot(True)
         self._screen_debounce.setInterval(300)
@@ -514,8 +519,24 @@ class AnalysisPage(QWidget):
 
         channels = exp._processed_channels or exp._raw_channels or {}
 
-        # Wire viewer with volume (ND2) or flat channels (TIFF / post-recipe).
-        if exp._raw_volume is not None:
+        # Wire viewer.  Prefer the all-M processed volume (full M/T navigation)
+        # when available; fall back to the single-M processed dict, then the
+        # raw volume for full M/T, then raw flat channels.
+        proc_vol = getattr(exp, "_processed_volume", None)
+        if proc_vol is not None:
+            self.viewer.set_volume(
+                proc_vol,
+                channel_display=exp.channel_display,
+                z_mode=exp.z_view_mode or "max",
+                z_index=exp.z_view_index,
+                m=exp.m_index, t=0, z=exp.z_view_index,
+            )
+        elif exp._processed_channels:
+            self.viewer.set_channels(
+                exp._processed_channels,
+                channel_display=exp.channel_display,
+            )
+        elif exp._raw_volume is not None:
             self.viewer.set_volume(
                 exp._raw_volume,
                 channel_display=exp.channel_display,
@@ -582,6 +603,7 @@ class AnalysisPage(QWidget):
     # ── Pipeline / param wiring ───────────────────────────────────────────────
 
     def _on_pipeline_changed(self, name: str, restore_values: Optional[Dict] = None) -> None:
+        self._last_restore_values = restore_values
         # Cancel any in-flight screen; clear both result sets (pipeline-specific).
         if self._runner is not None:
             self._runner.cancel(_PREVIEW_KEY)
@@ -632,6 +654,12 @@ class AnalysisPage(QWidget):
         if pipeline_cls is None:
             return
         current_values = self.param_editor.get_values()
+        # Merge in any pending restore values for keys that the param editor
+        # couldn't store earlier because choice widgets had no items yet.
+        if self._last_restore_values:
+            for k, v in self._last_restore_values.items():
+                if current_values.get(k) in ("", None):
+                    current_values[k] = v
         instance = pipeline_cls()
         self._load_params(instance, current_values, channel_names)
 
@@ -678,7 +706,7 @@ class AnalysisPage(QWidget):
 
         # Determine all M positions in the file to analyze.
         vol = getattr(exp, "_raw_volume", None)
-        if vol is not None and exp._processed_channels is None:
+        if vol is not None:
             m_positions = list(range(vol.n_multipoints))
         else:
             m_positions = [0]
@@ -733,7 +761,7 @@ class AnalysisPage(QWidget):
         selected_ch = params.get("channel_name") or next(iter(channels_raw))
         channels: Dict[str, np.ndarray] = {}
         vol = getattr(exp, "_raw_volume", None)
-        if vol is not None and exp._processed_channels is None:
+        if vol is not None:
             z_mode = getattr(exp, "z_view_mode", None) or "max"
             z_index = int(getattr(exp, "z_view_index", None) or 0)
             for c_idx, ch_name in enumerate(vol.channel_names):
@@ -749,6 +777,9 @@ class AnalysisPage(QWidget):
                     ).materialize()
                     for c_idx, ch_name in enumerate(vol.channel_names)
                 }
+            # Apply committed recipe so analysis runs on processed data,
+            # consistent with what the user saw in the Recipe page.
+            channels = _apply_recipe_to_channels(channels, exp)
         else:
             for ch, arr in channels_raw.items():
                 if ch == selected_ch:
@@ -1007,12 +1038,19 @@ class AnalysisPage(QWidget):
 
         # Extract the single (m, t) frame without materialising the whole stack.
         vol = getattr(exp, "_raw_volume", None)
-        if vol is not None and exp._processed_channels is None and selected_ch in vol.channel_names:
+        if vol is not None and selected_ch in vol.channel_names:
             z_mode = getattr(exp, "z_view_mode", None) or "max"
             z_index = int(getattr(exp, "z_view_index", None) or 0)
             c_idx = vol.channel_names.index(selected_ch)
             frame_2d = vol.get_frame(c_idx, m=m, t=t, z=z_index, z_mode=z_mode)
             frame_arr = frame_2d[np.newaxis]  # (1, H, W)
+            # Apply recipe to the single frame so preview matches the processed
+            # data the full run would use.
+            if getattr(exp, "recipe", None):
+                frame_channels = _apply_recipe_to_channels(
+                    {selected_ch: frame_arr}, exp
+                )
+                frame_arr = frame_channels.get(selected_ch, frame_arr)
         elif selected_ch in channels_raw:
             arr = channels_raw[selected_ch]
             if isinstance(arr, np.ndarray):
@@ -1645,7 +1683,21 @@ class AnalysisPage(QWidget):
             except Exception:  # noqa: BLE001
                 pass
         channels = exp._processed_channels or exp._raw_channels or {}
-        if exp._raw_volume is not None:
+        proc_vol = getattr(exp, "_processed_volume", None)
+        if proc_vol is not None:
+            self.viewer.set_volume(
+                proc_vol,
+                channel_display=exp.channel_display,
+                z_mode=exp.z_view_mode or "max",
+                z_index=exp.z_view_index,
+                m=exp.m_index, t=0, z=exp.z_view_index,
+            )
+        elif exp._processed_channels:
+            self.viewer.set_channels(
+                exp._processed_channels,
+                channel_display=exp.channel_display,
+            )
+        elif exp._raw_volume is not None:
             self.viewer.set_volume(
                 exp._raw_volume,
                 channel_display=exp.channel_display,
@@ -1723,6 +1775,29 @@ _LABEL_PALETTE: List[tuple] = [
     (200, 100, 200), (150, 255, 200), (255, 200, 150), (200, 150, 255),
     (80, 180, 80),   (180, 80, 80),   (80, 80, 180),   (180, 180, 80),
 ]
+
+
+def _apply_recipe_to_channels(
+    channels: Dict[str, np.ndarray],
+    exp: Any,
+) -> Dict[str, np.ndarray]:
+    """Re-apply exp.recipe to channels synchronously via EnhancedDataset.
+
+    Returns channels unchanged when no recipe is committed (avoids the import
+    cost on the fast path).
+    """
+    from nd2studios.pipeline import EnhancedDataset
+    recipe = list(getattr(exp, "recipe", []) or [])
+    normalized = bool(getattr(exp, "recipe_normalized", False))
+    if not recipe and not normalized:
+        return channels
+    enhanced = EnhancedDataset(
+        raw_channels=channels,
+        recipe=recipe,
+        normalized=normalized,
+        pixel_size_um=float(getattr(exp, "pixel_size_um", 1.0)),
+    )
+    return {name: enhanced.materialize_channel(name) for name in channels}
 
 
 def _overlay_labels(

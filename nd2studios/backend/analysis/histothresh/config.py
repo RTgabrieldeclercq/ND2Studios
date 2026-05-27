@@ -36,6 +36,7 @@ class ThresholdConfig:
 
     # Spatial constraints
     min_area: int = 100
+    max_area: int = 0
     opening_radius: int = 1
     closing_radius: int = 2
     min_hole_size: int = 50

@@ -1,0 +1,55 @@
+{
+  "version": "1.0",
+  "processing": {
+    "normalized": false,
+    "recipe": [
+      {
+        "name": "CLAHE",
+        "params": {
+          "clip_limit": 2.0,
+          "tile_size": 8
+        }
+      }
+    ]
+  },
+  "analysis": {
+    "pipeline": "Histogram Threshold Segmenter",
+    "params": {
+      "channel_name": "ERK-mRuby2",
+      "method": "hysteresis",
+      "direction": "below",
+      "bit_depth": 12,
+      "strict": 100,
+      "permissive": 200,
+      "low": 50,
+      "high": 500,
+      "percentile_low": 5.0,
+      "percentile_high": 95.0,
+      "fraction_low": 0.3,
+      "fraction_high": 1.5,
+      "min_area": 200,
+      "max_area": 10000,
+      "opening_radius": 1,
+      "closing_radius": 2,
+      "min_hole_size": 50
+    }
+  },
+  "results": {
+    "selected_columns": [
+      "segmentation_channel",
+      "frame",
+      "label_id",
+      "area_px",
+      "area_um2",
+      "delta_area_px",
+      "delta_area_um2",
+      "centroid_y_stage_um",
+      "centroid_x_stage_um",
+      "eccentricity",
+      "solidity",
+      "track_id",
+      "track_length",
+      "track_validation"
+    ]
+  }
+}

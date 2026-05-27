@@ -63,18 +63,29 @@ def _draw_overlays(
     """Paint scale bar / timestamp / channel labels onto a copy of `rgb`."""
     from PIL import Image, ImageDraw, ImageFont
 
-    img = Image.fromarray(rgb)
+    # Use RGBA so the timestamp semi-transparent background can composite
+    # correctly; convert back to RGB before returning.
+    img = Image.fromarray(rgb).convert("RGBA")
     draw = ImageDraw.Draw(img)
     h, w = rgb.shape[:2]
 
-    def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-        # Try a few common system fonts; fall back to the default.
-        for name in ("Helvetica.ttc", "DejaVuSans.ttf", "Arial.ttf"):
+    def _font(size: int):
+        candidates = [
+            "Arial.ttf",
+            "DejaVuSans.ttf",
+            "Helvetica.ttc",
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\segoeui.ttf",
+        ]
+        for name in candidates:
             try:
                 return ImageFont.truetype(name, size)
             except Exception:
                 continue
-        return ImageFont.load_default()
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
 
     # ── Scale bar ──
     if opts.show_scale_bar and pixel_size_um > 0:
@@ -143,7 +154,7 @@ def _draw_overlays(
             draw.text((x + sw + 6, y - 1), name, fill=opts.timestamp_color, font=font)
             y += line_h
 
-    return np.asarray(img)
+    return np.asarray(img.convert("RGB"))
 
 
 # Largest edge libx264 can comfortably encode at Level 6.2 with the

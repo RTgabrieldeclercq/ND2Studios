@@ -24,3 +24,14 @@ def test_hole_fill() -> None:
         mask, min_area=0, opening_radius=0, closing_radius=0, min_hole_size=10
     )
     assert out[5, 5]
+
+
+def test_max_area_filter() -> None:
+    mask = np.zeros((30, 30), dtype=bool)
+    mask[1:4, 1:4] = True      # 9 px — should survive (below max_area)
+    mask[10:25, 10:25] = True  # 225 px — should be removed (above max_area=100)
+    out = apply_spatial_constraints(
+        mask, min_area=0, max_area=100, opening_radius=0, closing_radius=0, min_hole_size=0
+    )
+    assert out[2, 2]       # small object survives
+    assert not out[17, 17] # large object removed

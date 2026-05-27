@@ -25,8 +25,9 @@ the `#bgApp` background frame.
 """
 from __future__ import annotations
 
+import json
 import os
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from PySide6.QtCore import (
     QEasingCurve, QEvent, QPropertyAnimation, QSize, Qt, QTimer,
@@ -100,6 +101,10 @@ class MainWindow(QMainWindow):
         self._sidebar_expanded: bool = True
         self._drag_pos = None
         self._is_maximized = False
+
+        # Config file state — set on Load or after a successful Save.
+        self._cfg_path: Optional[str] = None
+        self._cfg_data: Optional[Dict[str, Any]] = None
 
         self._build_ui()
         self._install_grips()
@@ -230,11 +235,11 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
 
-        # Session controls at the bottom.
+        # Controls at the bottom.
         for label, slot, tooltip in [
-            ("  📄  New",     self._new_session,    "Start a new empty session"),
-            ("  💾  Save",    self._save_session,   "Save session to a .nd2s file"),
-            ("  📂  Load",    self._load_session,   "Load a saved .nd2s session"),
+            ("  💾  Save",      self._save_config,   "Save configuration to a .nd2s_cfg file"),
+            ("  📂  Load",      self._load_config,   "Load a .nd2s_cfg configuration file"),
+            ("  🔧  Configure", self._configure,     "Open the pipeline configuration wizard"),
             ("  ⚙  Performance",
              self._open_performance_settings,
              "GPU acceleration and multi-resolution pyramid settings (V1.39)"),
@@ -858,7 +863,126 @@ class MainWindow(QMainWindow):
             return [exp]
         return []
 
-    # ── Session controls ───────────────────────────────────────────
+    # ── Config controls ────────────────────────────────────────────
+    def _configure(self) -> None:
+        from PySide6.QtWidgets import QDialog
+        from nd2studios.widgets.config_wizard import ConfigWizard
+        recipe_page = self.pages.get("recipe")
+        analysis_page = self.pages.get("analysis")
+        results_page = self.pages.get("results")
+        dlg = ConfigWizard(
+            recipe_page, analysis_page, results_page,
+            parent=self, initial_path=self._cfg_path or "",
+        )
+        if self._cfg_data is not None:
+            dlg.apply_config(self._cfg_data)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        # The wizard saved the file in _on_accept; record the baseline.
+        self._cfg_path = dlg.save_path
+        self._cfg_data = dlg.get_config()
+
+        # Persist into the active experiment so load_from_experiment
+        # re-applies everything correctly on future tab visits.
+        exp = self.exp_manager.active
+        if exp is not None:
+            cfg = self._cfg_data
+            if "analysis" in cfg:
+                exp.analysis_config = dict(cfg["analysis"])
+            if "results" in cfg:
+                exp.results_config = dict(cfg["results"])
+            processing = cfg.get("processing", {})
+            recipe_list = processing.get("recipe")
+            if recipe_list is not None:
+                exp.recipe = [
+                    (s["name"], dict(s.get("params", {}))) for s in recipe_list
+                ]
+            if "normalized" in processing:
+                exp.recipe_normalized = bool(processing["normalized"])
+
+        self.set_status_text(f"Config saved: {os.path.basename(self._cfg_path)}")
+
+    def _save_config(self) -> None:
+        from PySide6.QtWidgets import QDialog
+        from nd2studios.widgets.config_wizard import (
+            CONFIG_EXTENSION, SavePreviewDialog, build_config_from_pages,
+        )
+
+        if self._cfg_data is None:
+            # No baseline — open Configure (it handles file naming and saving).
+            self._configure()
+            return
+
+        recipe_page = self.pages.get("recipe")
+        analysis_page = self.pages.get("analysis")
+        results_page = self.pages.get("results")
+
+        # Baseline exists — show a diff of what changed.
+        new_cfg = build_config_from_pages(analysis_page, results_page, recipe_page)
+        preview = SavePreviewDialog(
+            old_config=self._cfg_data,
+            new_config=new_cfg,
+            default_path=self._cfg_path or "",
+            parent=self,
+        )
+        if preview.exec() != QDialog.DialogCode.Accepted:
+            return
+        path = preview.save_path
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save Configuration", "",
+                f"ND2Studios Config (*{CONFIG_EXTENSION})",
+            )
+            if not path:
+                return
+        if not path.endswith(CONFIG_EXTENSION):
+            path += CONFIG_EXTENSION
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(new_cfg, fh, indent=2)
+        self._cfg_path = path
+        self._cfg_data = new_cfg
+        self.set_status_text(f"Config saved: {os.path.basename(path)}")
+
+    def _load_config(self) -> None:
+        from nd2studios.widgets.config_wizard import (
+            CONFIG_EXTENSION, apply_config_to_pages,
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Configuration", "",
+            f"ND2Studios Config (*{CONFIG_EXTENSION})",
+        )
+        if not path:
+            return
+        with open(path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        recipe_page = self.pages.get("recipe")
+        analysis_page = self.pages.get("analysis")
+        results_page = self.pages.get("results")
+        apply_config_to_pages(cfg, analysis_page, results_page, recipe_page)
+
+        # Persist config into the active experiment record so that
+        # load_from_experiment (called on future tab switches and experiment
+        # changes) re-applies the settings correctly.
+        exp = self.exp_manager.active
+        if exp is not None:
+            if "analysis" in cfg:
+                exp.analysis_config = dict(cfg["analysis"])
+            if "results" in cfg:
+                exp.results_config = dict(cfg["results"])
+            processing = cfg.get("processing", {})
+            recipe_list = processing.get("recipe")
+            if recipe_list is not None:
+                exp.recipe = [
+                    (s["name"], dict(s.get("params", {}))) for s in recipe_list
+                ]
+            if "normalized" in processing:
+                exp.recipe_normalized = bool(processing["normalized"])
+
+        self._cfg_path = path
+        self._cfg_data = cfg
+        self.set_status_text(f"Config loaded: {os.path.basename(path)}")
+
+    # ── Session controls (internal / legacy) ───────────────────────
     def _new_session(self) -> None:
         self.exp_manager.new_experiment("Untitled")
         self.detach_session()

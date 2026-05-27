@@ -3,8 +3,9 @@ Results page (V1.22).
 
 Displays extended per-object measurements computed from the AnalysisResult
 label masks produced by the Analysis page.  Measurements are shown in a
-sortable table alongside a summary panel and can be exported to CSV.
-Images with the label overlay can be exported as TIFF or JPG.
+sortable table alongside a column-selector sidebar and summary panel.
+Measurements can be exported to CSV; images with label overlay can be
+exported as TIFF or JPG.
 
 Prerequisite: at least one analysis pipeline must have been run for the
 active session (exp.analysis_results must be non-empty).
@@ -13,18 +14,24 @@ from __future__ import annotations
 
 import csv
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import numpy as np
 from PySide6.QtCore import Qt, QSortFilterProxyModel, QAbstractTableModel, QModelIndex
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSpinBox,
     QSplitter,
     QTableView,
     QVBoxLayout,
@@ -35,6 +42,82 @@ from PySide6.QtWidgets import (
 
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
+from nd2studios.workers.base_worker import BaseWorker
+
+
+# ── Column catalogue ──────────────────────────────────────────────────────────
+# Each entry: (group_label, [(column_key, display_label), ...])
+# Intensity columns (mean_intensity_*, std_intensity_*) are added dynamically
+# into the sidebar when the first compute finishes.
+
+_COLUMN_GROUPS: List[tuple] = [
+    ("Identity", [
+        ("segmentation_channel", "Segmentation channel"),
+        ("frame", "Frame"),
+        ("label_id", "Label ID"),
+        ("m_position", "M position"),
+    ]),
+    ("Size", [
+        ("area_px", "Area (px²)"),
+        ("area_um2", "Area (µm²)"),
+        ("volume_um3", "Volume (µm³)"),
+    ]),
+    ("Change (Δ)", [
+        ("delta_area_px", "Δ Area (px²)"),
+        ("delta_area_um2", "Δ Area (µm²)"),
+        ("delta_volume_um3", "Δ Volume (µm³)"),
+    ]),
+    ("Position", [
+        ("centroid_y_px", "Centroid Y (px)"),
+        ("centroid_x_px", "Centroid X (px)"),
+        ("centroid_y_um", "Centroid Y (µm)"),
+        ("centroid_x_um", "Centroid X (µm)"),
+        ("centroid_y_stage_um", "Centroid Y stage (µm)"),
+        ("centroid_x_stage_um", "Centroid X stage (µm)"),
+    ]),
+    ("Shape", [
+        ("perimeter", "Perimeter"),
+        ("circularity", "Circularity"),
+        ("eccentricity", "Eccentricity"),
+        ("solidity", "Solidity"),
+    ]),
+    ("Bounding box", [
+        ("bbox_min_row", "BBox min row"),
+        ("bbox_min_col", "BBox min col"),
+        ("bbox_max_row", "BBox max row"),
+        ("bbox_max_col", "BBox max col"),
+    ]),
+    ("Tracking", [
+        ("track_id",         "Track ID"),
+        ("track_length",     "Track length"),
+        ("track_validation", "Track validation"),
+    ]),
+]
+
+_DEFAULT_COLUMNS: Set[str] = {
+    "segmentation_channel", "frame", "label_id",
+    "area_px", "area_um2",
+    "delta_area_um2",
+    "centroid_y_um", "centroid_x_um",
+    "circularity", "eccentricity", "solidity",
+    "track_id", "track_length", "track_validation",
+}
+
+# Uniform row height for every checkbox in the sidebar (px).
+_CB_HEIGHT = 24
+
+
+# ── Background worker for Results tab exports ─────────────────────────────────
+
+class _ResultsExportWorker(BaseWorker):
+    """Run a Results-tab export task in a background thread."""
+
+    def __init__(self, fn: Callable[..., Any], parent=None) -> None:
+        super().__init__(parent)
+        self._fn = fn
+
+    def run_task(self) -> Any:
+        return self._fn(self.set_progress, self.set_status)
 
 
 # ── Minimal read-only table model ────────────────────────────────────────────
@@ -97,6 +180,19 @@ class ResultsPage(QWidget):
         self._current_pipeline: str = ""
         self._exp: Optional[ND2StudiosRecord] = None
         self._selected_rec: Optional[ND2StudiosRecord] = None
+        self._worker: Optional[_ResultsExportWorker] = None
+
+        # Cached data for the track-validation dialog.
+        self._label_masks_for_validation: Dict[str, Any] = {}
+        self._channels_for_validation: Dict[str, Any] = {}
+
+        # key → QCheckBox for every column (static + dynamic intensity).
+        self._col_checkboxes: Dict[str, QCheckBox] = {}
+        # Layout and header label for the dynamic Intensity group.
+        self._intensity_layout: Optional[QVBoxLayout] = None
+        self._intensity_header: Optional[QLabel] = None
+        self._intensity_sep: Optional[QFrame] = None
+
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -120,7 +216,6 @@ class ResultsPage(QWidget):
 
         # ── Top controls row ──
         ctrl_row = QHBoxLayout()
-
         ctrl_row.addWidget(QLabel("Pipeline:"))
         self._combo_pipeline = QComboBox()
         self._combo_pipeline.setMinimumWidth(220)
@@ -132,19 +227,93 @@ class ResultsPage(QWidget):
         self._btn_compute.clicked.connect(self._on_compute)
         ctrl_row.addWidget(self._btn_compute)
 
+        self._cb_raw_intensity = QCheckBox("Use raw image for intensity")
+        self._cb_raw_intensity.setToolTip(
+            "When checked, intensity measurements are taken from the raw\n"
+            "(unprocessed) image data. Mask/label positions still come\n"
+            "from the analysis result, which may have been run on processed data."
+        )
+        ctrl_row.addWidget(self._cb_raw_intensity)
         ctrl_row.addStretch(1)
 
         self._lbl_count = QLabel("")
         self._lbl_count.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
         ctrl_row.addWidget(self._lbl_count)
-
         root.addLayout(ctrl_row)
 
-        # ── Splitter: table + summary ──
+        # ── Object tracking parameters row ──
+        track_row = QHBoxLayout()
+        track_row.setSpacing(6)
+
+        lbl_tracking = QLabel("Object Tracking:")
+        lbl_tracking.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: bold 8pt; letter-spacing: 0.5px;"
+        )
+        track_row.addWidget(lbl_tracking)
+
+        track_row.addWidget(QLabel("Link distance (px):"))
+        self._spin_max_disp = QSpinBox()
+        self._spin_max_disp.setRange(1, 9999)
+        self._spin_max_disp.setValue(100)
+        self._spin_max_disp.setFixedWidth(65)
+        self._spin_max_disp.setToolTip(
+            "Maximum centroid displacement (Euclidean, pixels) between\n"
+            "consecutive frames to link two detections as the same object."
+        )
+        track_row.addWidget(self._spin_max_disp)
+
+        track_row.addSpacing(12)
+        track_row.addWidget(QLabel("Min. track length (frames):"))
+        self._spin_min_track_len = QSpinBox()
+        self._spin_min_track_len.setRange(2, 9999)
+        self._spin_min_track_len.setValue(2)
+        self._spin_min_track_len.setFixedWidth(65)
+        self._spin_min_track_len.setToolTip(
+            "Minimum number of consecutive frames an object must appear in\n"
+            "to be treated as a tracked object.  Objects with fewer frames\n"
+            "receive no track_id and are excluded from validation."
+        )
+        track_row.addWidget(self._spin_min_track_len)
+
+        track_row.addSpacing(12)
+        track_row.addWidget(QLabel("Min. circularity:"))
+        self._spin_min_circ = QDoubleSpinBox()
+        self._spin_min_circ.setRange(0.0, 1.0)
+        self._spin_min_circ.setSingleStep(0.05)
+        self._spin_min_circ.setDecimals(2)
+        self._spin_min_circ.setValue(0.0)
+        self._spin_min_circ.setFixedWidth(65)
+        self._spin_min_circ.setToolTip(
+            "Minimum circularity (4π·area/perimeter²) an object must have\n"
+            "to be eligible for tracking.  0.0 = no filter (all shapes pass);\n"
+            "1.0 = perfect circles only."
+        )
+        track_row.addWidget(self._spin_min_circ)
+
+        track_row.addSpacing(12)
+        track_row.addWidget(QLabel("Max. eccentricity:"))
+        self._spin_max_ecc = QDoubleSpinBox()
+        self._spin_max_ecc.setRange(0.0, 1.0)
+        self._spin_max_ecc.setSingleStep(0.05)
+        self._spin_max_ecc.setDecimals(2)
+        self._spin_max_ecc.setValue(1.0)
+        self._spin_max_ecc.setFixedWidth(65)
+        self._spin_max_ecc.setToolTip(
+            "Maximum eccentricity an object may have to be eligible for\n"
+            "tracking.  0.0 = circles only; 1.0 = no filter (all shapes pass)."
+        )
+        track_row.addWidget(self._spin_max_ecc)
+
+        track_row.addStretch(1)
+        root.addLayout(track_row)
+
+        # ── Three-pane splitter: columns | table | summary ──
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        # Measurements table
+        splitter.addWidget(self._build_columns_sidebar())
+
+        # Centre: measurements table
         table_widget = QWidget()
         tl = QVBoxLayout(table_widget)
         tl.setContentsMargins(0, 0, 0, 0)
@@ -152,23 +321,33 @@ class ResultsPage(QWidget):
         self._table = QTableView()
         self._table.setSortingEnabled(True)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setAlternatingRowColors(True)
+        self._table.setAlternatingRowColors(False)
+        self._table.setStyleSheet(f"""
+            QTableView {{
+                background-color: {Settings.BG_PRIMARY};
+                gridline-color: {Settings.BORDER_COLOR};
+            }}
+            QTableView::item {{
+                background-color: {Settings.BG_PRIMARY};
+                color: {Settings.FG_PRIMARY};
+                border-bottom: 1px solid {Settings.BORDER_COLOR};
+            }}
+            QTableView::item:selected {{
+                background-color: {Settings.BG_HOVER};
+                color: {Settings.FG_PRIMARY};
+            }}
+        """)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalHeader().setVisible(False)
         tl.addWidget(self._table, stretch=1)
         splitter.addWidget(table_widget)
 
-        # Summary panel
+        # Right: summary panel
         summary_group = QGroupBox("Summary")
         sl = QVBoxLayout(summary_group)
         self._summary_labels: Dict[str, QLabel] = {}
-        for key in (
-            "n_objects",
-            "n_frames",
-            "mean_area_um2",
-            "std_area_um2",
-        ):
+        for key in ("n_objects", "n_frames", "mean_area_um2", "std_area_um2"):
             row_w = QWidget()
             rl = QHBoxLayout(row_w)
             rl.setContentsMargins(0, 0, 0, 0)
@@ -180,17 +359,17 @@ class ResultsPage(QWidget):
             rl.addWidget(lbl_val, stretch=1)
             self._summary_labels[key] = lbl_val
             sl.addWidget(row_w)
-
-        # Dynamic channel intensity summary labels added at compute time
         self._dynamic_summary_container = QVBoxLayout()
         sl.addLayout(self._dynamic_summary_container)
         sl.addStretch(1)
-        summary_group.setMinimumWidth(240)
-        summary_group.setMaximumWidth(340)
+        summary_group.setMinimumWidth(220)
+        summary_group.setMaximumWidth(300)
         splitter.addWidget(summary_group)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([210, 600, 240])
         root.addWidget(splitter, stretch=1)
 
         # ── Export row ──
@@ -205,6 +384,13 @@ class ResultsPage(QWidget):
         self._btn_export_masks.clicked.connect(self._on_export_masks)
         export_row.addWidget(self._btn_export_masks)
 
+        self._cb_mask_overlay = QCheckBox("Include image")
+        self._cb_mask_overlay.setToolTip(
+            "Overlay colored per-object masks on the image data.\n"
+            "When unchecked, exports raw integer label TIFFs."
+        )
+        export_row.addWidget(self._cb_mask_overlay)
+
         self._combo_img_fmt = QComboBox()
         self._combo_img_fmt.addItems(["TIFF", "JPG"])
         export_row.addWidget(self._combo_img_fmt)
@@ -213,8 +399,32 @@ class ResultsPage(QWidget):
         self._btn_export_images.clicked.connect(self._on_export_images)
         export_row.addWidget(self._btn_export_images)
 
+        self._btn_validate_tracks = QPushButton("Validate Tracked Objects")
+        self._btn_validate_tracks.setEnabled(False)
+        self._btn_validate_tracks.setToolTip(
+            "Review and accept/reject tracked objects that appear across\n"
+            "multiple frames.  Rejected tracks are removed from the table."
+        )
+        self._btn_validate_tracks.clicked.connect(self._on_validate_tracked)
+        export_row.addWidget(self._btn_validate_tracks)
+
         export_row.addStretch(1)
         root.addLayout(export_row)
+
+        # ── Progress bar (hidden when idle) ──
+        progress_row = QHBoxLayout()
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(False)
+        self._progress_bar.setMaximumHeight(14)
+        progress_row.addWidget(self._progress_bar, stretch=1)
+        self._btn_cancel_export = QPushButton("Cancel")
+        self._btn_cancel_export.setVisible(False)
+        self._btn_cancel_export.setMaximumWidth(70)
+        self._btn_cancel_export.clicked.connect(self._on_cancel_export)
+        progress_row.addWidget(self._btn_cancel_export)
+        root.addLayout(progress_row)
 
         # ── Empty-state label ──
         self._lbl_empty = QLabel(
@@ -227,6 +437,165 @@ class ResultsPage(QWidget):
         )
         root.addWidget(self._lbl_empty)
         self._lbl_empty.setVisible(False)
+
+    # ── Column selector sidebar ───────────────────────────────────────────────
+
+    def _build_columns_sidebar(self) -> QWidget:
+        """Build the left column-selector panel with uniform checkbox spacing."""
+        outer = QWidget()
+        outer.setMinimumWidth(180)
+        outer.setMaximumWidth(240)
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 4, 0)
+        outer_layout.setSpacing(4)
+
+        outer_layout.addWidget(QLabel("Columns", objectName="sectionHeader"))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        inner = QWidget()
+        self._col_inner_layout = QVBoxLayout(inner)
+        self._col_inner_layout.setContentsMargins(2, 2, 4, 4)
+        self._col_inner_layout.setSpacing(0)
+
+        for group_name, cols in _COLUMN_GROUPS:
+            self._add_col_group(group_name, cols)
+
+        # Intensity placeholder (hidden until first compute).
+        self._intensity_header = QLabel("INTENSITY")
+        self._intensity_header.setFixedHeight(_CB_HEIGHT)
+        self._intensity_header.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: bold 8pt; "
+            f"letter-spacing: 1px; padding-left: 4px;"
+        )
+        self._intensity_header.hide()
+        self._col_inner_layout.addWidget(self._intensity_header)
+
+        intensity_container = QWidget()
+        self._intensity_layout = QVBoxLayout(intensity_container)
+        self._intensity_layout.setContentsMargins(0, 0, 0, 0)
+        self._intensity_layout.setSpacing(0)
+        intensity_container.hide()
+        self._intensity_container = intensity_container
+        self._col_inner_layout.addWidget(intensity_container)
+
+        self._intensity_sep = QFrame()
+        self._intensity_sep.setFrameShape(QFrame.Shape.HLine)
+        self._intensity_sep.setFixedHeight(1)
+        self._intensity_sep.setStyleSheet(
+            f"background: {Settings.BORDER_COLOR}; margin: 4px 0;"
+        )
+        self._intensity_sep.hide()
+        self._col_inner_layout.addWidget(self._intensity_sep)
+
+        self._col_inner_layout.addStretch(1)
+        scroll.setWidget(inner)
+        outer_layout.addWidget(scroll, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 2, 0, 0)
+        btn_all = QPushButton("All")
+        btn_all.setFixedWidth(50)
+        btn_all.setToolTip("Check all columns")
+        btn_all.clicked.connect(self._select_all_columns)
+        btn_none = QPushButton("None")
+        btn_none.setFixedWidth(50)
+        btn_none.setToolTip("Uncheck all columns")
+        btn_none.clicked.connect(self._clear_all_columns)
+        btn_row.addWidget(btn_all)
+        btn_row.addWidget(btn_none)
+        btn_row.addStretch(1)
+        outer_layout.addLayout(btn_row)
+
+        return outer
+
+    def _add_col_group(self, group_name: str, cols: List[tuple]) -> None:
+        """Add a section header + uniform-height checkboxes to the inner layout."""
+        lbl = QLabel(group_name.upper())
+        lbl.setFixedHeight(_CB_HEIGHT)
+        lbl.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: bold 8pt; "
+            f"letter-spacing: 1px; padding-left: 4px;"
+        )
+        self._col_inner_layout.addWidget(lbl)
+
+        for key, label in cols:
+            cb = QCheckBox(label)
+            cb.setFixedHeight(_CB_HEIGHT)
+            cb.setChecked(key in _DEFAULT_COLUMNS)
+            cb.setStyleSheet("padding-left: 4px;")
+            cb.toggled.connect(self._on_column_toggled)
+            self._col_checkboxes[key] = cb
+            self._col_inner_layout.addWidget(cb)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(
+            f"background: {Settings.BORDER_COLOR}; margin: 4px 0;"
+        )
+        self._col_inner_layout.addWidget(sep)
+
+    # ── Column sidebar slots ──────────────────────────────────────────────────
+
+    def _on_column_toggled(self, _checked: bool = False) -> None:
+        if self._measurements:
+            self._update_table(self._measurements)
+
+    def _select_all_columns(self) -> None:
+        for cb in self._col_checkboxes.values():
+            cb.blockSignals(True)
+            cb.setChecked(True)
+            cb.blockSignals(False)
+        if self._measurements:
+            self._update_table(self._measurements)
+
+    def _clear_all_columns(self) -> None:
+        for cb in self._col_checkboxes.values():
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+        if self._measurements:
+            self._update_table(self._measurements)
+
+    def _get_selected_column_keys(self, rows: List[Dict[str, Any]]) -> List[str]:
+        if not rows:
+            return []
+        return [
+            key for key in rows[0]
+            if self._col_checkboxes.get(key, None) is None
+            or self._col_checkboxes[key].isChecked()
+        ]
+
+    def _sync_intensity_columns(self, rows: List[Dict[str, Any]]) -> None:
+        """Register sidebar checkboxes for any new intensity columns."""
+        if not rows:
+            return
+        new_added = False
+        for key in rows[0]:
+            if key in self._col_checkboxes:
+                continue
+            if not (key.startswith("mean_intensity_") or key.startswith("std_intensity_")):
+                continue
+            if key.startswith("mean_intensity_"):
+                ch = key[len("mean_intensity_"):].replace("_", " ")
+                label = f"Mean intensity ({ch})"
+            else:
+                ch = key[len("std_intensity_"):].replace("_", " ")
+                label = f"Std intensity ({ch})"
+            cb = QCheckBox(label)
+            cb.setFixedHeight(_CB_HEIGHT)
+            cb.setChecked(True)
+            cb.setStyleSheet("padding-left: 4px;")
+            cb.toggled.connect(self._on_column_toggled)
+            self._col_checkboxes[key] = cb
+            self._intensity_layout.addWidget(cb)
+            new_added = True
+        if new_added:
+            self._intensity_header.show()
+            self._intensity_container.show()
+            self._intensity_sep.show()
 
     # ── Page lifecycle ────────────────────────────────────────────────────────
 
@@ -245,18 +614,27 @@ class ResultsPage(QWidget):
             idx = self._combo_pipeline.findText(cfg["pipeline"])
             if idx >= 0:
                 self._combo_pipeline.setCurrentIndex(idx)
+        saved_cols: Optional[List[str]] = cfg.get("selected_columns")
+        if saved_cols is not None:
+            sel_set = set(saved_cols)
+            for key, cb in self._col_checkboxes.items():
+                cb.blockSignals(True)
+                cb.setChecked(key in sel_set)
+                cb.blockSignals(False)
         self._refresh_pipeline_combo(exp)
 
     def save_to_experiment(self, exp: ND2StudiosRecord) -> None:
         exp.results_config = {
             "pipeline": self._combo_pipeline.currentText(),
             "image_format": self._combo_img_fmt.currentText().lower(),
+            "selected_columns": [
+                k for k, cb in self._col_checkboxes.items() if cb.isChecked()
+            ],
         }
 
     # ── File selector ─────────────────────────────────────────────────────────
 
     def _rebuild_file_selector(self) -> None:
-        """Populate the file-selector combo from all confirmed records."""
         if self.main_window is None:
             return
         fn = getattr(self.main_window, "get_confirmed_records", None)
@@ -269,8 +647,7 @@ class ResultsPage(QWidget):
         self._combo_file.blockSignals(True)
         self._combo_file.clear()
         for rec in records:
-            import os as _os
-            label = _os.path.basename(
+            label = os.path.basename(
                 (getattr(rec, "import_config", {}) or {}).get("filepath", "")
                 or (getattr(rec, "nd2_metadata", {}) or {}).get("filepath", "")
             ) or "Untitled"
@@ -279,8 +656,6 @@ class ResultsPage(QWidget):
 
         self._file_selector_row.setVisible(len(records) > 1)
 
-        # Default to whichever confirmed record has analysis results, keeping
-        # any existing selection if it's still valid.
         current_idx = self._combo_file.currentIndex()
         best_idx = 0
         for i, rec in enumerate(records):
@@ -322,23 +697,17 @@ class ResultsPage(QWidget):
 
     def _on_pipeline_changed(self, name: str) -> None:
         self._current_pipeline = name
-        # Clear stale measurements when the pipeline changes.
         self._measurements = []
         self._update_table([])
         self._update_summary([])
         self._btn_export_csv.setEnabled(False)
         self._btn_export_masks.setEnabled(False)
         self._btn_export_images.setEnabled(False)
+        self._btn_validate_tracks.setEnabled(False)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _get_result(self, exp: ND2StudiosRecord, pipeline_name: str):
-        """Return the AnalysisResult for the current m_index.
-
-        analysis_results[pipeline_name] is stored as Dict[int, AnalysisResult]
-        by AnalysisPage._on_finished.  Unwrap it here so the rest of the page
-        never has to know about the nesting.
-        """
         from nd2studios.core.analysis_registry import AnalysisResult
         stored = exp.analysis_results.get(pipeline_name)
         if stored is None:
@@ -354,22 +723,33 @@ class ResultsPage(QWidget):
         return None
 
     def _channels_for_m(self, exp: ND2StudiosRecord, m: int) -> Dict[str, Any]:
-        """Return materialised (T, H, W) channel arrays for a single M position."""
+        from nd2studios.pipeline import EnhancedDataset
+        use_raw = self._cb_raw_intensity.isChecked()
         vol = getattr(exp, "_raw_volume", None)
-        # V1.38 Phase 6: ``has_processed()`` is True for both the in-RAM
-        # ``_processed_channels`` dict and a lazy ``_processed_view``
-        # proxy from a workspace release — keep the volume-based fast
-        # path active when *neither* is available.
-        has_processed = getattr(exp, "has_processed", lambda: bool(exp._processed_channels))()
-        if vol is not None and not has_processed:
+        if vol is not None:
             z_mode = getattr(exp, "z_view_mode", None) or "max"
             z_index = int(getattr(exp, "z_view_index", None) or 0)
-            return {
+            raw_for_m = {
                 ch_name: vol.to_lazy_channel(
                     c_idx, m=m, z_mode=z_mode, z_index=z_index
                 ).materialize()
                 for c_idx, ch_name in enumerate(vol.channel_names)
             }
+            if use_raw:
+                return raw_for_m
+            # Apply committed recipe so intensity values match processed data.
+            recipe = list(getattr(exp, "recipe", []) or [])
+            normalized = bool(getattr(exp, "recipe_normalized", False))
+            if recipe or normalized:
+                enhanced = EnhancedDataset(
+                    raw_channels=raw_for_m,
+                    recipe=recipe,
+                    normalized=normalized,
+                    pixel_size_um=float(getattr(exp, "pixel_size_um", 1.0)),
+                )
+                return {name: enhanced.materialize_channel(name)
+                        for name in raw_for_m}
+            return raw_for_m
         source = exp.processed_view() if hasattr(exp, "processed_view") else (
             exp._processed_channels or exp._raw_channels or {}
         )
@@ -387,15 +767,6 @@ class ResultsPage(QWidget):
     def _rehydrate_released_label_masks(
         self, pipeline_name: str, results_by_m: Dict[int, Any],
     ) -> None:
-        """Refill ``label_masks`` from the workspace if they were released.
-
-        Released results are recognized by an empty ``label_masks`` dict
-        on an otherwise-populated :class:`AnalysisResult`. Reads back
-        from the workspace's Zarr/NPZ artifacts via
-        :meth:`AnalysisStage.rehydrate_m`. If the workspace is
-        unavailable, the method is a no-op and the caller will see the
-        original (likely empty) label masks — same behaviour as V1.37.
-        """
         if self.main_window is None:
             return
         stage = self.main_window.analysis_stage(pipeline_name)
@@ -446,11 +817,6 @@ class ResultsPage(QWidget):
             )
             return
 
-        # V1.38 Phase 6 — if the Analysis page released label masks
-        # after committing them to the workspace, read them back now.
-        # Released results have ``label_masks == {}`` but the
-        # measurements / summary still in RAM; rehydrate fills the
-        # arrays before ``compute_measurements`` needs them.
         self._rehydrate_released_label_masks(pipeline_name, results_by_m)
 
         metadata = dict(exp.nd2_metadata or {})
@@ -478,6 +844,31 @@ class ResultsPage(QWidget):
             all_rows.extend(rows)
 
         self._measurements = all_rows
+
+        # ── Object tracking ───────────────────────────────────────────────────
+        from nd2studios.backend.object_tracker import link_objects
+        link_objects(
+            all_rows,
+            max_displacement_px=float(self._spin_max_disp.value()),
+            min_track_length=int(self._spin_min_track_len.value()),
+            min_circularity=float(self._spin_min_circ.value()),
+            max_eccentricity=float(self._spin_max_ecc.value()),
+        )
+
+        # Cache channel data and label masks for the validation dialog.
+        # Only the first (or only) M position is cached; multi-M is V2.
+        self._label_masks_for_validation = {}
+        self._channels_for_validation = {}
+        if results_by_m:
+            m0 = next(iter(sorted(results_by_m.keys())))
+            self._channels_for_validation = self._channels_for_m(exp, m0)
+            self._label_masks_for_validation = dict(results_by_m[m0].label_masks)
+
+        has_tracked = any(r.get("track_id") is not None for r in all_rows)
+        self._btn_validate_tracks.setEnabled(has_tracked)
+        # ─────────────────────────────────────────────────────────────────────
+
+        self._sync_intensity_columns(all_rows)
         self._update_table(all_rows)
         self._update_summary(all_rows)
 
@@ -493,18 +884,71 @@ class ResultsPage(QWidget):
                 f"Results: {len(all_rows)} objects from '{pipeline_name}'."
             )
 
+    # ── Track validation ──────────────────────────────────────────────────────
+
+    def _on_validate_tracked(self) -> None:
+        """Open the TrackValidationDialog and apply accept/reject decisions."""
+        from nd2studios.widgets.track_validation_dialog import TrackValidationDialog
+
+        if not self._measurements:
+            return
+        if not any(r.get("track_id") is not None for r in self._measurements):
+            return
+
+        exp = self._selected_rec or self._exp
+        if exp is None and self.main_window is not None:
+            exp = self.main_window.exp_manager.active
+        channel_display: Dict[str, Any] = dict(
+            getattr(exp, "channel_display", None) or {}
+        )
+
+        dlg = TrackValidationDialog(
+            measurements=self._measurements,
+            label_masks=self._label_masks_for_validation,
+            channels=self._channels_for_validation,
+            channel_display=channel_display,
+            parent=self,
+        )
+        dlg.exec()
+
+        rejected = dlg.rejected_track_ids
+        accepted = dlg.accepted_track_ids
+
+        if rejected:
+            self._measurements = [
+                r for r in self._measurements
+                if r.get("track_id") not in rejected
+            ]
+
+        for r in self._measurements:
+            if r.get("track_id") in accepted:
+                r["track_validation"] = "accepted"
+
+        self._update_table(self._measurements)
+        self._update_summary(self._measurements)
+        self._lbl_count.setText(f"{len(self._measurements)} objects")
+
+        if rejected and self.main_window is not None:
+            self.main_window.set_status_text(
+                f"Validation complete: {len(rejected)} track(s) rejected and removed."
+            )
+
     # ── Table update ─────────────────────────────────────────────────────────
 
     def _update_table(self, rows: List[Dict[str, Any]]) -> None:
         if not rows:
             self._table.setModel(None)
             return
-        model = _MeasurementsModel(rows, parent=self)
+        selected_keys = self._get_selected_column_keys(rows)
+        if not selected_keys:
+            self._table.setModel(None)
+            return
+        filtered = [{k: r.get(k) for k in selected_keys} for r in rows]
+        model = _MeasurementsModel(filtered, parent=self)
         proxy = QSortFilterProxyModel(self)
         proxy.setSourceModel(model)
         self._table.setModel(proxy)
         self._table.resizeColumnsToContents()
-        # Cap column width so wide columns don't dominate.
         for c in range(proxy.columnCount()):
             w = self._table.columnWidth(c)
             self._table.setColumnWidth(c, min(w, 160))
@@ -512,7 +956,6 @@ class ResultsPage(QWidget):
     # ── Summary update ────────────────────────────────────────────────────────
 
     def _update_summary(self, rows: List[Dict[str, Any]]) -> None:
-        # Clear dynamic channel labels
         while self._dynamic_summary_container.count():
             item = self._dynamic_summary_container.takeAt(0)
             if item.widget():
@@ -536,7 +979,6 @@ class ResultsPage(QWidget):
             self._summary_labels["mean_area_um2"].setText("—")
             self._summary_labels["std_area_um2"].setText("—")
 
-        # Dynamic: mean intensity per channel found in rows
         intensity_keys = sorted({
             k for r in rows for k in r if k.startswith("mean_intensity_")
         })
@@ -574,16 +1016,16 @@ class ResultsPage(QWidget):
                 writer.writeheader()
                 writer.writerows(self._measurements)
             if self.main_window is not None:
-                self.main_window.set_status_text(
-                    f"CSV saved: {os.path.basename(path)}"
-                )
+                self.main_window.set_status_text(f"CSV saved: {os.path.basename(path)}")
         except Exception as exc:
             QMessageBox.warning(self, "Export Failed", str(exc))
 
     # ── Export: label masks ───────────────────────────────────────────────────
 
     def _on_export_masks(self) -> None:
-        from nd2studios.backend.results_engine import export_label_masks_tiff
+        from nd2studios.backend.results_engine import (
+            export_label_masks_tiff, export_label_masks_as_overlay,
+        )
         from nd2studios.core.analysis_registry import AnalysisResult
 
         exp = self._selected_rec or self._exp
@@ -605,27 +1047,58 @@ class ResultsPage(QWidget):
         if not results_by_m:
             return
 
+        self._rehydrate_released_label_masks(pipeline_name, results_by_m)
+
+        has_any_masks = any(r.label_masks for r in results_by_m.values())
+        if not has_any_masks:
+            QMessageBox.information(
+                self, "No Label Masks",
+                "No label masks are available for this pipeline.\n"
+                "Run 'Compute Measurements' first."
+            )
+            return
+
         out_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if not out_dir:
             return
 
-        try:
-            multi_m = len(results_by_m) > 1
+        include_image = self._cb_mask_overlay.isChecked()
+        fmt = self._combo_img_fmt.currentText().lower()
+        metadata = dict(exp.nd2_metadata or {})
+        pixel_size_um = float(exp.pixel_size_um or 0.0)
+        multi_m = len(results_by_m) > 1
+
+        def _run(progress_cb, status_cb):
             total_paths: List[str] = []
-            for m, result in sorted(results_by_m.items()):
+            items = sorted(results_by_m.items())
+            for idx, (m, result) in enumerate(items):
                 if not result.label_masks:
                     continue
                 target = os.path.join(out_dir, f"M{m:02d}") if multi_m else out_dir
                 if multi_m:
                     os.makedirs(target, exist_ok=True)
-                paths = export_label_masks_tiff(result.label_masks, target)
+                if include_image:
+                    channels_for_m = self._channels_for_m(exp, m)
+                    paths = export_label_masks_as_overlay(
+                        channels=channels_for_m,
+                        label_masks=result.label_masks,
+                        metadata=metadata,
+                        output_dir=target,
+                        fmt=fmt,
+                        channel_display=exp.channel_display or {},
+                        pixel_size_um=pixel_size_um,
+                        show_scale_bar=True,
+                        show_channel_labels=True,
+                        progress_cb=lambda p: progress_cb(
+                            int(idx / len(items) * 100 + p / len(items))
+                        ),
+                    )
+                else:
+                    paths = export_label_masks_tiff(result.label_masks, target)
                 total_paths.extend(paths)
-            if self.main_window is not None:
-                self.main_window.set_status_text(
-                    f"Masks saved: {len(total_paths)} file(s) → {out_dir}"
-                )
-        except Exception as exc:
-            QMessageBox.warning(self, "Export Failed", str(exc))
+            return total_paths
+
+        self._run_export(_run, f"Exporting label masks → {out_dir}")
 
     # ── Export: overlay images ────────────────────────────────────────────────
 
@@ -658,11 +1131,13 @@ class ResultsPage(QWidget):
 
         fmt = self._combo_img_fmt.currentText().lower()
         metadata = dict(exp.nd2_metadata or {})
+        pixel_size_um = float(exp.pixel_size_um or 0.0)
+        multi_m = len(results_by_m) > 1
 
-        try:
-            multi_m = len(results_by_m) > 1
+        def _run(progress_cb, status_cb):
             total_paths: List[str] = []
-            for m, result in sorted(results_by_m.items()):
+            items = sorted(results_by_m.items())
+            for idx, (m, result) in enumerate(items):
                 if not result.label_masks:
                     continue
                 channels_for_m = self._channels_for_m(exp, m)
@@ -676,11 +1151,88 @@ class ResultsPage(QWidget):
                     output_dir=target,
                     fmt=fmt,
                     channel_display=exp.channel_display or {},
+                    pixel_size_um=pixel_size_um,
+                    show_scale_bar=True,
+                    show_channel_labels=True,
+                    progress_cb=lambda p: progress_cb(
+                        int(idx / len(items) * 100 + p / len(items))
+                    ),
                 )
                 total_paths.extend(paths)
-            if self.main_window is not None:
-                self.main_window.set_status_text(
-                    f"Images saved: {len(total_paths)} frame(s) → {out_dir}"
-                )
-        except Exception as exc:
-            QMessageBox.warning(self, "Export Failed", str(exc))
+            return total_paths
+
+        self._run_export(_run, f"Exporting overlay images → {out_dir}")
+
+    # ── Worker plumbing ───────────────────────────────────────────────────────
+
+    def _run_export(self, fn: Callable[..., Any], label: str) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "Busy", "An export is already running.")
+            return
+
+        self._worker = _ResultsExportWorker(fn, parent=self)
+        self._worker.progress.connect(self._on_export_progress)
+        self._worker.status.connect(self._on_export_status)
+        self._worker.finished.connect(self._on_export_done)
+        self._worker.error.connect(self._on_export_error)
+
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(True)
+        self._btn_cancel_export.setVisible(True)
+        self._set_export_buttons_enabled(False)
+
+        if self.main_window is not None:
+            self.main_window.set_status_text(label)
+        self._worker.start()
+
+    def _set_export_buttons_enabled(self, enabled: bool) -> None:
+        self._btn_export_csv.setEnabled(enabled and bool(self._measurements))
+        first_result = self._first_result_with_masks()
+        self._btn_export_masks.setEnabled(enabled and first_result is not None)
+        self._btn_export_images.setEnabled(enabled and bool(self._measurements))
+
+    def _first_result_with_masks(self):
+        exp = self._selected_rec or self._exp
+        if exp is None and self.main_window is not None:
+            exp = self.main_window.exp_manager.active
+        if exp is None:
+            return None
+        pipeline_name = self._combo_pipeline.currentText()
+        stored = exp.analysis_results.get(pipeline_name) if exp else None
+        if stored is None:
+            return None
+        from nd2studios.core.analysis_registry import AnalysisResult
+        if isinstance(stored, AnalysisResult):
+            return stored if stored.label_masks else None
+        if isinstance(stored, dict):
+            for r in stored.values():
+                if isinstance(r, AnalysisResult) and r.label_masks:
+                    return r
+        return None
+
+    def _on_cancel_export(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+
+    def _on_export_progress(self, p: int) -> None:
+        self._progress_bar.setValue(p)
+
+    def _on_export_status(self, msg: str) -> None:
+        if self.main_window is not None:
+            self.main_window.set_status_text(msg)
+
+    def _on_export_done(self, result: Any) -> None:
+        self._progress_bar.setVisible(False)
+        self._btn_cancel_export.setVisible(False)
+        self._set_export_buttons_enabled(True)
+        n = len(result) if isinstance(result, list) else 1
+        msg = f"Saved {n} file(s)."
+        if self.main_window is not None:
+            self.main_window.set_status_text(msg)
+        QMessageBox.information(self, "Export Complete", msg)
+
+    def _on_export_error(self, msg: str) -> None:
+        self._progress_bar.setVisible(False)
+        self._btn_cancel_export.setVisible(False)
+        self._set_export_buttons_enabled(True)
+        QMessageBox.warning(self, "Export Failed", msg)

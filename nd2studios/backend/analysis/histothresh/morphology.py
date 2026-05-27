@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+from skimage.measure import label as _label_components
 from skimage.morphology import (
     opening,
     closing,
@@ -16,6 +17,7 @@ def apply_spatial_constraints(
     mask: np.ndarray,
     *,
     min_area: int = 100,
+    max_area: int = 0,
     opening_radius: int = 1,
     closing_radius: int = 2,
     min_hole_size: int = 50,
@@ -25,7 +27,8 @@ def apply_spatial_constraints(
 
     Opening first kills isolated noise pixels before closing would bridge them.
     Closing bridges legitimate small gaps. Hole filling repairs interior pockets.
-    Small-object removal applies the size threshold last.
+    Small-object removal applies the size threshold last, then large-object removal
+    strips background blobs that exceed max_area (0 = disabled).
     """
     footprint_fn = ball if is_3d else disk
     out = mask.copy()
@@ -38,6 +41,12 @@ def apply_spatial_constraints(
         out = remove_small_holes(out, max_size=max(0, min_hole_size - 1))
     if min_area > 0:
         out = remove_small_objects(out, max_size=max(0, min_area - 1))
+    if max_area > 0:
+        labeled = _label_components(out, connectivity=2)
+        sizes = np.bincount(labeled.ravel())
+        too_large = sizes > max_area
+        too_large[0] = False  # label 0 is background — never remove it
+        out = out & ~too_large[labeled]
     return out
 
 

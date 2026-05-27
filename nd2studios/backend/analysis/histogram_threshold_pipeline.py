@@ -116,6 +116,15 @@ class HistogramThresholdPipeline(AnalysisPipeline):
                 tooltip="Discard objects smaller than this area in pixels.",
             ),
             ParamSpec(
+                "max_area", "Max area (px)", "int", 0,
+                min_val=0, max_val=100_000_000, step=1000,
+                tooltip=(
+                    "Discard objects larger than this area in pixels. "
+                    "Set to 0 to disable. Use this to exclude background blobs "
+                    "that would otherwise dominate the mean area statistic."
+                ),
+            ),
+            ParamSpec(
                 "opening_radius", "Opening radius (px)", "int", 1,
                 min_val=0, max_val=10, step=1,
                 tooltip="Morphological opening removes isolated noise before closing.",
@@ -213,6 +222,7 @@ class HistogramThresholdPipeline(AnalysisPipeline):
             bit_depth=bit_depth,
             bit_depth_strict=False,  # TIFF inputs may overflow declared depth
             min_area=int(params.get("min_area", 100)),
+            max_area=int(params.get("max_area", 0)),
             opening_radius=int(params.get("opening_radius", 1)),
             closing_radius=int(params.get("closing_radius", 2)),
             min_hole_size=int(params.get("min_hole_size", 50)),

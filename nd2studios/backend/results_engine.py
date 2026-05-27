@@ -8,10 +8,30 @@ headless scripts.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from skimage.measure import regionprops
+
+from nd2studios.backend.exporters.composite_exporter import (
+    CHANNEL_COLORS, _composite_frame,
+)
+
+# Visually distinct colors cycled by label ID for per-object mask overlays.
+_LABEL_PALETTE: List[Tuple[int, int, int]] = [
+    (240, 60,  60),   # red
+    (60,  210, 60),   # green
+    (60,  100, 240),  # blue
+    (240, 200, 50),   # yellow
+    (200, 60,  200),  # magenta
+    (50,  200, 200),  # cyan
+    (240, 130, 50),   # orange
+    (150, 60,  240),  # purple
+    (60,  240, 150),  # mint
+    (240, 60,  150),  # pink
+    (110, 200, 60),   # lime
+    (60,  150, 240),  # sky blue
+]
 
 
 # ── Core measurement computation ─────────────────────────────────────────────
@@ -41,7 +61,8 @@ def compute_measurements(
         Columns: segmentation_channel, frame, label_id, area_px, area_um2,
         delta_area_px, delta_area_um2, volume_um3, delta_volume_um3,
         centroid_y/x_px, centroid_y/x_um, [centroid_y/x_stage_um],
-        perimeter, eccentricity, solidity, bbox_*, mean/std_intensity_{ch}.
+        perimeter, circularity, eccentricity, solidity, bbox_*,
+        mean/std_intensity_{ch}.
     """
     pixel_size: float = float(metadata.get("pixel_size_um") or 1.0)
     z_step: float = float(metadata.get("z_step_um") or 1.0)
@@ -100,6 +121,12 @@ def compute_measurements(
                     "centroid_y_um": round(cy_px * pixel_size, 4),
                     "centroid_x_um": round(cx_px * pixel_size, 4),
                     "perimeter": round(float(prop.perimeter), 3),
+                    "circularity": round(
+                        4.0 * 3.141592653589793 * float(prop.area)
+                        / (float(prop.perimeter) ** 2)
+                        if prop.perimeter > 0 else 0.0,
+                        4,
+                    ),
                     "eccentricity": round(float(prop.eccentricity), 4),
                     "solidity": (
                         round(float(prop.solidity), 4)
@@ -179,20 +206,34 @@ def export_overlay_frames(
     output_dir: str,
     fmt: str = "tiff",
     channel_display: Optional[Dict[str, Any]] = None,
+    pixel_size_um: float = 0.0,
+    show_scale_bar: bool = True,
+    scale_bar_um: float = 50.0,
+    show_channel_labels: bool = True,
+    mask_alpha: float = 0.5,
+    frame_timestamps: Optional[np.ndarray] = None,
+    progress_cb: Optional[Callable[[int], None]] = None,
 ) -> List[str]:
-    """Export per-frame composite images with label mask burned in.
+    """Export per-frame composite images with per-object colored label masks.
 
-    For each T frame, builds a uint8 RGB composite from *channels* using
-    *channel_display* colours (or a default palette), then overlays the
-    combined label mask in semi-transparent cyan.
+    For each T frame: builds a uint8 RGB composite from *channels*, overlays
+    all label masks using per-object distinct colors at *mask_alpha* opacity,
+    then burns in a scale bar and channel labels if requested.
 
     Args:
-        channels:        {name: (T, H, W)} arrays
-        label_masks:     {seg_channel: (T, H, W) int32}
-        metadata:        nd2_metadata dict
-        output_dir:      directory to write files into (must exist)
-        fmt:             "tiff" or "jpg"
-        channel_display: {name: {color, lut_lo, lut_hi}} — uses viewer state
+        channels:            {name: (T, H, W)} arrays
+        label_masks:         {seg_channel: (T, H, W) int32}
+        metadata:            nd2_metadata dict
+        output_dir:          directory to write files into (must exist)
+        fmt:                 "tiff" or "jpg"
+        channel_display:     {name: {color, lut_lo, lut_hi}} — viewer state
+        pixel_size_um:       µm per pixel for scale bar; ≤0 disables bar
+        show_scale_bar:      draw scale bar when pixel_size_um > 0
+        scale_bar_um:        physical length of the scale bar in µm
+        show_channel_labels: draw per-channel color swatches + names
+        mask_alpha:          opacity of the label overlay (0–1)
+        frame_timestamps:    per-frame timestamps in seconds (optional)
+        progress_cb:         called with 0–100 progress values
 
     Returns:
         List of written file paths.
@@ -201,14 +242,12 @@ def export_overlay_frames(
 
     mat_channels = {k: _materialise(v) for k, v in channels.items()}
 
-    # Determine T from the first channel
     T = 1
     for arr in mat_channels.values():
         if arr is not None and arr.ndim == 3:
             T = arr.shape[0]
             break
 
-    # Build combined binary mask across all segmentation channels
     H = W = 0
     for arr in mat_channels.values():
         if arr is not None and arr.ndim == 3:
@@ -217,47 +256,70 @@ def export_overlay_frames(
 
     ext = "tiff" if fmt.lower() in ("tif", "tiff") else "jpg"
 
+    default_colors = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255),
+        (255, 255, 0), (0, 255, 255), (255, 0, 255),
+    ]
+
     written: List[str] = []
     for t in range(T):
-        # RGB composite
-        rgb = np.zeros((H, W, 3), dtype=np.uint8)
+        # ── RGB composite from enabled channels ──
         ch_list = list(mat_channels.keys())
-        default_colors = [
-            (255, 0, 0), (0, 255, 0), (0, 0, 255),
-            (255, 255, 0), (0, 255, 255), (255, 0, 255),
-        ]
+        ch_colors: Dict[str, Tuple[int, int, int]] = {}
+        ch_enabled: Dict[str, bool] = {}
+        frame_dict: Dict[str, np.ndarray] = {}
         for ci, ch_name in enumerate(ch_list):
             arr = _get_frame(mat_channels, ch_name, t)
-            if arr is None:
-                continue
             disp = (channel_display or {}).get(ch_name, {})
-            if not disp.get("enabled", True):
-                continue
-            color_hex: str = disp.get("color") or ""
-            color = _hex_to_rgb(color_hex) if color_hex else default_colors[ci % len(default_colors)]
-            lut_lo = float(disp.get("lut_lo") or 0.0)
-            lut_hi = float(disp.get("lut_hi") or 1.0)
-            gray = _normalise_frame(arr, lut_lo, lut_hi)  # float32 0-1
-            for c, weight in enumerate(color):
-                rgb[..., c] = np.clip(
-                    rgb[..., c].astype(np.float32) + gray * weight, 0, 255
-                ).astype(np.uint8)
+            ch_enabled[ch_name] = bool(disp.get("enabled", True))
+            color_name: str = disp.get("color") or ""
+            ch_colors[ch_name] = (
+                CHANNEL_COLORS.get(color_name)
+                or default_colors[ci % len(default_colors)]
+            )
+            if arr is not None:
+                frame_dict[ch_name] = arr
+        if frame_dict:
+            rgb = _composite_frame(frame_dict, ch_colors, ch_enabled, lut_settings=None)
+        else:
+            rgb = np.zeros((H, W, 3), dtype=np.uint8)
 
-        # Overlay binary mask in semi-transparent cyan
-        combined_mask = np.zeros((H, W), dtype=bool)
-        for masks in label_masks.values():
-            if masks.ndim == 3 and t < masks.shape[0]:
-                combined_mask |= masks[t] > 0
-        if combined_mask.any():
-            overlay = rgb.astype(np.float32).copy()
-            overlay[combined_mask, 0] = overlay[combined_mask, 0] * 0.5
-            overlay[combined_mask, 1] = np.clip(
-                overlay[combined_mask, 1] * 0.5 + 127, 0, 255
+        # ── Per-object colored mask overlay ──
+        if label_masks:
+            overlay = rgb.astype(np.float32)
+            for masks in label_masks.values():
+                if masks.ndim != 3 or t >= masks.shape[0]:
+                    continue
+                frame_mask = np.asarray(masks[t], dtype=np.int32)
+                label_ids = np.unique(frame_mask)
+                for lid in label_ids:
+                    if lid == 0:
+                        continue
+                    obj_pixels = frame_mask == lid
+                    color = _LABEL_PALETTE[(int(lid) - 1) % len(_LABEL_PALETTE)]
+                    for c in range(3):
+                        overlay[obj_pixels, c] = (
+                            overlay[obj_pixels, c] * (1.0 - mask_alpha)
+                            + color[c] * mask_alpha
+                        )
+            rgb = np.clip(overlay, 0, 255).astype(np.uint8)
+
+        # ── Scale bar + channel labels via PIL ──
+        needs_overlay = (
+            (show_scale_bar and pixel_size_um > 0) or show_channel_labels
+        )
+        if needs_overlay:
+            rgb = _draw_image_overlays(
+                rgb,
+                t_index=t,
+                pixel_size_um=pixel_size_um,
+                show_scale_bar=show_scale_bar,
+                scale_bar_um=scale_bar_um,
+                show_channel_labels=show_channel_labels,
+                channel_names=[n for n in ch_list if ch_enabled.get(n, True)],
+                channel_colors=ch_colors,
+                frame_timestamps=frame_timestamps,
             )
-            overlay[combined_mask, 2] = np.clip(
-                overlay[combined_mask, 2] * 0.5 + 127, 0, 255
-            )
-            rgb = overlay.astype(np.uint8)
 
         fname = os.path.join(output_dir, f"frame_{t:04d}.{ext}")
         if ext == "tiff":
@@ -265,6 +327,9 @@ def export_overlay_frames(
         else:
             imageio.imwrite(fname, rgb, quality=92)
         written.append(fname)
+
+        if progress_cb is not None and (t % 4 == 0 or t == T - 1):
+            progress_cb(int((t + 1) / T * 100))
 
     return written
 
@@ -286,7 +351,201 @@ def export_label_masks_tiff(
     return written
 
 
+def export_label_masks_as_overlay(
+    channels: Dict[str, np.ndarray],
+    label_masks: Dict[str, np.ndarray],
+    metadata: Dict[str, Any],
+    output_dir: str,
+    fmt: str = "tiff",
+    channel_display: Optional[Dict[str, Any]] = None,
+    pixel_size_um: float = 0.0,
+    show_scale_bar: bool = True,
+    scale_bar_um: float = 50.0,
+    show_channel_labels: bool = True,
+    mask_alpha: float = 0.5,
+    progress_cb: Optional[Callable[[int], None]] = None,
+) -> List[str]:
+    """Export label masks as colored per-object overlays on top of image data.
+
+    Each output frame shows the raw/processed image as the background with
+    label masks rendered using per-object distinct colors at *mask_alpha*
+    opacity — matching the image-viewer overlay appearance.
+
+    Returns:
+        List of written file paths (one per T frame per segmentation channel).
+    """
+    import imageio
+
+    mat_channels = {k: _materialise(v) for k, v in channels.items()}
+
+    T = 1
+    for arr in mat_channels.values():
+        if arr is not None and arr.ndim == 3:
+            T = arr.shape[0]
+            break
+
+    H = W = 0
+    for arr in mat_channels.values():
+        if arr is not None and arr.ndim == 3:
+            _, H, W = arr.shape
+            break
+
+    ext = "tiff" if fmt.lower() in ("tif", "tiff") else "jpg"
+    default_colors = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255),
+        (255, 255, 0), (0, 255, 255), (255, 0, 255),
+    ]
+
+    total_frames = T * max(1, len(label_masks))
+    done = 0
+    written: List[str] = []
+
+    for seg_ch_name, masks in label_masks.items():
+        safe_seg = seg_ch_name.replace(" ", "_").replace("/", "_")
+        for t in range(T):
+            # ── RGB composite background ──
+            ch_list = list(mat_channels.keys())
+            ch_colors: Dict[str, Tuple[int, int, int]] = {}
+            ch_enabled: Dict[str, bool] = {}
+            frame_dict: Dict[str, np.ndarray] = {}
+            for ci, ch_name in enumerate(ch_list):
+                arr = _get_frame(mat_channels, ch_name, t)
+                disp = (channel_display or {}).get(ch_name, {})
+                ch_enabled[ch_name] = bool(disp.get("enabled", True))
+                color_name: str = disp.get("color") or ""
+                ch_colors[ch_name] = (
+                    CHANNEL_COLORS.get(color_name)
+                    or default_colors[ci % len(default_colors)]
+                )
+                if arr is not None:
+                    frame_dict[ch_name] = arr
+            if frame_dict:
+                rgb = _composite_frame(frame_dict, ch_colors, ch_enabled, lut_settings=None)
+            else:
+                rgb = np.zeros((H, W, 3), dtype=np.uint8)
+
+            # ── Per-object colored mask for this segmentation channel ──
+            if masks.ndim == 3 and t < masks.shape[0]:
+                frame_mask = np.asarray(masks[t], dtype=np.int32)
+                overlay = rgb.astype(np.float32)
+                label_ids = np.unique(frame_mask)
+                for lid in label_ids:
+                    if lid == 0:
+                        continue
+                    obj_pixels = frame_mask == lid
+                    color = _LABEL_PALETTE[(int(lid) - 1) % len(_LABEL_PALETTE)]
+                    for c in range(3):
+                        overlay[obj_pixels, c] = (
+                            overlay[obj_pixels, c] * (1.0 - mask_alpha)
+                            + color[c] * mask_alpha
+                        )
+                rgb = np.clip(overlay, 0, 255).astype(np.uint8)
+
+            # ── Scale bar + channel labels ──
+            needs_overlay = (
+                (show_scale_bar and pixel_size_um > 0) or show_channel_labels
+            )
+            if needs_overlay:
+                rgb = _draw_image_overlays(
+                    rgb,
+                    t_index=t,
+                    pixel_size_um=pixel_size_um,
+                    show_scale_bar=show_scale_bar,
+                    scale_bar_um=scale_bar_um,
+                    show_channel_labels=show_channel_labels,
+                    channel_names=[n for n in ch_list if ch_enabled.get(n, True)],
+                    channel_colors=ch_colors,
+                    frame_timestamps=None,
+                )
+
+            fname = os.path.join(output_dir, f"overlay_{safe_seg}_frame_{t:04d}.{ext}")
+            if ext == "tiff":
+                imageio.imwrite(fname, rgb)
+            else:
+                imageio.imwrite(fname, rgb, quality=92)
+            written.append(fname)
+
+            done += 1
+            if progress_cb is not None and (done % 4 == 0 or done == total_frames):
+                progress_cb(int(done / total_frames * 100))
+
+    return written
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _draw_image_overlays(
+    rgb: np.ndarray,
+    t_index: int,
+    pixel_size_um: float,
+    show_scale_bar: bool,
+    scale_bar_um: float,
+    show_channel_labels: bool,
+    channel_names: List[str],
+    channel_colors: Dict[str, Tuple[int, int, int]],
+    frame_timestamps: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Burn scale bar and channel labels into an RGB frame using PIL."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return rgb
+
+    img = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(img)
+    h, w = rgb.shape[:2]
+    margin = 24
+
+    def _font(size: int):
+        candidates = [
+            "Arial.ttf",
+            "DejaVuSans.ttf",
+            "Helvetica.ttc",
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\segoeui.ttf",
+        ]
+        for name in candidates:
+            try:
+                return ImageFont.truetype(name, size)
+            except Exception:
+                continue
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+    if show_scale_bar and pixel_size_um > 0:
+        bar_px = int(round(scale_bar_um / pixel_size_um))
+        if 0 < bar_px < w:
+            thickness = 6
+            x1 = w - margin
+            x0 = x1 - bar_px
+            y0 = h - margin - thickness
+            y1 = h - margin
+            draw.rectangle([x0, y0, x1, y1], fill="white")
+            label = f"{scale_bar_um:g} µm"
+            font = _font(14)
+            try:
+                tw = draw.textlength(label, font=font)
+            except AttributeError:
+                tw = len(label) * 8
+            tx = (x0 + x1) // 2 - int(tw / 2)
+            draw.text((tx, y0 - 18), label, fill="white", font=font)
+
+    if show_channel_labels and channel_names:
+        font = _font(13)
+        line_h = 20
+        x = margin
+        y = margin
+        for name in channel_names:
+            color = channel_colors.get(name, (255, 255, 255))
+            sw = 14
+            draw.rectangle([x, y, x + sw, y + sw], fill=color)
+            draw.text((x + sw + 5, y), name, fill="white", font=font)
+            y += line_h
+
+    return np.asarray(img)
+
 
 def _materialise(data: Any) -> Optional[np.ndarray]:
     if data is None:
@@ -317,22 +576,3 @@ def _get_frame(
     return None
 
 
-def _normalise_frame(frame: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """Scale frame to [0, 255] float32 using percentile LUT bounds."""
-    f = frame.astype(np.float32)
-    vmax = float(f.max())
-    if vmax == 0:
-        return np.zeros_like(f)
-    lo_v = lo * vmax
-    hi_v = hi * vmax if hi > 0 else vmax
-    span = hi_v - lo_v
-    if span <= 0:
-        return np.zeros_like(f)
-    return np.clip((f - lo_v) / span * 255.0, 0, 255)
-
-
-def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
-    h = hex_color.lstrip("#")
-    if len(h) == 6:
-        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return (200, 200, 200)

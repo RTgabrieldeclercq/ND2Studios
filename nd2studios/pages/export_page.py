@@ -24,7 +24,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QRadioButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QPushButton, QRadioButton, QSpinBox, QStackedWidget, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from nd2studios.backend.exporters.composite_exporter import ImageAdjustments
@@ -50,31 +51,36 @@ class ExportPage(QWidget):
         outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(8)
 
-        # Source selector — applies to every tab.
-        src_group = QGroupBox("Source")
-        sl = QHBoxLayout(src_group)
-        self.rb_raw = QRadioButton("Raw")
-        self.rb_proc = QRadioButton("Processed (recipe applied)")
-        self.rb_proc.setChecked(True)
-        sg = QButtonGroup(self)
-        sg.addButton(self.rb_raw)
-        sg.addButton(self.rb_proc)
-        sl.addWidget(self.rb_raw)
-        sl.addWidget(self.rb_proc)
-        sl.addStretch(1)
+        # Top bar: export type selector + summary label.
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(QLabel("Export type:"))
+        self.combo_export_type = QComboBox()
+        self.combo_export_type.addItems(["Raw Image", "Processed Image", "Tracked Objects"])
+        self.combo_export_type.setToolTip(
+            "Raw Image: export from the original ND2 data.\n"
+            "Processed Image: export after the recipe pipeline is applied.\n"
+            "Tracked Objects: export per-object crops from the Results tracking workflow."
+        )
+        self.combo_export_type.currentIndexChanged.connect(self._on_export_type_changed)
+        top_bar.addWidget(self.combo_export_type)
+        top_bar.addStretch(1)
         self.lbl_summary = QLabel("")
-        self.lbl_summary.setStyleSheet(
-            f"color: {Settings.FG_SECONDARY}; font: 9pt;")
-        sl.addWidget(self.lbl_summary)
-        outer.addWidget(src_group)
+        self.lbl_summary.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        top_bar.addWidget(self.lbl_summary)
+        outer.addLayout(top_bar)
 
-        # Tabs.
+        # Stacked widget — index 0: image export tabs; index 1: tracked objects panel.
+        self._stacked = QStackedWidget()
+
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_tab_tiff(), "Z-Projection TIFF")
         self.tabs.addTab(self._build_tab_composite(), "RGB Composite")
         self.tabs.addTab(self._build_tab_movie(), "Movie")
         self.tabs.addTab(self._build_tab_image_sequence(), "Image Sequence")
-        outer.addWidget(self.tabs, stretch=1)
+        self._stacked.addWidget(self.tabs)
+
+        self._stacked.addWidget(self._build_tracked_objects_panel())
+        outer.addWidget(self._stacked, stretch=1)
 
     # ── Tab 1: TIFF stack ──
     def _build_tab_tiff(self) -> QWidget:
@@ -260,23 +266,165 @@ class ExportPage(QWidget):
         layout.addStretch(1)
         return w
 
+    # ── Tracked objects panel ──
+    def _build_tracked_objects_panel(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        info = QLabel(
+            "Exports each tracked object as a cropped image (3× object size), "
+            "optionally with image channels and mask highlight overlay. "
+            "Multiple objects can be tiled side-by-side per output file."
+        )
+        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        options = QGroupBox("Options")
+        form = QFormLayout(options)
+
+        self.combo_tracked_pipeline = QComboBox()
+        self.combo_tracked_pipeline.addItem("(no tracked objects)")
+        self.combo_tracked_pipeline.setToolTip(
+            "Filter by segmentation channel, or choose 'All' to export every "
+            "tracked object regardless of which pipeline produced it."
+        )
+        form.addRow("Pipeline", self.combo_tracked_pipeline)
+
+        self.spin_objects_per_m = QSpinBox()
+        self.spin_objects_per_m.setRange(1, 100)
+        self.spin_objects_per_m.setValue(1)
+        self.spin_objects_per_m.setToolTip(
+            "Number of tracked objects tiled side-by-side per output TIFF/PNG file.")
+        form.addRow("Objects per frame", self.spin_objects_per_m)
+
+        self.cb_tracked_include_image = QCheckBox("Include image channels")
+        self.cb_tracked_include_image.setChecked(True)
+        form.addRow(self.cb_tracked_include_image)
+
+        self.cb_tracked_mask_overlay = QCheckBox("Overlay mask highlight")
+        self.cb_tracked_mask_overlay.setChecked(True)
+        form.addRow(self.cb_tracked_mask_overlay)
+
+        self.combo_tracked_fmt = QComboBox()
+        self.combo_tracked_fmt.addItems(["TIFF", "PNG"])
+        form.addRow("Format", self.combo_tracked_fmt)
+
+        layout.addWidget(options)
+
+        self.btn_export_tracked = QPushButton("Export Tracked Objects…")
+        self.btn_export_tracked.setObjectName("primaryBtn")
+        self.btn_export_tracked.clicked.connect(self._on_export_tracked_objects)
+        layout.addWidget(self.btn_export_tracked)
+
+        layout.addStretch(1)
+        return w
+
+    def _on_export_type_changed(self, index: int) -> None:
+        # 0 = Raw Image, 1 = Processed Image → image tabs; 2 = Tracked Objects → tracked panel.
+        self._stacked.setCurrentIndex(0 if index < 2 else 1)
+
+    def _refresh_tracked_pipelines(self) -> None:
+        self.combo_tracked_pipeline.blockSignals(True)
+        self.combo_tracked_pipeline.clear()
+        results_page = self.main_window.pages.get("results") if self.main_window else None
+        measurements = getattr(results_page, "_measurements", []) if results_page else []
+        tracked = [r for r in measurements if r.get("track_id") is not None]
+        seg_channels = sorted({
+            str(r.get("segmentation_channel", ""))
+            for r in tracked
+            if r.get("segmentation_channel")
+        })
+        if seg_channels:
+            self.combo_tracked_pipeline.addItem("All")
+            for ch in seg_channels:
+                self.combo_tracked_pipeline.addItem(ch)
+        else:
+            self.combo_tracked_pipeline.addItem("(no tracked objects)")
+        self.combo_tracked_pipeline.blockSignals(False)
+
+    def _on_export_tracked_objects(self) -> None:
+        if self.main_window is None or self.main_window.exp_manager.active is None:
+            QMessageBox.information(self, "Nothing to export", "Import a file first.")
+            return
+        results_page = self.main_window.pages.get("results")
+        measurements = getattr(results_page, "_measurements", []) if results_page else []
+        seg_filter = self.combo_tracked_pipeline.currentText()
+        tracked = [
+            r for r in measurements
+            if r.get("track_id") is not None
+            and (seg_filter in ("All", "(no tracked objects)")
+                 or str(r.get("segmentation_channel", "")) == seg_filter)
+        ]
+        if not tracked:
+            QMessageBox.information(
+                self, "No tracked objects",
+                "No tracked objects found. Go to the Results page, run analysis, "
+                "click Compute Measurements, and ensure at least one valid track exists."
+            )
+            return
+        label_masks = getattr(results_page, "_label_masks_for_validation", {})
+        channels_data = getattr(results_page, "_channels_for_validation", {})
+        exp = self.main_window.exp_manager.active
+        channel_display = dict(getattr(exp, "channel_display", None) or {})
+
+        out_dir = QFileDialog.getExistingDirectory(self, "Choose output folder", "")
+        if not out_dir:
+            return
+
+        from nd2studios.backend.exporters.tracked_objects_exporter import export_tracked_objects
+        objects_per_m = int(self.spin_objects_per_m.value())
+        with_image = self.cb_tracked_include_image.isChecked()
+        with_mask = self.cb_tracked_mask_overlay.isChecked()
+        fmt = self.combo_tracked_fmt.currentText().lower()
+
+        try:
+            if self.main_window:
+                self.main_window.set_status_text("Exporting tracked objects…")
+            paths = export_tracked_objects(
+                measurements=tracked,
+                label_masks=label_masks,
+                channels=channels_data,
+                channel_display=channel_display,
+                output_dir=out_dir,
+                objects_per_m=objects_per_m,
+                with_image=with_image,
+                with_mask_overlay=with_mask,
+                fmt=fmt,
+                progress_cb=lambda p: self.main_window.set_progress(p) if self.main_window else None,
+            )
+            if self.main_window:
+                self.main_window.set_progress(0)
+                self.main_window.set_status_text(
+                    f"Exported {len(paths)} tracked object file(s) to {out_dir}")
+            QMessageBox.information(
+                self, "Export complete",
+                f"Wrote {len(paths)} file(s) to:\n{out_dir}"
+            )
+        except Exception as e:
+            if self.main_window:
+                self.main_window.set_progress(0)
+            QMessageBox.warning(self, "Export failed", str(e))
+
     # ── Page lifecycle ──
     def on_activated(self) -> None:
         if self.main_window is None or self.main_window.exp_manager.active is None:
             return
         exp = self.main_window.exp_manager.active
-        # Default to processed if available, raw otherwise. V1.38 Phase 6:
-        # ``has_processed()`` returns True when either ``_processed_channels``
-        # (in-RAM) or ``_processed_view`` (lazy after a workspace release)
-        # has data — so the radio defaults stay sensible after a
-        # Recipe → Export navigation that released RAM.
         has_processed = getattr(exp, "has_processed", lambda: bool(exp._processed_channels))()
-        if has_processed:
-            self.rb_proc.setChecked(True)
-            self.rb_proc.setEnabled(True)
-        else:
-            self.rb_raw.setChecked(True)
-            self.rb_proc.setEnabled(False)
+
+        # Enable/disable the "Processed Image" combo option.
+        model = self.combo_export_type.model()
+        proc_item = model.item(1)
+        if proc_item is not None:
+            proc_item.setEnabled(has_processed)
+        if not has_processed and self.combo_export_type.currentIndex() == 1:
+            self.combo_export_type.setCurrentIndex(0)
+
+        # Refresh tracked objects pipeline selector.
+        self._refresh_tracked_pipelines()
 
         # Z stack mode: z_mode="none" with a multi-Z volume.
         is_zstack = (
@@ -370,7 +518,7 @@ class ExportPage(QWidget):
             return {}, {}, {}, {}
         exp = self.main_window.exp_manager.active
         has_processed = getattr(exp, "has_processed", lambda: bool(exp._processed_channels))()
-        if self.rb_proc.isChecked() and has_processed:
+        if self.combo_export_type.currentText() == "Processed Image" and has_processed:
             # V1.38 Phase 6 — ``processed_view()`` returns the in-RAM
             # dict when present, else an ``EnhancedDataset`` proxy.
             # Materialize each channel on access — exports stream

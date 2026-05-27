@@ -488,11 +488,15 @@ class MultiAxisViewer(QWidget):
 
     def set_channels(self,
                      channels: Dict[str, Any],
-                     channel_display: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+                     channel_display: Optional[Dict[str, Dict[str, Any]]] = None,
+                     n_multipoints: int = 1,
+                     m: int = 0) -> None:
         """Wire up to a flat dict of (T, H, W) channel arrays.
 
-        Used on the Recipe page where M is fixed and Z has been
-        collapsed already.
+        Used on the Recipe page processed viewer. Pass ``n_multipoints`` and
+        ``m`` to enable M-slider navigation when the file has multiple
+        positions — the page drives actual data refresh on M changes via
+        coords_changed.
         """
         self._hist_cache.clear()
         self._cancel_pre_render_worker()
@@ -518,18 +522,33 @@ class MultiAxisViewer(QWidget):
             return
 
         sample = next(iter(channels.values()))
-        n = sample.shape[0]
-        # Hide M / Z sliders entirely.
+        sample_arr = np.asarray(sample)
+        # Guard: a 2D (H, W) single-frame channel must be treated as T=1.
+        # Without this, n = H and the T slider would have H positions where
+        # each "frame" would be a 1-D row — nothing would render.
+        if sample_arr.ndim == 2:
+            n = 1
+        else:
+            n = sample_arr.shape[0]
+        n_multipoints = max(1, int(n_multipoints))
+        self._m = max(0, min(int(m), n_multipoints - 1))
+        # Preserve the current T position when reloading the same or
+        # compatible data (e.g. after M-slider change with same T count).
+        # Reset to 0 only when the new T count is smaller.
+        prev_t = self._t
+        new_t = min(prev_t, max(0, n - 1))
+        # Show M slider when the file has multiple positions; hide Z (collapsed).
         self._configure_slider(self.m_slider, self.m_label, self._m_row,
-                                1, 0, visible=False,
+                                n_multipoints, self._m,
+                                visible=n_multipoints > 1,
                                 play_btn=self._m_play, fps_spin=self._m_fps)
         self._configure_slider(self.z_slider, self.z_label, self._z_row,
                                 1, 0, visible=False,
                                 play_btn=self._z_play, fps_spin=self._z_fps)
         self._configure_slider(self.t_slider, self.t_label, self._t_row,
-                                n, 0, visible=True,
+                                n, new_t, visible=True,
                                 play_btn=self._t_play, fps_spin=self._t_fps)
-        self._t = 0
+        self._t = new_t
         self._update_axis_labels()
 
         names = list(channels.keys())
@@ -579,6 +598,24 @@ class MultiAxisViewer(QWidget):
         if fps_spin is not None:
             fps_spin.setVisible(visible)
 
+    def set_m(self, m: int, *, emit: bool = True) -> None:
+        """Jump to M position without triggering a data-fetch cascade.
+
+        Used by the Recipe page to keep the processed and raw viewer M
+        sliders in sync without recursively firing coords_changed on
+        both sides.
+        """
+        n_m = (self._volume.n_multipoints if self._volume is not None
+               else self.m_slider.maximum() + 1)
+        m = max(0, min(int(m), n_m - 1))
+        self.m_slider.blockSignals(not emit)
+        self.m_slider.setValue(m)
+        self.m_slider.blockSignals(False)
+        self._m = m
+        self._update_axis_labels()
+        if emit:
+            self.coords_changed.emit(self._m, self._t, self._z)
+
     def _populate_chip_strip(self,
                               names: List[str],
                               display: Dict[str, Dict[str, Any]]) -> None:
@@ -588,11 +625,18 @@ class MultiAxisViewer(QWidget):
         self._chip_strip.clear()
 
         cycle = ["green", "red", "cyan", "magenta", "yellow", "blue", "orange"]
+        _named_colors = {"gray", "green", "red", "blue", "cyan", "magenta",
+                         "yellow", "orange", "white"}
         for i, name in enumerate(names):
             cd = display.get(name, {})
+            saved = cd.get("color", "")
+            if not saved:
+                # Use the channel name as the color if it's a recognized color
+                # (e.g. "red","green","blue" channels from an RGB overlay TIFF).
+                saved = name.lower() if name.lower() in _named_colors else cycle[i % len(cycle)]
             chip = ChannelChip(
                 name,
-                color_default=cd.get("color", cycle[i % len(cycle)]),
+                color_default=saved,
                 enabled=bool(cd.get("enabled", True)),
             )
             chip.state_changed.connect(self._on_chip_state)
@@ -994,7 +1038,12 @@ class MultiAxisViewer(QWidget):
                 if data is None:
                     continue
                 try:
-                    frame = np.asarray(data[self._t])
+                    arr = np.asarray(data)
+                    if arr.ndim == 2:
+                        frame = arr
+                    else:
+                        t_idx = min(self._t, arr.shape[0] - 1)
+                        frame = arr[t_idx]
                 except Exception:
                     continue
                 frame_2d = self._normalize_to_2d(frame)
@@ -1110,7 +1159,13 @@ class MultiAxisViewer(QWidget):
                 if data is None:
                     continue
                 try:
-                    frame = np.asarray(data[self._t])
+                    arr = np.asarray(data)
+                    if arr.ndim == 2:
+                        # Single-frame (H, W) channel — no T axis.
+                        frame = arr
+                    else:
+                        t_idx = min(self._t, arr.shape[0] - 1)
+                        frame = arr[t_idx]
                 except Exception:
                     continue
                 frame_2d = self._normalize_to_2d(frame)
@@ -1165,6 +1220,9 @@ class MultiAxisViewer(QWidget):
         else:
             n_t = self.t_slider.maximum() + 1 if self.t_slider.maximum() >= 0 else 0
             self.t_label.setText(f"{self._t + 1}/{n_t}")
+            # M label is driven by the slider range in flat-channel mode.
+            n_m = self.m_slider.maximum() + 1 if self.m_slider.maximum() >= 0 else 1
+            self.m_label.setText(f"{self._m + 1}/{n_m}")
 
     # ── Read-out / round-tripping ──
     def channel_state(self) -> Dict[str, Dict[str, Any]]:
@@ -1224,6 +1282,19 @@ class MultiAxisViewer(QWidget):
         for chip in self._chip_strip:
             self.lut_sidebar.update_swatch(chip.name, chip.color_rgb)
         self._refresh()
+
+    def swap_channels_for_m(self, channels: Dict[str, Any], m: int) -> None:
+        """Swap displayed channels to pre-computed data for M position ``m``.
+
+        Unlike :meth:`set_channels`, this does NOT stop play timers, reset
+        the T position, or rebuild the chip/LUT strip.  For recipe-page
+        instant M navigation only — caller must ensure ``channels`` is the
+        correct pre-computed result for this M.
+        """
+        self._channels = dict(channels)
+        self._m = m
+        self._update_axis_labels()
+        self._do_refresh()
 
     def set_t_playing(self, playing: bool, fps: Optional[float] = None) -> None:
         """Start or stop T-axis playback; optionally set FPS first."""

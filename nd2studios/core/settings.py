@@ -79,10 +79,10 @@ class Settings:
     PAGES = [
         ("import", "📂", "Import", "Load an ND2 or TIFF file and inspect metadata."),
         ("recipe", "🧪", "Recipe", "Build a processing pipeline (trial / accept / reject)."),
-        ("export", "💾", "Export", "Export TIFF stacks, RGB composites, and movies."),
         ("analysis", "🔬", "Analysis", "Run analysis pipelines on loaded data."),
         ("results", "📊", "Results", "Compute measurements from analysis binaries and export CSV / images."),
         ("batch", "⚡", "Batch", "Run a pipeline template over multiple files and aggregate results."),
+        ("export", "💾", "Export", "Export TIFF stacks, RGB composites, movies, and tracked objects."),
     ]
 
     # Status ladder. Forward navigation can require a minimum status.

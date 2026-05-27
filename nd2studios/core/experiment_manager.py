@@ -86,6 +86,10 @@ class ND2StudiosRecord:
     # the recipe on demand. ``processed_view()`` is the accessor pages
     # should call instead of ``_processed_channels`` directly.
     _processed_view: Optional[Any] = field(default=None, repr=False)
+    # All-M processed dataset built after trial/accept when all M positions
+    # have been processed. Each channel is (M, T, H, W). Used by downstream
+    # tabs (analysis, export) to get full M-axis navigation on processed data.
+    _processed_volume: Optional[Any] = field(default=None, repr=False)
     # Per-frame timestamps (seconds since experiment start), if present in ND2.
     _frame_timestamps: Optional[np.ndarray] = field(default=None, repr=False)
     # V1.1: a LazyND2Volume for M/Z scrolling (rebuilt from filepath on load).
@@ -198,6 +202,7 @@ class ND2StudiosRecord:
         return (
             self._processed_channels is not None
             or self._processed_view is not None
+            or self._processed_volume is not None
         )
 
 

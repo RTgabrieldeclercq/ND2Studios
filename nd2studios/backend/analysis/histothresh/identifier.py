@@ -83,6 +83,7 @@ class HistogramThresholdSegmenter:
         mask = apply_spatial_constraints(
             mask,
             min_area=cfg.min_area,
+            max_area=cfg.max_area,
             opening_radius=cfg.opening_radius,
             closing_radius=cfg.closing_radius,
             min_hole_size=cfg.min_hole_size,

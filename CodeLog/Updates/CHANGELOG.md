@@ -4,6 +4,292 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-05-26 (V1.0 tracking-shape-filter)
+
+### Added
+
+- **`nd2studios/backend/results_engine.py`** — `circularity` field added to
+  every measurement row: `4π·area/perimeter²` (range 0–1; 1 = perfect circle;
+  0 if perimeter is zero).  Appears in the Results table under the Shape column
+  group.
+
+### Changed
+
+- **`nd2studios/backend/object_tracker.py`** — `link_objects()` gains two new
+  shape-filter parameters:
+  - `min_circularity: float = 0.0` — objects whose circularity falls below this
+    value are excluded from tracking; they keep `track_id = None`.
+  - `max_eccentricity: float = 1.0` — objects whose eccentricity exceeds this
+    value are excluded from tracking.
+  Both filters default to disabled (pass everything).
+
+  **Bug fix** — bounding-box overlap check added to `_link_group`.  Before
+  accepting a Hungarian-assignment pair, the linker now verifies that the two
+  objects' bounding boxes actually intersect spatially.  Pairs with no bbox
+  overlap receive a cost above `max_displacement_px` and are therefore never
+  linked, preventing unrelated objects that happen to be within the centroid
+  displacement threshold from being incorrectly joined into the same track.
+  The `_bbox()` helper extracts `bbox_min/max_row/col` from a measurement row
+  and expands degenerate (zero-size) bboxes to a 1-px centroid-centred region
+  so the check is non-blocking for edge cases.
+
+- **`nd2studios/pages/results_page.py`** — Object Tracking row gains two new
+  `QDoubleSpinBox` controls:
+  - *Min. circularity* (0.00–1.00, step 0.05, default 0.00 = disabled).
+  - *Max. eccentricity* (0.00–1.00, step 0.05, default 1.00 = disabled).
+  Both values are forwarded to `link_objects()` on every Compute Measurements
+  click.  The `circularity` column is added to the Shape group in
+  `_COLUMN_GROUPS` and to `_DEFAULT_COLUMNS`.
+
+---
+
+## [Unreleased] - 2026-05-26 (V1.0 export-tab-restructure)
+
+### Added
+
+- **`nd2studios/backend/exporters/tracked_objects_exporter.py`** — NEW backend
+  module.  `export_tracked_objects(measurements, label_masks, channels,
+  channel_display, output_dir, objects_per_m, with_image, with_mask_overlay,
+  fmt, progress_cb)` renders each tracked object as a 3× crop (matching the
+  validation dialog), tiles `objects_per_m` crops side-by-side per output file,
+  and writes `tracked_objects_M000.tif`, `tracked_objects_M001.tif`, … (or a
+  numbered PNG series for multi-frame PNG output).  Returns the list of written
+  paths.
+
+### Changed
+
+- **`nd2studios/core/settings.py`** — Export page moved to the last position in
+  `PAGES`; new order is Import → Recipe → Analysis → Results → Batch → Export.
+
+- **`nd2studios/pages/export_page.py`** — complete UI restructure:
+  - The `QGroupBox("Source")` with `rb_raw` / `rb_proc` radio buttons is
+    replaced by a single `combo_export_type` (`QComboBox`) at the top of the
+    page with three options: **Raw Image**, **Processed Image**, and **Tracked
+    Objects**.  Selecting Raw or Processed shows the existing image-export tab
+    widget; selecting Tracked Objects shows the new tracked-objects panel.
+  - The page body is now a `QStackedWidget` (index 0: image tabs, index 1:
+    tracked objects panel).
+  - **Tracked Objects panel** — new panel with pipeline selector
+    (`combo_tracked_pipeline`, populated on page activation from available
+    segmentation channels in `ResultsPage._measurements`), *Objects per frame*
+    spinbox (1–100, default 1), *Include image channels* checkbox, *Overlay
+    mask highlight* checkbox, format selector (TIFF / PNG), and an
+    *Export Tracked Objects…* button that calls `export_tracked_objects`.
+  - `on_activated()` now enables/disables the *Processed Image* combo option
+    (instead of the old radio button) and refreshes the pipeline selector.
+  - `_channels_and_state()` now reads `combo_export_type.currentText()` instead
+    of checking `rb_proc.isChecked()`.
+
+---
+
+## [Unreleased] - 2026-05-26 (V1.0 tracked-object-validation-v3)
+
+### Added
+
+- **`nd2studios/widgets/track_validation_dialog.py`** — **Accept All** and
+  **Reject All** buttons in the bottom bar.  Each applies its decision to
+  every undecided panel in the current batch, then triggers the 400 ms
+  visual-confirmation delay before loading the next batch.
+
+### Changed
+
+- **`nd2studios/backend/object_tracker.py`** — `link_objects()` gains a
+  `min_track_length: int = 2` parameter.  Tracks whose frame count falls
+  below this threshold receive `track_id = None` and are excluded from
+  validation.  The threshold is clamped to ≥ 1 internally.
+
+- **`nd2studios/pages/results_page.py`** — the tracking controls are now
+  presented as a dedicated **Object Tracking** parameter row (below the
+  main controls row) with two labelled spinboxes:
+  - *Link distance (px)* — max centroid displacement between frames
+    (default 100; was `Max disp. (px)` in the controls row).
+  - *Min. track length (frames)* — minimum consecutive frames for a valid
+    track (default 2).
+  Both values are forwarded to `link_objects()` on every Compute Measurements
+  click.
+
+---
+
+## [Unreleased] - 2026-05-26 (V1.0 tracked-object-validation-v2)
+
+### Changed
+
+- **`nd2studios/widgets/track_validation_dialog.py`** — complete redesign of
+  the validation dialog:
+  - **3× crop** — `_CROP_FACTOR = 3.0`; crop now spans center ± 1.5× object
+    bbox half-extent (previously 2×, i.e., ± 1× half-extent).
+  - **1/2/4-up mode selector** — three toggle buttons at the top-right
+    ("1", "2", "4") switch between single, side-by-side, and 2×2 quartet
+    layouts.  Mode can be changed at any time; `_batch_start` is
+    realigned to a clean batch boundary for the new mode size.
+  - **`_TrackPanel` inner widget** — each slot in the grid is an independent
+    `_TrackPanel(QWidget)` with its own `ImageCanvas`, track-info label,
+    and per-track **Accept** / **Reject** buttons.  After a decision the
+    panel's border turns green (accepted) or red (rejected) and its buttons
+    are disabled.
+  - **Batch auto-advance** — once every active panel in the current batch has
+    been decided, the dialog waits 400 ms (so the user can see the final
+    colours) then loads the next batch.  The dialog closes (`exec()` returns)
+    when all tracked objects have been reviewed.
+  - **Shared T controls with "▶ Play All / ⏸ Pause All"** — a single T
+    slider, T spinbox, and FPS spinbox drive all visible panels in sync.
+    Play / Pause button renamed "Play All" / "Pause All".
+  - Previously-made decisions are preserved when switching view mode.
+
+---
+
+## [Unreleased] - 2026-05-26 (V1.0 tracked-object-validation)
+
+### Added
+
+- **`nd2studios/backend/object_tracker.py`** (NEW) — `link_objects(rows,
+  max_displacement_px=100.0)` runs a frame-to-frame Hungarian linker
+  (`scipy.optimize.linear_sum_assignment`) on the measurement list returned by
+  `compute_measurements()`.  Groups rows by `(segmentation_channel,
+  m_position)`, matches objects between consecutive frames whose centroid
+  Euclidean distance is ≤ `max_displacement_px`, and adds three columns to
+  every dict: `track_id` (int or None), `track_length` (int), and
+  `track_validation` ("unvalidated" / None).  Tracks spanning only one frame
+  receive `track_id = None`.
+
+- **`nd2studios/widgets/track_validation_dialog.py`** (NEW) —
+  `TrackValidationDialog(QDialog)` opens at 90 % of primary screen size and
+  iterates through unvalidated tracked objects one at a time.  For each track
+  it pre-renders all T frames as a cropped composite (2× the union bounding box,
+  clamped to FOV) with a yellow-orange mask highlight.  Controls: T slider,
+  play/pause toggle, FPS spinbox (0.5–60).  Buttons: **Accept** (keeps all
+  rows for that track), **Reject** (all corresponding rows removed from the
+  table), **Close** (exits early).  After every decision the dialog
+  auto-advances to the next unvalidated track.
+
+- **`nd2studios/pages/results_page.py`** — "Tracking" column group added to
+  the column selector sidebar with columns `track_id`, `track_length`, and
+  `track_validation`; all three are on by default.
+
+- **`nd2studios/pages/results_page.py`** — `Max disp. (px)` `QSpinBox`
+  (range 1–9999, default 100) in the top controls row; its value is forwarded
+  to `link_objects` on every Compute Measurements click.
+
+- **`nd2studios/pages/results_page.py`** — "Validate Tracked Objects"
+  `QPushButton` in the export row; enabled only after at least one
+  multi-frame track is found.  Clicking opens `TrackValidationDialog`; on
+  close, rejected tracks' rows are removed from `self._measurements` and the
+  table refreshes.
+
+- **`CodeLog/ClaudesPlan/V1.0_tracked_object_validation.md`** — permanent
+  record of design decisions, algorithm choice, and V1 scope limitations.
+
+---
+
+## [Unreleased] - 2026-05-26 (V1.0 recipe-page-fixes)
+
+### Added
+
+- **`nd2studios/pages/recipe_page.py`** — `▶ Play All` / `⏸ Pause` toggle button
+  in the trial-controls area, wired to `viewer_proc.set_t_playing()`.  Enabled
+  after a trial completes; reset on Reject / Clear All.  Mirrors the `>` play
+  button already in the slider row but gives it a dedicated, prominently-placed
+  control.
+
+### Changed
+
+- **`nd2studios/pages/analysis_page.py`** — `on_activated` and
+  `_reload_for_selected_record` now prefer `exp._processed_channels` over
+  `exp._raw_volume` when a recipe has been accepted.  The Analysis viewer
+  therefore shows processed data automatically upon tab entry, matching what the
+  analysis pipeline will actually receive.  Raw data remains intact on the record.
+
+### Bug Fixes
+
+- **`nd2studios/pages/recipe_page.py`** — `_on_trial_done_primary`: the global
+  progress bar was left at 100 % after a trial completed because `RecipeWorker`
+  emits `progress(100)` on finish but nothing reset it.  Now calls
+  `main_window.set_progress(0)` and sets a "Trial complete — Accept or Reject."
+  status message.
+- **`nd2studios/pages/recipe_page.py`** — `_on_error`: also resets the progress
+  bar to 0 and sets a "Recipe failed." status message on worker errors.
+- **`nd2studios/widgets/multi_axis_viewer.py`** — `set_channels`: 2-D `(H, W)`
+  single-frame channels were treated as `T = H` frames, configuring the slider
+  with `H` positions and making `data[t]` return a 1-D row rather than a 2-D
+  frame (renders nothing).  Fixed: 2-D inputs are now treated as `T = 1`.
+- **`nd2studios/widgets/multi_axis_viewer.py`** — `set_channels`: the T slider
+  was always reset to frame 0 when new processed data arrived (e.g. after a
+  trial on a different M position).  Now preserves the current T position when
+  the new data has at least that many frames, so the user stays on the frame
+  they were inspecting.
+- **`nd2studios/widgets/multi_axis_viewer.py`** — `_compose_current_frame` and
+  `_render_current_frame_gpu`: when a channel array is 2-D `(H, W)`, index it
+  as a single frame instead of silently swallowing an IndexError and rendering
+  nothing.
+
+## [Unreleased] - 2026-05-25 (V1.0 results-column-selector)
+
+### Added
+
+- **`nd2studios/widgets/config_wizard.py`** — new module.
+  `ConfigWizard(QDialog)`: two-step guided wizard (Analysis + Results nav
+  sidebar + `QStackedWidget`). Analysis panel has a `QComboBox` for pipeline
+  selection and a `ParamEditor`; Results panel has the same flat checkbox groups
+  as the results sidebar, live-synced to `results_page._col_checkboxes`. Cancel
+  restores original checkbox states; Accept applies all changes to the live page.
+  `apply_config(cfg)` pre-populates the wizard from a saved dict.
+  `get_config()` returns a serialisable dict.
+- **`nd2studios/widgets/config_wizard.py`** — `SavePreviewDialog(QDialog)`:
+  read-only diff view (Analysis / Results nav) showing lines colour-coded green
+  (`+`), red (`−`), orange (`→`). Browse button lets the user change the save
+  path before confirming.
+- **`nd2studios/widgets/config_wizard.py`** — `build_config_from_pages`,
+  `apply_config_to_pages`, `build_config_diff` helpers; `CONFIG_EXTENSION =
+  ".nd2s_cfg"` constant.
+- **`nd2studios/pages/results_page.py`** — `_COLUMN_GROUPS` catalogue: 6 static
+  groups (Identity, Size, Change Δ, Position, Shape, Bounding box) with all
+  column keys and display labels; `_DEFAULT_COLUMNS` set of keys shown on first
+  open.
+- **`nd2studios/pages/results_page.py`** — `ResultsPage._build_columns_sidebar()`:
+  permanent left panel (flat `QVBoxLayout`, every checkbox and section-header
+  label at `_CB_HEIGHT = 24` px) with an initially-hidden Intensity group. "All"
+  / "None" buttons at the bottom.
+- **`nd2studios/pages/results_page.py`** — `ResultsPage._sync_intensity_columns(rows)`:
+  dynamically registers `mean_intensity_*` / `std_intensity_*` checkboxes into
+  the Intensity group on first `_on_compute` call; shows the group on first add.
+- **`nd2studios/core/main_window.py`** — `_configure()`: opens `ConfigWizard`
+  (pre-populated from `self._cfg_data` if a config file has been loaded/saved).
+- **`nd2studios/core/main_window.py`** — `_save_config()`: if no baseline config
+  exists, opens `ConfigWizard` then prompts for a file path; otherwise opens
+  `SavePreviewDialog` with a diff against the baseline and writes the new config
+  on Accept. Updates `self._cfg_path` and `self._cfg_data`.
+- **`nd2studios/core/main_window.py`** — `_load_config()`: opens a `QFileDialog`
+  for `*.nd2s_cfg`, calls `apply_config_to_pages` to push all settings into the
+  live page widgets, and records the loaded config as the new baseline.
+- **`nd2studios/core/main_window.py`** — `self._cfg_path: Optional[str]` and
+  `self._cfg_data: Optional[dict]` instance variables tracking the active config
+  file path and its last loaded/saved content.
+
+### Changed
+
+- **`nd2studios/core/main_window.py`** — sidebar bottom buttons: removed "New
+  Session"; replaced "Save Session" / "Load Session" with "Save" / "Load" (config
+  file ops); added "Configure" button opening `ConfigWizard`.
+- **`nd2studios/pages/results_page.py`** — column sidebar layout changed from
+  `QGroupBox`-per-group to a flat `QVBoxLayout` with section-header `QLabel`s
+  and `QFrame` separators; all rows fixed to `_CB_HEIGHT = 24` px for uniform
+  spacing. Removed `_ResultsConfigDialog` and the "Configure…" button (replaced
+  by the main-window "Configure" sidebar button).
+- **`nd2studios/pages/results_page.py`** — `QTableView.setAlternatingRowColors`
+  changed from `True` → `False`; explicit stylesheet sets uniform
+  `background-color: BG_PRIMARY`, `color: FG_PRIMARY`, `border-bottom` grid
+  lines using `BORDER_COLOR`, and `BG_HOVER` for selected rows.
+- **`nd2studios/pages/results_page.py`** — `_update_table(rows)` now filters row
+  dicts to only the columns whose sidebar checkbox is checked before constructing
+  `_MeasurementsModel`; live toggling re-renders without recomputing measurements.
+- **`nd2studios/pages/results_page.py`** — `save_to_experiment` / `load_from_experiment`
+  persist `selected_columns` (list of checked column keys) in `exp.results_config`
+  alongside the existing `pipeline` and `image_format` entries.
+- **`nd2studios/pages/results_page.py`** — splitter restructured from 2-pane
+  (table | summary) to 3-pane (columns sidebar | table | summary).
+
+---
+
 ## [Unreleased] - 2026-05-24 (V1.0 multifile-analysis-perf)
 
 ### Added

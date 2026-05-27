@@ -279,7 +279,14 @@ def materialize_from_volume(
         plane = np.asarray(plane)
         if plane.ndim != 2:
             plane = np.squeeze(plane)
-            if plane.ndim != 2:
+            if plane.ndim == 3 and plane.shape[-1] in (3, 4):
+                # RGB/RGBA frame — extract the color component that matches
+                # this channel index.  When the volume reports n_channels=3
+                # for an RGB TIFF (set by read_tiff_meta_fast), c=0/1/2
+                # maps to R/G/B, preserving per-object color in the viewer.
+                comp = min(int(c), plane.shape[-1] - 1)
+                plane = plane[..., comp]
+            elif plane.ndim != 2:
                 plane = plane.reshape(h, w)
         if plane.dtype != out_dtype:
             plane = plane.astype(out_dtype)
