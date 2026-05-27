@@ -863,9 +863,16 @@ class RecipePage(QWidget):
                 self._columns[0].viewer_raw.set_t_playing(False)
         self.btn_play_proc.setText("▶  Play All")
 
+    def _record(self, action_type: str, label: str, **params) -> None:
+        if self.main_window is None:
+            return
+        from nd2studios.backend.macro_engine import MacroAction
+        self.main_window.record_macro_action(MacroAction(action_type, label, params))
+
     def _on_accept(self) -> None:
         if self._trial_step is None:
             return
+        plugin_name, plugin_params = self._trial_step
         self._recipe.append(self._trial_step)
         self._trial_step = None
         self.btn_accept.setEnabled(False)
@@ -879,6 +886,17 @@ class RecipePage(QWidget):
             )
             self.main_window.exp_manager.set_status("preprocessed")
             self._commit_recipe_stage()
+        # Record the accepted step for macro.
+        param_preview = ", ".join(
+            f"{k}={v}" for k, v in list(plugin_params.items())[:2]
+        )
+        label = f"Recipe: {plugin_name}" + (f" ({param_preview})" if param_preview else "")
+        self._record(
+            "recipe_add_step", label,
+            plugin=plugin_name,
+            plugin_params=plugin_params,
+            normalized=self._normalized,
+        )
         # Mark secondary records preprocessed too.
         for col in self._columns[1:]:
             if col.record is not None:
@@ -961,6 +979,7 @@ class RecipePage(QWidget):
         self._refresh_recipe_list()
         self._cancel_allm_workers()
         self._all_m_results.clear()
+        self._record("recipe_remove_last", "Remove last recipe step")
         if self.main_window is not None and self.main_window.exp_manager.active is not None:
             exp = self.main_window.exp_manager.active
             exp._processed_volume = None
@@ -976,6 +995,7 @@ class RecipePage(QWidget):
         self._refresh_recipe_list()
         self._cancel_allm_workers()
         self._all_m_results.clear()
+        self._record("recipe_clear", "Clear all recipe steps")
         if self.main_window is not None and self.main_window.exp_manager.active is not None:
             exp = self.main_window.exp_manager.active
             self._cancel_extra_workers()
@@ -987,6 +1007,28 @@ class RecipePage(QWidget):
                 rec._processed_volume = None
                 if rec._raw_channels:
                     self._set_proc_channels(col, rec._raw_channels, rec)
+
+    # ── Macro replay ──
+    def _replay_add_step(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
+        """Apply one recipe_add_step action during macro replay."""
+        plugin = action.params.get("plugin", "")
+        plugin_params = action.params.get("plugin_params", {})
+        normalized = bool(action.params.get("normalized", False))
+        if not plugin:
+            return
+        idx = self.combo_plugin.findText(plugin)
+        if idx < 0:
+            return
+        self.combo_plugin.blockSignals(True)
+        self.combo_plugin.setCurrentIndex(idx)
+        self.combo_plugin.blockSignals(False)
+        self._on_plugin_changed(plugin)
+        self.param_editor.set_values(plugin_params)
+        self._normalized = normalized
+        self.cb_normalized.blockSignals(True)
+        self.cb_normalized.setChecked(normalized)
+        self.cb_normalized.blockSignals(False)
+        self._on_trial()
 
     # ── Save / Load recipe ──
     def _on_save_recipe(self) -> None:

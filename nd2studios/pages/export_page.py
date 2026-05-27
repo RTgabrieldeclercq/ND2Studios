@@ -610,6 +610,8 @@ class ExportPage(QWidget):
                 m_index=exp.m_index,
                 crop_rect=exp.crop_rect,
             )
+            self._record_macro("export_tiff", "Export TIFF Z-Stack",
+                               bit_depth=self.combo_tiff_bitdepth.currentText())
             self._run_export(req, "Building Z stack TIFF…")
             return
 
@@ -633,6 +635,8 @@ class ExportPage(QWidget):
             pixel_size_um=self._pixel_size_um(),
             bit_depth=self.combo_tiff_bitdepth.currentText(),
         )
+        self._record_macro("export_tiff", "Export TIFF Stack",
+                           bit_depth=self.combo_tiff_bitdepth.currentText())
         self._run_export(req, "Writing TIFF…")
 
     def _on_export_composite(self) -> None:
@@ -655,6 +659,7 @@ class ExportPage(QWidget):
             pixel_size_um=self._pixel_size_um(),
             lut_settings=lut_settings,
         )
+        self._record_macro("export_composite", "Export RGB Composite TIFF")
         self._run_export(req, "Writing RGB composite…")
 
     def _movie_options_from_ui(self) -> MovieOptions:
@@ -744,6 +749,19 @@ class ExportPage(QWidget):
             lut_settings=lut_settings,
             image_adjustments=adjustments,
         )
+        self._record_macro(
+            "export_movie", f"Export Movie ({opts.codec}, {opts.fps:.0f} fps)",
+            fps=opts.fps,
+            format=opts.codec,
+            show_scale_bar=opts.show_scale_bar,
+            scale_bar_um=opts.scale_bar_um,
+            scale_bar_color=opts.scale_bar_color,
+            scale_bar_position=opts.scale_bar_position,
+            show_timestamp=opts.show_timestamp,
+            timestamp_position=opts.timestamp_position,
+            timestamp_color=opts.timestamp_color,
+            show_channel_labels=opts.show_channel_labels,
+        )
         self._run_export(req, "Rendering movie…")
 
     def _on_export_image_sequence(self) -> None:
@@ -802,6 +820,50 @@ class ExportPage(QWidget):
             crop_rect=exp.crop_rect,
         )
         self._run_export(req, "Writing image sequence…")
+
+    # ── Macro recording / replay ──────────────────────────────────────────────
+
+    def _record_macro(self, action_type: str, label: str, **params) -> None:
+        mw = self.main_window
+        if mw is None:
+            return
+        from nd2studios.backend.macro_engine import MacroAction
+        mw.record_macro_action(MacroAction(action_type, label, params))
+
+    def _replay_export(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
+        """Apply an export_* macro action to the current file."""
+        t = action.params if isinstance(action.params, dict) else {}
+        action_type = action.action_type
+
+        if action_type == "export_tiff":
+            bd = t.get("bit_depth", "uint16")
+            if hasattr(self, "combo_tiff_bitdepth"):
+                idx = self.combo_tiff_bitdepth.findText(str(bd))
+                if idx >= 0:
+                    self.combo_tiff_bitdepth.setCurrentIndex(idx)
+            self._on_export_tiff()
+
+        elif action_type == "export_composite":
+            self._on_export_composite()
+
+        elif action_type == "export_movie":
+            if hasattr(self, "spin_fps") and "fps" in t:
+                self.spin_fps.setValue(float(t["fps"]))
+            if hasattr(self, "combo_movie_fmt") and "format" in t:
+                idx = self.combo_movie_fmt.findText(str(t["format"]))
+                if idx >= 0:
+                    self.combo_movie_fmt.setCurrentIndex(idx)
+            if hasattr(self, "cb_scalebar"):
+                self.cb_scalebar.setChecked(bool(t.get("show_scale_bar", False)))
+            if hasattr(self, "spin_scalebar_um") and "scale_bar_um" in t:
+                self.spin_scalebar_um.setValue(float(t["scale_bar_um"]))
+            if hasattr(self, "cb_timestamp"):
+                self.cb_timestamp.setChecked(bool(t.get("show_timestamp", False)))
+            if hasattr(self, "cb_channel_labels"):
+                self.cb_channel_labels.setChecked(
+                    bool(t.get("show_channel_labels", False))
+                )
+            self._on_export_movie()
 
     # ── Worker plumbing ──
     def _run_export(self, request: ExportRequest, label: str) -> None:

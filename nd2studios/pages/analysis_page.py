@@ -725,6 +725,14 @@ class AnalysisPage(QWidget):
                 if reply != QMessageBox.StandardButton.Yes:
                     return
 
+        # Record this run for macro replay.
+        self._record_macro_action(
+            "analysis_run",
+            f"Run: {pipeline_name}",
+            pipeline=pipeline_name,
+            pipeline_params=params,
+        )
+
         # Store run context for sequential multi-M execution.
         self._run_pipeline_cls = pipeline_cls
         self._run_params = params
@@ -932,6 +940,32 @@ class AnalysisPage(QWidget):
         self.btn_cancel.setEnabled(False)
         self.lbl_status.setText(status)
         self.btn_screen.setEnabled(self._has_data())
+
+    # ── Macro recording / replay ──────────────────────────────────────────────
+
+    def _record_macro_action(self, action_type: str, label: str, **params) -> None:
+        mw = getattr(self, "main_window", None)
+        if mw is None:
+            return
+        from nd2studios.backend.macro_engine import MacroAction
+        mw.record_macro_action(MacroAction(action_type, label, params))
+
+    def _replay_run(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
+        """Apply an analysis_run macro action to the current file."""
+        pipeline_name = action.params.get("pipeline", "")
+        pipeline_params = action.params.get("pipeline_params", {})
+        if not pipeline_name:
+            return
+        idx = self.combo_pipeline.findText(pipeline_name)
+        if idx < 0:
+            return
+        self.combo_pipeline.blockSignals(True)
+        self.combo_pipeline.setCurrentIndex(idx)
+        self.combo_pipeline.blockSignals(False)
+        self._on_pipeline_changed(pipeline_name)
+        if pipeline_params:
+            self.param_editor.set_values(pipeline_params)
+        self._on_run()
 
     # ── V1.37 Phase 5 — JobRunner signal dispatch ────────────────────────────
 

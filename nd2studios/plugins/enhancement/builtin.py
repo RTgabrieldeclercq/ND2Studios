@@ -125,22 +125,45 @@ class MedianFilterPlugin(EnhancementPlugin):
 @PluginBase.register
 class BackgroundSubtractPlugin(EnhancementPlugin):
     name = "Background Subtract"
-    description = "Gaussian-blur background subtraction"
+    description = "Background subtraction via Rolling Ball or Gaussian blur"
 
     def get_params(self) -> List[ParamSpec]:
         return [
-            ParamSpec("sigma", "BG sigma (px)", "float", 100.0, 10.0, 500.0, 10.0,
-                      tooltip="Gaussian sigma for background estimation"),
+            ParamSpec("mode", "Mode", "choice", "Rolling Ball",
+                      choices=["Rolling Ball", "Gaussian Blur"],
+                      tooltip="Rolling Ball: morphological opening-based estimation (robust to bright objects).\n"
+                              "Gaussian Blur: fast Gaussian-smoothed background estimate."),
+            ParamSpec("radius", "Ball radius (px)", "float", 50.0, 5.0, 500.0, 5.0,
+                      tooltip="Radius of the rolling ball. Larger values capture broader background variations.\n"
+                              "Typical range: 50–100 px for wide-field, 10–30 px for confocal."),
+            ParamSpec("sigma", "Gaussian sigma (px)", "float", 100.0, 10.0, 500.0, 10.0,
+                      tooltip="Gaussian blur sigma for background estimation (Gaussian Blur mode only)."),
         ]
+
+    @staticmethod
+    def _rolling_ball_bg(frame: np.ndarray, radius: float) -> np.ndarray:
+        """Estimate background via morphological opening with a disk-shaped kernel."""
+        r = max(1, int(np.round(radius)))
+        y, x = np.ogrid[-r:r + 1, -r:r + 1]
+        kernel = np.where(x ** 2 + y ** 2 <= r ** 2, 1, 0).astype(np.uint8)
+        # erosion then dilation (opening) approximates rolling-ball background
+        eroded = cv2.erode(frame, kernel)
+        background = cv2.dilate(eroded, kernel)
+        return background
 
     def execute(self, volume: np.ndarray, params: Dict[str, Any],
                 progress_cb=None) -> np.ndarray:
+        mode = params.get("mode", "Rolling Ball")
+        radius = params.get("radius", 50.0)
         sigma = params.get("sigma", 100.0)
         T = volume.shape[0]
         result = np.zeros_like(volume)
         for t in range(T):
             frame = volume[t].astype(np.float32)
-            bg = cv2.GaussianBlur(frame, (0, 0), sigma)
+            if mode == "Rolling Ball":
+                bg = self._rolling_ball_bg(frame, radius)
+            else:
+                bg = cv2.GaussianBlur(frame, (0, 0), sigma)
             diff = np.clip(frame - bg, 0, None)
             result[t] = diff.astype(volume.dtype)
             if progress_cb and (t % 10 == 0):

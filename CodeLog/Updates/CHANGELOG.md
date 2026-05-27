@@ -4,6 +4,74 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-05-26 (V1.0 macro-recorder)
+
+### Added
+
+- **`nd2studios/backend/macro_engine.py`** — NEW backend module (no Qt). Defines
+  `MacroAction` dataclass (`action_type`, `label`, `params: dict`, `enabled: bool`,
+  `timestamp: float`) and `MacroRecorder` (start / pause / resume / cancel /
+  finish). `save_macro(name, actions, path)` and `load_macro(path)` serialize to
+  `.nd2s_macro.json`. `list_macros(directory)` enumerates macro files.
+
+- **`nd2studios/widgets/macro_dialog.py`** — Non-modal `MacroDialog(QDialog)` with
+  three panels managed by a `QStackedWidget`:
+  - **Manage** — create (with name) or open an existing `.nd2s_macro.json`.
+  - **Record** — live feed of recorded actions with animated ● REC indicator;
+    Pause/Resume toggle, Cancel, and Finish buttons. Finish prompts for a save path.
+  - **Edit** — drag-to-reorder list of `_ActionRowWidget` blocks. Each block has
+    an enabled checkbox, label, **Edit** button (opens param key-value editor), and
+    Delete (✕) button. **Run Macro** button replays all enabled actions on the
+    currently loaded file. **Save As…** persists edits.
+
+- **`MainWindow.macro_action_recorded = Signal(dict)`** — class-level PySide6
+  signal emitted whenever a macro action is captured. Consumed by `MacroDialog`
+  to update its live-record list without polling.
+
+- **`MainWindow.macro_recorder: MacroRecorder`** — per-session recorder instance
+  initialized in `__init__`.
+
+- **`MainWindow._open_macro()`**, **`record_macro_action(action)`**,
+  **`replay_macro_action(action)`** — sidebar button handler, recording helper
+  (emits `macro_action_recorded`), and action dispatcher for replay (routes to
+  `recipe._replay_add_step`, `analysis._replay_run`, or `export._replay_export`).
+
+- **Sidebar Macro button** (`🎬  Macro`) added to the bottom control group in
+  `MainWindow._build_sidebar()`. Opens / raises the `MacroDialog`.
+
+- **Recipe page recording hooks** (`nd2studios/pages/recipe_page.py`):
+  - `_record(action_type, label, **params)` helper forwards to
+    `main_window.record_macro_action`.
+  - `_on_accept()` records `recipe_add_step` with `plugin`, `plugin_params`,
+    `normalized`.
+  - `_on_remove_last()` records `recipe_remove_last`.
+  - `_on_clear()` records `recipe_clear`.
+  - `_replay_add_step(action)` sets `combo_plugin`, applies params, calls
+    `_on_trial()` for replay.
+
+- **Analysis page recording hook** (`nd2studios/pages/analysis_page.py`):
+  - `_record_macro_action(action_type, label, **params)` helper.
+  - `_on_run()` records `analysis_run` with `pipeline` and `pipeline_params`.
+  - `_replay_run(action)` sets pipeline + params, calls `_on_run()` for replay.
+
+- **Export page recording hooks** (`nd2studios/pages/export_page.py`):
+  - `_record_macro(action_type, label, **params)` helper.
+  - `_on_export_tiff()` records `export_tiff` (bit_depth).
+  - `_on_export_composite()` records `export_composite`.
+  - `_on_export_movie()` records `export_movie` (fps, format, scale_bar flags, etc.).
+  - `_replay_export(action)` restores widget state and triggers the matching export slot.
+
+- **Batch page Macro section** (`nd2studios/pages/batch_page.py`):
+  - New `QGroupBox("Macro")` with macro file picker + "Run macro instead of
+    template" checkbox.
+  - `_on_run_macro_batch()` — iterates the file list; for each file, loads it via
+    the Import page then calls `main_window.replay_macro_action()` for every
+    enabled action.
+  - `save_to_experiment` / `load_from_experiment` persist `macro_path` and
+    `use_macro` in `exp.batch_config`.
+
+---
+
 ## [Unreleased] - 2026-05-26 (V1.0 tracking-shape-filter)
 
 ### Added

@@ -30,7 +30,7 @@ import os
 from typing import Any, Dict, Optional
 
 from PySide6.QtCore import (
-    QEasingCurve, QEvent, QPropertyAnimation, QSize, Qt, QTimer,
+    QEasingCurve, QEvent, QPropertyAnimation, QSize, Qt, QTimer, Signal,
 )
 from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import (
@@ -60,6 +60,10 @@ from nd2studios.widgets.custom_grips import CustomGrip
 
 class MainWindow(QMainWindow):
     """Frameless main window with collapsible sidebar and three pages."""
+
+    # Emitted whenever a macro action is recorded so the MacroDialog can
+    # append the block to its live-feed list while the user works.
+    macro_action_recorded = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -105,6 +109,11 @@ class MainWindow(QMainWindow):
         # Config file state — set on Load or after a successful Save.
         self._cfg_path: Optional[str] = None
         self._cfg_data: Optional[Dict[str, Any]] = None
+
+        # Macro recorder — records meaningful user actions for replay.
+        from nd2studios.backend.macro_engine import MacroRecorder
+        self.macro_recorder = MacroRecorder()
+        self._macro_dialog: Optional[object] = None
 
         self._build_ui()
         self._install_grips()
@@ -243,6 +252,8 @@ class MainWindow(QMainWindow):
             ("  ⚙  Performance",
              self._open_performance_settings,
              "GPU acceleration and multi-resolution pyramid settings (V1.39)"),
+            ("  🎬  Macro",     self._open_macro,
+             "Record, edit, and replay action macros across files"),
         ]:
             btn = QPushButton(label)
             btn.setObjectName("sessionBtn")
@@ -764,6 +775,58 @@ class MainWindow(QMainWindow):
                     f"(GPU analysis: {'on' if effective else 'off'}, "
                     f"pyramids: {'on' if Settings.BUILD_PYRAMIDS else 'off'})."
                 )
+
+    # ── Macro recorder ─────────────────────────────────────────────
+    def _open_macro(self) -> None:
+        from nd2studios.widgets.macro_dialog import MacroDialog
+        if self._macro_dialog is None or not self._macro_dialog.isVisible():
+            self._macro_dialog = MacroDialog(self, parent=self)
+            self._macro_dialog.show()
+        else:
+            self._macro_dialog.raise_()
+            self._macro_dialog.activateWindow()
+
+    def record_macro_action(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
+        """Record *action* if the recorder is active and emit the signal."""
+        from dataclasses import asdict
+        if self.macro_recorder.record(action):
+            self.macro_action_recorded.emit(asdict(action))
+
+    def replay_macro_action(self, action: "MacroAction") -> None:  # type: ignore[name-defined]
+        """Dispatch one macro action to the appropriate page for replay."""
+        from PySide6.QtCore import QCoreApplication
+        t = action.action_type
+
+        if t in ("recipe_add_step", "recipe_remove_last", "recipe_clear"):
+            page = self.pages.get("recipe")
+            if page is None:
+                return
+            self._navigate("recipe")
+            QCoreApplication.processEvents()
+            if t == "recipe_add_step":
+                page._replay_add_step(action)
+            elif t == "recipe_remove_last":
+                page._on_remove_last()
+            elif t == "recipe_clear":
+                page._on_clear()
+
+        elif t == "analysis_run":
+            page = self.pages.get("analysis")
+            if page is None:
+                return
+            self._navigate("analysis")
+            QCoreApplication.processEvents()
+            page._replay_run(action)
+
+        elif t in ("export_tiff", "export_composite", "export_movie"):
+            page = self.pages.get("export")
+            if page is None:
+                return
+            self._navigate("export")
+            QCoreApplication.processEvents()
+            page._replay_export(action)
+
+        QCoreApplication.processEvents()
 
     def _release_outgoing_stage(self, page_key: str) -> None:
         """Drop in-memory stage outputs when the workspace owns them.

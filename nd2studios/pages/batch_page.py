@@ -47,6 +47,8 @@ class BatchPage(QWidget):
         self._template_path: str = ""
         self._worker = None
         self._exp: Optional[ND2StudiosRecord] = None
+        self._macro_path: str = ""
+        self._macro_actions: List = []
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -173,6 +175,31 @@ class BatchPage(QWidget):
         rl.addWidget(self._lbl_status)
 
         root.addWidget(run_group)
+
+        # ── Macro section ──
+        macro_group = QGroupBox("Macro")
+        ml = QVBoxLayout(macro_group)
+
+        macro_path_row = QHBoxLayout()
+        self._edit_macro = QLineEdit()
+        self._edit_macro.setPlaceholderText("No macro loaded…")
+        self._edit_macro.setReadOnly(True)
+        macro_path_row.addWidget(self._edit_macro, stretch=1)
+        btn_browse_macro = QPushButton("Browse…")
+        btn_browse_macro.clicked.connect(self._on_browse_macro)
+        macro_path_row.addWidget(btn_browse_macro)
+        ml.addLayout(macro_path_row)
+
+        self._chk_use_macro = QCheckBox(
+            "Run macro on each file instead of template"
+        )
+        self._chk_use_macro.setToolTip(
+            "When checked, each file will have the loaded macro applied "
+            "(recipe steps, analysis, export) rather than the pipeline template."
+        )
+        ml.addWidget(self._chk_use_macro)
+
+        root.addWidget(macro_group)
         root.addStretch(1)
 
     # ── Page lifecycle ────────────────────────────────────────────────────────
@@ -192,6 +219,9 @@ class BatchPage(QWidget):
             if idx >= 0:
                 self._combo_fmt.setCurrentIndex(idx)
         self._chk_export_images.setChecked(bool(cfg.get("export_images", False)))
+        if cfg.get("macro_path") and os.path.isfile(cfg["macro_path"]):
+            self._on_browse_macro_from_path(cfg["macro_path"])
+        self._chk_use_macro.setChecked(bool(cfg.get("use_macro", False)))
 
     def save_to_experiment(self, exp: ND2StudiosRecord) -> None:
         exp.batch_config = {
@@ -199,6 +229,8 @@ class BatchPage(QWidget):
             "output_dir": self._edit_output.text().strip(),
             "image_format": self._combo_fmt.currentText().lower(),
             "export_images": self._chk_export_images.isChecked(),
+            "macro_path": self._macro_path,
+            "use_macro": self._chk_use_macro.isChecked(),
         }
 
     # ── Template I/O ──────────────────────────────────────────────────────────
@@ -330,9 +362,35 @@ class BatchPage(QWidget):
         if folder:
             self._edit_output.setText(folder)
 
+    def _on_browse_macro(self) -> None:
+        from nd2studios.backend.macro_engine import MACRO_EXTENSION, load_macro
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Macro", "",
+            f"ND2Studios Macro (*{MACRO_EXTENSION});;All files (*)",
+        )
+        if not path:
+            return
+        self._on_browse_macro_from_path(path)
+        self._chk_use_macro.setChecked(True)
+
+    def _on_browse_macro_from_path(self, path: str) -> None:
+        from nd2studios.backend.macro_engine import load_macro
+        try:
+            _name, actions = load_macro(path)
+            self._macro_path = path
+            self._macro_actions = actions
+            self._edit_macro.setText(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Macro Load Failed", str(exc))
+
     # ── Run / Cancel ──────────────────────────────────────────────────────────
 
     def _on_run(self) -> None:
+        # Macro mode: apply macro to each file via the main window.
+        if self._chk_use_macro.isChecked():
+            self._on_run_macro_batch()
+            return
+
         from nd2studios.workers.batch_worker import BatchWorker
 
         # Validate inputs
@@ -381,6 +439,88 @@ class BatchPage(QWidget):
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
+
+    def _on_run_macro_batch(self) -> None:
+        """Apply the loaded macro to each file in the file list sequentially."""
+        if not self._macro_actions:
+            QMessageBox.information(
+                self, "No Macro",
+                "Load a macro file first using Browse… in the Macro section."
+            )
+            return
+        if self.main_window is None:
+            return
+        filepaths = [
+            self._file_list.item(i).data(Qt.UserRole)
+            for i in range(self._file_list.count())
+        ]
+        if not filepaths:
+            QMessageBox.information(self, "No Files", "Add at least one file to process.")
+            return
+
+        from PySide6.QtCore import QCoreApplication
+        from nd2studios.workers.load_worker import LoadWorker
+
+        enabled_actions = [a for a in self._macro_actions if a.enabled]
+        total = len(filepaths)
+        self._btn_run.setEnabled(False)
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setValue(0)
+
+        errors: List[str] = []
+        for idx, filepath in enumerate(filepaths):
+            self._lbl_status.setText(
+                f"Macro: loading {os.path.basename(filepath)} ({idx + 1}/{total})…"
+            )
+            QCoreApplication.processEvents()
+
+            # Load the file via the import page if available, else skip.
+            import_page = self.main_window.pages.get("import")
+            if import_page is not None and hasattr(import_page, "_load_file"):
+                try:
+                    import_page._load_file(filepath)
+                except Exception as exc:
+                    errors.append(f"{os.path.basename(filepath)}: {exc}")
+                    continue
+
+            self._lbl_status.setText(
+                f"Macro: applying to {os.path.basename(filepath)} ({idx + 1}/{total})…"
+            )
+            QCoreApplication.processEvents()
+
+            for action in enabled_actions:
+                try:
+                    self.main_window.replay_macro_action(action)
+                    QCoreApplication.processEvents()
+                except Exception as exc:
+                    errors.append(
+                        f"{os.path.basename(filepath)}/{action.action_type}: {exc}"
+                    )
+
+            pct = int((idx + 1) / total * 100)
+            self._progress_bar.setValue(pct)
+            if self.main_window is not None:
+                self.main_window.set_progress(pct, f"Macro batch: {idx + 1}/{total}")
+            QCoreApplication.processEvents()
+
+        self._btn_run.setEnabled(True)
+        self._progress_bar.setVisible(False)
+        if self.main_window is not None:
+            self.main_window.set_progress(0)
+
+        if errors:
+            summary = "\n".join(errors[:10])
+            QMessageBox.warning(
+                self, "Macro Batch Completed with Errors",
+                f"Finished {total} file(s) with {len(errors)} error(s):\n\n{summary}"
+            )
+            self._lbl_status.setText(f"Done with {len(errors)} error(s).")
+        else:
+            self._lbl_status.setText(f"Macro applied to all {total} file(s).")
+            QMessageBox.information(
+                self, "Macro Batch Complete",
+                f"Macro applied to all {total} file(s) successfully."
+            )
 
     def _on_cancel(self) -> None:
         if self._worker is not None:
