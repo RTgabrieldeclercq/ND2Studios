@@ -28,17 +28,21 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QPushButton, QSlider, QSplitter, QVBoxLayout, QWidget,
+    QLineEdit, QPushButton, QSizePolicy, QSlider, QSplitter, QVBoxLayout,
+    QWidget,
 )
 
 from nd2studios.backend.materialized_dataset import MaterializedDataset
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.frame_strip import FrameStrip
+from nd2studios.widgets.icon_button import bind_toggle_icon, icon_button
 from nd2studios.widgets.image_viewer import (
     CHANNEL_COLORS, ImageCanvas, ZoomToolbar,
 )
 from nd2studios.widgets.lut_histogram import apply_lut
 from nd2studios.widgets.lut_sidebar import LutSidebar
 from nd2studios.workers.pre_render_worker import PreRenderWorker
+from nd2studios.utils.perf import perf_log, perf_block
 
 
 def _gpu_display_enabled() -> bool:
@@ -128,6 +132,8 @@ class MultiAxisViewer(QWidget):
     stitch_requested = Signal()
     # Crop rect selected via drag on the canvas (x, y, w, h in image pixels).
     crop_rect_selected = Signal(int, int, int, int)
+    # V1.43 — tile-strip "crop to selected frames" request: (axis, frozenset).
+    crop_to_selection_requested = Signal(str, object)
     # Manual-mask shape drawn on the canvas. See ImageCanvas.shape_drawn.
     shape_drawn = Signal(str, list)
     # Vertex-edit signals — see ImageCanvas.
@@ -155,6 +161,9 @@ class MultiAxisViewer(QWidget):
         self._z_mode: str = "max"
         self._z_index: int = 0
         self._stage_xy_um: List[Tuple[float, float]] = []
+        # V1.43 — per-frame acquisition timestamps (seconds) for the T-axis
+        # tile-strip metadata tooltip. ``None`` until the host supplies them.
+        self._frame_timestamps = None
 
         self._m: int = 0
         self._t: int = 0
@@ -191,6 +200,13 @@ class MultiAxisViewer(QWidget):
         self._lut_rebuild_timer.timeout.connect(self._rebuild_render_cache_after_lut)
 
         self._hist_cache: dict = {}  # (m, z_mode) -> True
+
+        # V1.42 — optional multi-resolution pyramid (BigDataViewer-style).
+        # ``_attach_pyramid_reader_to_viewers`` in :class:`MainWindow`
+        # calls :meth:`attach_pyramid` after the build worker finishes;
+        # we then prefer a coarse level when zoomed out so the GPU /
+        # CPU compose pays for fewer pixels.
+        self._pyramid_reader = None  # set by attach_pyramid()
         self._frame_post_process: Optional[Callable] = None
 
         # Pre-render frame cache.
@@ -279,15 +295,33 @@ class MultiAxisViewer(QWidget):
         slider_layout = QVBoxLayout(slider_box)
         slider_layout.setContentsMargins(8, 4, 8, 4)
         slider_layout.setSpacing(2)
-        self._m_row, self.m_slider, self.m_label, self._m_total, self._m_play, self._m_fps = \
+        self._m_row, self.m_slider, self.m_label, self._m_total, self._m_play, self._m_fps, self._m_strip = \
             self._make_axis_row("M")
-        self._t_row, self.t_slider, self.t_label, self._t_total, self._t_play, self._t_fps = \
+        self._t_row, self.t_slider, self.t_label, self._t_total, self._t_play, self._t_fps, self._t_strip = \
             self._make_axis_row("T")
-        self._z_row, self.z_slider, self.z_label, self._z_total, self._z_play, self._z_fps = \
+        self._z_row, self.z_slider, self.z_label, self._z_total, self._z_play, self._z_fps, self._z_strip = \
             self._make_axis_row("Z")
         self.m_slider.valueChanged.connect(self._on_m_changed)
         self.t_slider.valueChanged.connect(self._on_t_changed)
         self.z_slider.valueChanged.connect(self._on_z_changed)
+        # V1.43 — per-axis tile-strip selection + crop wiring.
+        self._m_strip.selection_changed.connect(
+            lambda s: self._on_strip_selection("m", s))
+        self._t_strip.selection_changed.connect(
+            lambda s: self._on_strip_selection("t", s))
+        self._z_strip.selection_changed.connect(
+            lambda s: self._on_strip_selection("z", s))
+        self._m_strip.crop_requested.connect(
+            lambda s: self._on_strip_crop("m", s))
+        self._t_strip.crop_requested.connect(
+            lambda s: self._on_strip_crop("t", s))
+        self._z_strip.crop_requested.connect(
+            lambda s: self._on_strip_crop("z", s))
+        # Per-axis selections (frozenset of indices). T drives M/Z inheritance.
+        self._axis_selection = {"m": frozenset(), "t": frozenset(), "z": frozenset()}
+        self._t_strip.set_meta_fn(lambda i: self._frame_meta_text("t", i))
+        self._m_strip.set_meta_fn(lambda i: self._frame_meta_text("m", i))
+        self._z_strip.set_meta_fn(lambda i: self._frame_meta_text("z", i))
         self.m_label.editingFinished.connect(lambda: self._on_axis_label_edited("m"))
         self.t_label.editingFinished.connect(lambda: self._on_axis_label_edited("t"))
         self.z_label.editingFinished.connect(lambda: self._on_axis_label_edited("z"))
@@ -334,10 +368,22 @@ class MultiAxisViewer(QWidget):
         row.setSpacing(4)
         lbl = QLabel(label + ":")
         lbl.setFixedWidth(20)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         row.addWidget(lbl)
+        # V1.43 — NIS-Elements-style rectangular tile strip is the visible
+        # control. A hidden QSlider remains the source of truth for the
+        # current index so all existing playback / value code keeps working.
+        strip = FrameStrip(label)
+        row.addWidget(strip, stretch=1)
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(0, 0)
-        row.addWidget(slider, stretch=1)
+        slider.setParent(strip)
+        slider.hide()
+        # Bidirectional sync: strip → slider drives the real refresh cascade
+        # (slider.valueChanged is already wired to _on_*_changed); slider →
+        # strip keeps the tiles visually current without a feedback loop.
+        strip.current_changed.connect(slider.setValue)
+        slider.valueChanged.connect(lambda v: strip.set_current(v, emit=False))
         # Editable current-frame number (user can type to jump).
         info_edit = QLineEdit("1")
         info_edit.setObjectName("axisFrameEdit")
@@ -352,11 +398,11 @@ class MultiAxisViewer(QWidget):
         info_total.setStyleSheet(
             f"color: {Settings.FG_SECONDARY}; font: 9pt 'Helvetica Neue';")
         row.addWidget(info_total)
-        play_btn = QPushButton("▶")
-        play_btn.setObjectName("playBtn")
-        play_btn.setCheckable(True)
-        play_btn.setFixedSize(30, 24)
-        play_btn.setToolTip(f"Play / pause {label} axis")
+        play_btn = icon_button("fa5s.play", f"Play / pause {label} axis",
+                               checkable=True, object_name="playBtn",
+                               button_px=26, icon_px=12)
+        bind_toggle_icon(play_btn, "fa5s.play", "fa5s.pause",
+                         color_checked=Settings.ACCENT_GREEN)
         row.addWidget(play_btn)
         fps_spin = QDoubleSpinBox()
         fps_spin.setRange(0.1, 60.0)
@@ -365,8 +411,14 @@ class MultiAxisViewer(QWidget):
         fps_spin.setSuffix(" fps")
         fps_spin.setFixedWidth(72)
         fps_spin.setToolTip("Playback speed")
+        fps_spin.setSizePolicy(fps_spin.sizePolicy().horizontalPolicy(),
+                               QSizePolicy.Policy.Fixed)
         row.addWidget(fps_spin)
-        return row, slider, info_edit, info_total, play_btn, fps_spin
+        row.setAlignment(info_edit, Qt.AlignmentFlag.AlignTop)
+        row.setAlignment(info_total, Qt.AlignmentFlag.AlignTop)
+        row.setAlignment(play_btn, Qt.AlignmentFlag.AlignTop)
+        row.setAlignment(fps_spin, Qt.AlignmentFlag.AlignTop)
+        return row, slider, info_edit, info_total, play_btn, fps_spin, strip
 
     def invalidate_post_process_cache(self) -> None:
         """Discard cached overlay composites so the next refresh recomputes them.
@@ -405,6 +457,11 @@ class MultiAxisViewer(QWidget):
     ) -> None:
         """Enter vertex-edit mode on the canvas with draggable handles."""
         self.canvas.set_edit_vertices(vertices)
+
+    def set_frame_timestamps(self, timestamps) -> None:
+        """Supply per-frame acquisition timestamps (seconds) for the T-axis
+        tile metadata tooltip. Pass ``None`` to clear."""
+        self._frame_timestamps = timestamps
 
     # ── Population ──
     def set_volume(self,
@@ -613,11 +670,20 @@ class MultiAxisViewer(QWidget):
         slider.setRange(0, max(0, total - 1))
         slider.setValue(min(value, max(0, total - 1)))
         slider.blockSignals(False)
+        # Drive the visible tile strip (the QSlider stays a hidden model).
+        strip = self._strip_for(slider)
+        if strip is not None:
+            strip.set_count(total)
+            strip.set_current(min(value, max(0, total - 1)), emit=False)
+            strip.clear_selection(emit=False)
+            strip.setVisible(visible)
+            axis = ("m" if slider is self.m_slider
+                    else "t" if slider is self.t_slider else "z")
+            self._axis_selection[axis] = frozenset()
         # First widget in the row is the axis letter label.
         prefix = row.itemAt(0).widget()
         if prefix is not None:
             prefix.setVisible(visible)
-        slider.setVisible(visible)
         label.setVisible(visible)
         total_label.setVisible(visible)
         if play_btn is not None:
@@ -775,20 +841,99 @@ class MultiAxisViewer(QWidget):
                 min_interval = 50
             interval = max(min_interval, int(1000 / fps_spin.value()))
             timer.start(interval)
-            play_btn.setText("⏸")
         else:
             timer.stop()
-            play_btn.setText("▶")
+        # The play/pause icon is driven by bind_toggle_icon on the button's
+        # toggled signal (V1.44) — no text to swap here.
 
+    # ── V1.43 tile-strip helpers ──
+    def _strip_for(self, slider: QSlider) -> Optional[FrameStrip]:
+        if slider is self.m_slider:
+            return self._m_strip
+        if slider is self.t_slider:
+            return self._t_strip
+        if slider is self.z_slider:
+            return self._z_strip
+        return None
+
+    def _next_playback_value(self, slider: QSlider) -> int:
+        """Next frame for playback. When the axis has a tile selection, loop
+        only through the selected frames; otherwise advance linearly."""
+        axis = ("m" if slider is self.m_slider
+                else "t" if slider is self.t_slider
+                else "z")
+        sel = sorted(self._axis_selection.get(axis, frozenset()))
+        cur = slider.value()
+        if len(sel) >= 2:
+            # Step to the next selected index after the current one (wrap).
+            for v in sel:
+                if v > cur:
+                    return v
+            return sel[0]
+        return (cur + 1) % (slider.maximum() + 1)
+
+    def _on_strip_selection(self, axis: str, sel: frozenset) -> None:
+        self._axis_selection[axis] = sel
+
+    def _on_strip_crop(self, axis: str, sel: frozenset) -> None:
+        self.crop_to_selection_requested.emit(axis, sel)
+
+    def _frame_meta_text(self, axis: str, idx: int) -> str:
+        """Per-axis metadata tooltip for tile ``idx`` (T/M/Z)."""
+        vol = self._volume
+        if axis == "t":
+            lines = [f"T {idx + 1}"]
+            ts = self._frame_timestamps
+            if ts is not None and 0 <= idx < len(ts):
+                t0 = float(ts[0])
+                lines.append(f"Time imaged: {self._fmt_seconds(float(ts[idx]) - t0)}")
+                if idx > 0:
+                    lines.append(
+                        f"Δ to previous: {float(ts[idx]) - float(ts[idx - 1]):.2f} s")
+                lines.append(
+                    f"Elapsed total: {self._fmt_seconds(float(ts[-1]) - t0)}")
+            return "\n".join(lines)
+        if axis == "m":
+            px = getattr(vol, "pixel_size_um", 1.0) if vol is not None else 1.0
+            h = getattr(vol, "height", 0) if vol is not None else 0
+            w = getattr(vol, "width", 0) if vol is not None else 0
+            lines = [f"M {idx + 1}", f"Pixel size: {px:.4g} µm/px",
+                     f"Resolution: {w}×{h} px",
+                     f"Field of view: {w * px:.1f}×{h * px:.1f} µm"]
+            return "\n".join(lines)
+        # Z
+        step = getattr(vol, "z_step_um", 1.0) if vol is not None else 1.0
+        n_z = getattr(vol, "n_zslices", 1) if vol is not None else 1
+        total = max(0.0, step * (n_z - 1))
+        height = step * idx
+        lines = [f"Z {idx + 1}", f"Step: {step:.4g} µm",
+                 f"Height: {height:.2f} µm / {total:.2f} µm range"]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_seconds(s: float) -> str:
+        s = max(0.0, s)
+        h = int(s // 3600)
+        m = int((s % 3600) // 60)
+        sec = s % 60
+        if h > 0:
+            return f"{h:d}:{m:02d}:{sec:05.2f}"
+        return f"{m:02d}:{sec:05.2f}"
+
+    @perf_log("viewer._axis_tick")
     def _axis_tick(self, slider: QSlider) -> None:
         if slider.maximum() <= 0:
             return
-        next_val = (slider.value() + 1) % (slider.maximum() + 1)
+        next_val = self._next_playback_value(slider)
+        self._last_frame_idx = next_val
         # Block valueChanged so the debounce timer is not started — the
         # playback timer is the clock and we call _do_refresh directly below.
         slider.blockSignals(True)
         slider.setValue(next_val)
         slider.blockSignals(False)
+        strip = self._strip_for(slider)
+        if strip is not None:
+            strip.set_current(next_val, emit=False)
         # Manually sync the internal coordinate and axis label.
         if slider is self.t_slider:
             self._t = next_val
@@ -830,8 +975,16 @@ class MultiAxisViewer(QWidget):
         self.channels_changed.emit()
 
     def _rebuild_render_cache_after_lut(self) -> None:
-        """Full cache rebuild triggered 250 ms after the last LUT change."""
-        self._invalidate_render_cache()
+        """Cache rebuild triggered 250 ms after the last LUT change.
+
+        V1.42 — uses ``lut_only=True`` so the rebuild reuses the
+        existing cache slots in-place (the worker overwrites entries
+        as it visits them) rather than emptying the dict first.  The
+        user sees stale-LUT frames briefly during scrubbing instead
+        of falling all the way back to the slow live-compose path
+        while the worker warms up.
+        """
+        self._invalidate_render_cache(lut_only=True)
 
     # ── Pre-render cache management ──
 
@@ -886,8 +1039,41 @@ class MultiAxisViewer(QWidget):
         self._pre_render_worker = None
         self._pixmap_build_timer.stop()
 
-    def _invalidate_render_cache(self) -> None:
-        """Clear render + pixmap caches and restart the pre-render worker."""
+    def _invalidate_render_cache(self, *, lut_only: bool = False) -> None:
+        """Drop pre-render caches and restart the worker.
+
+        Parameters
+        ----------
+        lut_only : bool
+            Default ``False`` — full invalidation: every dict is emptied,
+            ``_cache_m`` is reset, the QPixmap build timer is stopped.
+            Used when channels change shape (enable / disable / color
+            swap, z-mode change, dataset reload).
+
+            ``True`` — V1.42 LUT-only fast path.  On the GPU canvas this
+            is a no-op: ``GpuImageCanvas`` applies LUT/levels as a GPU
+            uniform on every paint, so the stale cache is never read.
+            On the CPU canvas the existing dicts are kept and the
+            worker is restarted to overwrite entries as it visits them.
+            The user sees brief stale-LUT frames during scrub instead
+            of falling all the way through to the slow live-compose
+            path while the worker warms up.  ``_pp_version`` is bumped
+            so the overlay caches re-render on demand.
+        """
+        if lut_only:
+            self._pp_version += 1
+            if self._use_gpu_canvas:
+                # GPU canvas re-applies LUT every paint — the CPU caches
+                # are not being read by the render path, so leave them
+                # untouched and skip the worker churn.
+                return
+            # CPU canvas — restart the worker but keep the existing cache
+            # dicts. ``PreRenderWorker._render`` writes ``cache[(m, t)] =
+            # composite`` which overwrites stale entries atomically.
+            self._cancel_pre_render_worker()
+            self._start_pre_render_worker()
+            return
+
         self._render_cache.clear()
         self._pixmap_cache.clear()
         self._pp_cache.clear()
@@ -963,7 +1149,14 @@ class MultiAxisViewer(QWidget):
             pass
 
     # ── Drawing ──
+    @perf_log("viewer._do_refresh")
     def _do_refresh(self) -> None:
+        # Track which branch handled the frame so perf logs can split
+        # cache-hit / cache-miss rates without us having to instrument
+        # each branch separately.
+        self._last_frame_idx = self._t
+        self._last_cache_hit = False
+
         # V1.36 Phase 4: when the GPU canvas is active, push planes
         # per channel and let the GPU additively composite + apply
         # LUT. We only fall back to the legacy RGB composite when a
@@ -974,6 +1167,10 @@ class MultiAxisViewer(QWidget):
                 and hasattr(self.canvas, "update_channel")):
             try:
                 if self._render_current_frame_gpu():
+                    # GPU canvas bypasses the CPU cache by design — mark
+                    # as a hit so playback timing isn't classified as
+                    # the slow live-compose path.
+                    self._last_cache_hit = True
                     return
                 # If the GPU branch returns False (e.g. no enabled
                 # channels with cached planes yet) we fall through to
@@ -991,6 +1188,7 @@ class MultiAxisViewer(QWidget):
                 and self._cache_m == self._m
                 and self._t in self._pixmap_cache):
             self.canvas.set_pixmap_direct(self._pixmap_cache[self._t])
+            self._last_cache_hit = True
             return
 
         # numpy composite cache fast-path — skip LUT+compose, still needs
@@ -1000,6 +1198,7 @@ class MultiAxisViewer(QWidget):
                 and self._frame_post_process is None
                 and key in self._render_cache):
             self.canvas.set_image(self._render_cache[key])
+            self._last_cache_hit = True
             return
 
         # Post-process overlay fast-path: QPixmap already built for this
@@ -1008,11 +1207,13 @@ class MultiAxisViewer(QWidget):
         if self._frame_post_process is not None:
             if pp_key in self._pp_pixmap_cache:
                 self.canvas.set_pixmap_direct(self._pp_pixmap_cache[pp_key])
+                self._last_cache_hit = True
                 return
             if pp_key in self._pp_cache:
                 pm = self._numpy_to_pixmap(self._pp_cache[pp_key])
                 self._pp_pixmap_cache[pp_key] = pm
                 self.canvas.set_pixmap_direct(pm)
+                self._last_cache_hit = True
                 return
 
         # Render cache + post-process: skip LUT/channel compose, only pay
@@ -1029,6 +1230,7 @@ class MultiAxisViewer(QWidget):
             pm = self._numpy_to_pixmap(processed)
             self._pp_pixmap_cache[pp_key] = pm
             self.canvas.set_pixmap_direct(pm)
+            self._last_cache_hit = True  # render_cache hit, overlay reblend
             return
 
         # Live compose fallback (GPU off, no cache, or recipe-page path).
@@ -1036,6 +1238,7 @@ class MultiAxisViewer(QWidget):
         if composite is None:
             return
         self.canvas.set_image(composite)
+        # _last_cache_hit stays False — this is the slow path.
 
     # Backward-compat alias used by set_volume / set_channels / apply_channel_state.
     _refresh = _do_refresh
@@ -1109,6 +1312,57 @@ class MultiAxisViewer(QWidget):
 
         return any_pushed
 
+    # ── V1.42 pyramid plumbing ──
+    def attach_pyramid(self, reader) -> None:
+        """Adopt a :class:`PyramidReader` for zoom-aware reads.
+
+        Called by :meth:`MainWindow._attach_pyramid_reader_to_viewers`
+        after the pyramid build worker finishes.  When the user zooms
+        out far enough that one screen pixel spans multiple source
+        pixels, :meth:`_choose_pyramid_level` returns ``L > 0`` and the
+        plane is read from the pyramid instead of the in-RAM level-0
+        ndarray — much smaller transfer to the GPU canvas.
+        """
+        self._pyramid_reader = reader
+
+    def _choose_pyramid_level(self) -> int:
+        """Return the pyramid level appropriate for the current zoom.
+
+        Returns 0 when no pyramid is attached, when the volume is
+        absent (recipe-page path), or when the canvas doesn't expose
+        a ``ViewBox``.  The actual level pick uses the canvas's
+        viewport rect via :meth:`PyramidReader.pick_level_for_viewport`.
+        """
+        reader = self._pyramid_reader
+        if reader is None or self._volume is None:
+            return 0
+        # Both canvases expose ``width()``; the GPU canvas additionally
+        # has a pyqtgraph ViewBox for the source-pixel rect.
+        try:
+            viewport_screen_px = max(1, int(self.canvas.width()))
+        except Exception:  # noqa: BLE001
+            return 0
+        # Image-pixels-visible: the ViewBox extent in source units.
+        # On the legacy QLabel canvas we don't have a precise rect, so
+        # use the full image width as a conservative upper bound (this
+        # only over-picks level 0, which is the safe direction).
+        image_pixels_visible = int(getattr(self._volume, "width", 0))
+        view_box = getattr(self.canvas, "view_box", None)
+        if view_box is not None:
+            try:
+                rect = view_box.viewRect()
+                image_pixels_visible = max(1, int(round(rect.width())))
+            except Exception:  # noqa: BLE001
+                pass
+        if image_pixels_visible <= 0:
+            return 0
+        try:
+            return int(reader.pick_level_for_viewport(
+                viewport_screen_px, image_pixels_visible,
+            ))
+        except Exception:  # noqa: BLE001
+            return 0
+
     def _read_volume_plane(self, c_idx: int, name: str) -> Optional[np.ndarray]:
         """Fetch the current (m, t) plane for channel ``c_idx`` from RAM.
 
@@ -1116,10 +1370,28 @@ class MultiAxisViewer(QWidget):
         per-channel (M, T, Z, H, W) array directly and apply Z projection
         or slice selection in-place. Otherwise we fall back to the
         LazyND2Volume.get_frame interface for backwards compatibility.
+
+        V1.42 — when a pyramid is attached and zoom-out chose a level
+        ``>0``, read the plane from the pyramid instead of level 0.
         """
         volume = self._volume
         if volume is None:
             return None
+
+        # V1.42 pyramid short-circuit: read from the coarsest level
+        # whose pixels still beat screen pixels, transferring far less
+        # data to the GPU canvas when zoomed out.
+        level = self._choose_pyramid_level()
+        if level > 0 and self._pyramid_reader is not None:
+            try:
+                return np.asarray(self._pyramid_reader.get_frame(
+                    level, c_idx, self._m, self._t, self._z,
+                    z_mode=self._z_mode,
+                ))
+            except Exception:  # noqa: BLE001
+                # On any read failure, fall through to level 0.
+                pass
+
         # Fast path — MaterializedDataset has a ``channels`` dict.
         channels = getattr(volume, "channels", None)
         if channels is not None:
@@ -1194,6 +1466,7 @@ class MultiAxisViewer(QWidget):
             a = a[0]
         return a if a.ndim == 2 else None
 
+    @perf_log("viewer._compose_current_frame")
     def _compose_current_frame(self) -> Optional[np.ndarray]:
         """CPU-side RGB composite, used when the GPU canvas is off or
         when a frame post-process hook needs a uint8 RGB array.
@@ -1290,6 +1563,14 @@ class MultiAxisViewer(QWidget):
             n_m = self.m_slider.maximum() + 1 if self.m_slider.maximum() >= 0 else 1
             self.m_label.setText(str(self._m + 1))
             self._m_total.setText(f"/{n_m}")
+        # V1.44 — mirror the current frame's metadata into the pinned panel.
+        sidebar = getattr(self, "lut_sidebar", None)
+        if sidebar is not None and hasattr(sidebar, "set_metadata_text"):
+            parts = [self._frame_meta_text("t", self._t),
+                     self._frame_meta_text("m", self._m)]
+            if self._volume is not None and getattr(self._volume, "n_zslices", 1) > 1:
+                parts.append(self._frame_meta_text("z", self._z))
+            sidebar.set_metadata_text("\n".join(parts))
 
     def _on_axis_label_edited(self, axis: str) -> None:
         """Parse a manually entered frame number and jump the slider."""

@@ -15,6 +15,7 @@ from PySide6.QtCore import Qt, Signal, QPoint, QRectF, QPointF
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QBrush, QColor, QPolygonF
 
 from nd2studios.core.settings import Settings
+from nd2studios.utils.perf import perf_log
 
 
 # Standard LUT colors available for channel assignment
@@ -246,6 +247,7 @@ class ImageCanvas(QLabel):
         self._source_pixmap = QPixmap.fromImage(qimg)
         self.update()
 
+    @perf_log("set_pixmap_direct")
     def set_pixmap_direct(self, pixmap: QPixmap) -> None:
         """Display a pre-built QPixmap without creating a new QImage.
 

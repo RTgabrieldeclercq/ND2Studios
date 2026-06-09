@@ -40,6 +40,7 @@ from nd2studios.backend.exporters.composite_exporter import (
 from nd2studios.backend.exporters.movie_exporter import (
     MovieOptions, _draw_overlays,
 )
+from nd2studios.utils.progress import FrameProgress
 
 
 def _width(n: int) -> int:
@@ -152,6 +153,7 @@ def export_image_sequence(
         if request.frame_timestamps_s is not None else None
     )
 
+    fp = FrameProgress(n_t, progress_cb)
     for t in range(n_t):
         if status_cb is not None and (t == 0 or t % 8 == 0):
             status_cb(f"Writing frame {t + 1}/{n_t}…")
@@ -175,8 +177,7 @@ def export_image_sequence(
             n_t=n_t, n_m=1, n_z=1,
         )
         Image.fromarray(rgb).save(os.path.join(request.output_dir, fname))
-        if progress_cb is not None:
-            progress_cb(int((t + 1) / n_t * 100))
+        fp.advance()
     return request.output_dir
 
 
@@ -212,6 +213,7 @@ def _export_from_volume(
     cx, cy, cw, ch_px = (request.crop_rect if request.crop_rect
                          else (0, 0, 0, 0))
     total = n_m * n_t * n_z_out
+    fp = FrameProgress(total, progress_cb)
     written = 0
     frame_ts = (
         np.asarray(request.frame_timestamps_s)
@@ -259,7 +261,6 @@ def _export_from_volume(
                     os.path.join(request.output_dir, fname)
                 )
                 written += 1
-                if progress_cb is not None:
-                    progress_cb(int(written / total * 100))
+                fp.advance()
 
     return request.output_dir

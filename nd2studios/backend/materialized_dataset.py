@@ -193,6 +193,58 @@ class MaterializedDataset:
                                              z_index=z_index)
         return out
 
+    def subset(self, *, m=None, t=None, z=None,
+               progress_cb=None) -> "MaterializedDataset":
+        """Return a NEW dataset containing only the selected M / T / Z indices.
+
+        ``m`` / ``t`` / ``z`` are iterables of indices (``None`` = keep the
+        whole axis). The source dataset is never mutated — advanced indexing
+        copies — so this is the "crop to selection that does not touch the
+        original file" operation (V1.43). ``progress_cb`` (0–100) is invoked
+        per channel as the copies complete.
+        """
+        m_idx = (sorted({int(i) for i in m if 0 <= int(i) < self.n_multipoints})
+                 if m is not None else list(range(self.n_multipoints)))
+        t_idx = (sorted({int(i) for i in t if 0 <= int(i) < self.n_timepoints})
+                 if t is not None else list(range(self.n_timepoints)))
+        z_idx = (sorted({int(i) for i in z if 0 <= int(i) < self.n_zslices})
+                 if z is not None else list(range(self.n_zslices)))
+        # Never collapse an axis to empty — fall back to "keep all".
+        if not m_idx:
+            m_idx = list(range(self.n_multipoints))
+        if not t_idx:
+            t_idx = list(range(self.n_timepoints))
+        if not z_idx:
+            z_idx = list(range(self.n_zslices))
+
+        sel = np.ix_(m_idx, t_idx, z_idx)
+        new_channels: Dict[str, np.ndarray] = {}
+        n = max(1, len(self.channels))
+        for i, (name, arr) in enumerate(self.channels.items()):
+            # arr is (M, T, Z, H, W); np.ix_ indexes the leading 3 axes and
+            # preserves H, W. Advanced indexing returns a fresh contiguous copy.
+            new_channels[name] = arr[sel]
+            if progress_cb is not None:
+                progress_cb(int((i + 1) / n * 100))
+
+        return MaterializedDataset(
+            filepath=self.filepath,
+            channels=new_channels,
+            channel_names=list(self.channel_names),
+            dtype=self.dtype,
+            pixel_size_um=self.pixel_size_um,
+            z_step_um=self.z_step_um,
+            n_multipoints=len(m_idx),
+            n_timepoints=len(t_idx),
+            n_channels=self.n_channels,
+            height=self.height,
+            width=self.width,
+            z_mode=self.z_mode,
+            n_zslices=len(z_idx),
+            extra={**self.extra, "cropped_from": self.filepath,
+                   "crop_m": m_idx, "crop_t": t_idx, "crop_z": z_idx},
+        )
+
     def reopen(self) -> "MaterializedDataset":
         """Materialized data is already in RAM; reopen is a no-op identity."""
         return self

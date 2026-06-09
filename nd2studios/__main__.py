@@ -46,6 +46,15 @@ def main() -> None:
     from nd2studios.core.theme import STYLESHEET
     from nd2studios.core.main_window import MainWindow
 
+    # V1.41 — apply the user's saved preferences to ``Settings`` before
+    # any subsystem reads them. Best-effort; a corrupt or missing
+    # preferences file just means the user gets defaults.
+    try:
+        from nd2studios.utils.user_config import load_user_preferences
+        load_user_preferences()
+    except Exception:  # noqa: BLE001
+        pass
+
     # V1.36 Phase 4: configure pyqtgraph defaults before any
     # :class:`GpuImageCanvas` is constructed. ``row-major`` makes
     # numpy ``(H, W)`` arrays display with ``(0, 0)`` at the top-left
@@ -91,6 +100,49 @@ def main() -> None:
         log_gpu_status()
         configure(bool(getattr(Settings, "USE_GPU_ANALYSIS", False)))
     except Exception:  # noqa: BLE001 — GPU bootstrap must never break startup
+        pass
+
+    # V1.41 startup diagnostic sequence: emit one info line per
+    # subsystem and apply safe defaults so a low-RAM laptop doesn't
+    # try to build pyramids or push 4-byte-per-pixel RGBA to a 1 GB
+    # iGPU.  Each block is independently try/excepted because the
+    # full chain must never block the app from starting.
+    try:
+        from nd2studios.utils.resources import log_system_resources, detect
+        log_system_resources()
+        res = detect()
+        if res.available_ram_gb < 8 and getattr(Settings, "BUILD_PYRAMIDS", False):
+            Settings.BUILD_PYRAMIDS = False
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "Low RAM (%.1f GB available) — disabling pyramid build by default.",
+                res.available_ram_gb,
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from pathlib import Path
+        from nd2studios.utils.storage import log_default_storage_class
+        # Probe the working directory; a per-file probe will refine
+        # this when LoadWorker opens an actual ND2 / TIFF.
+        log_default_storage_class(Path(Settings.PROJECT_DIR))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from nd2studios.compute.gpu import gpu_status
+        gpu = gpu_status()
+        if (
+            gpu.get("available")
+            and float(gpu.get("memory_gb", 0.0)) < 2.0
+            and getattr(Settings, "USE_GPU_DISPLAY", False)
+        ):
+            Settings.USE_GPU_DISPLAY = False
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "GPU has only %.1f GB VRAM — disabling pyqtgraph GPU canvas.",
+                float(gpu.get("memory_gb", 0.0)),
+            )
+    except Exception:  # noqa: BLE001
         pass
 
     window = MainWindow()

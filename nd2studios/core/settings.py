@@ -63,6 +63,34 @@ class Settings:
     BUILD_PYRAMIDS = True
     PYRAMID_ENV_DISABLE = "ND2_DISABLE_PYRAMIDS"
 
+    # ── Resource-aware load strategy (V1.41) ────────────────────────
+    # EAGER_MAX_FRACTION: cap on the share of available RAM that the
+    # eager-materialization path is allowed to consume. The remaining
+    # share is reserved for the OS, the Qt pixmap cache, downstream
+    # analysis pipelines, and matplotlib figures.
+    # MEMORY_RESERVE_OVERHEAD: safety multiplier applied to the
+    # estimated footprint before fit check; soaks up working-set
+    # growth during decode (chunked reads, dask threading buffers,
+    # PIL/imageio backbuffers).
+    # MEMORY_PRESSURE_*: percentage thresholds for the runtime memory
+    # monitor. Lower bands trigger soft signals (clear caches);
+    # higher bands surface modal warnings and block new ops.
+    EAGER_MAX_FRACTION = 0.50
+    MEMORY_RESERVE_OVERHEAD = 1.20
+    MEMORY_PRESSURE_WARNING_PCT = 80.0
+    MEMORY_PRESSURE_CRITICAL_PCT = 90.0
+    MEMORY_PRESSURE_EMERGENCY_PCT = 95.0
+    MEMORY_PRESSURE_RECOVER_WARNING_PCT = 75.0
+    MEMORY_PRESSURE_RECOVER_CRITICAL_PCT = 85.0
+    MEMORY_PRESSURE_RECOVER_EMERGENCY_PCT = 90.0
+    MEMORY_MONITOR_INTERVAL_MS = 1500
+
+    # Forced LoadStrategy override (empty string = auto pick).
+    # When non-empty, must be one of the LoadStrategy enum values:
+    # "eager_full", "eager_reduced", or "lazy_cached". Surfaced via
+    # the Performance dialog and persisted by ``utils/user_config``.
+    FORCED_LOAD_STRATEGY = ""
+
     # ── Dracula palette (matches CellTracker + Modern_GUI_PyDracula) ──
     BG_PRIMARY = "#282a36"      # main background
     BG_SECONDARY = "#21252b"    # sidebar / top + bottom bars

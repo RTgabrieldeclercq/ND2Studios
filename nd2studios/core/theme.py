@@ -233,6 +233,49 @@ QPushButton#dangerBtn:hover { background-color: #ff7777; color: #f8f8f2; }
 QPushButton#dangerBtn:pressed { background-color: #d94545; color: #f8f8f2; }
 QPushButton#dangerBtn:disabled { background-color: #663a3a; color: #a28282; }
 
+/* TOP TAB BAR (V1.44 — migrated from the left sidebar) */
+QWidget#topTabBar {
+    background-color: #21252b;
+    border-bottom: 1px solid #44475a;
+}
+QToolButton#topTabBtn {
+    background-color: transparent;
+    color: #b0b0b0;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 6px;
+    padding: 4px 14px;
+    margin: 4px 1px;
+    font: 10pt "Helvetica Neue";
+}
+QToolButton#topTabBtn:hover {
+    background-color: #2c313c;
+    color: #f8f8f2;
+}
+QToolButton#topTabBtn:checked {
+    color: #f8f8f2;
+    border-bottom: 2px solid #bd93f9;
+    background-color: #2c313c;
+}
+/* Session actions on the right of the tab bar */
+QPushButton#sessionTabBtn {
+    background-color: transparent;
+    color: #b0b0b0;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 10px;
+    margin: 4px 1px;
+    font: 9pt "Helvetica Neue";
+}
+QPushButton#sessionTabBtn:hover {
+    background-color: #343b48;
+    color: #f8f8f2;
+}
+QPushButton#sessionTabBtn:pressed {
+    background-color: #bd93f9;
+    color: #282a36;
+}
+
 /* SIDEBAR NAV BUTTONS (collapsible with text labels — PyDracula style) */
 QPushButton#navBtn {
     background-color: transparent;

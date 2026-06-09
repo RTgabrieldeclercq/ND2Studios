@@ -22,6 +22,7 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 from nd2studios.backend.materialized_dataset import MaterializedDataset
+from nd2studios.utils.progress import FrameProgress
 from nd2studios.widgets.lut_histogram import apply_lut
 
 # Upper bound on cached frames before the worker restricts itself to
@@ -104,8 +105,8 @@ class PreRenderWorker(QThread):
             m_order = [self._priority_m] + other_m
 
         # Count only the work we'll actually do for progress reporting.
-        total = len(m_order) * n_t
-        done = 0
+        # (Z is already projected here, so the real unit is M·T frames.)
+        fp = FrameProgress(len(m_order) * n_t, self.progress.emit)
 
         for m in m_order:
             if self._cancelled:
@@ -115,8 +116,7 @@ class PreRenderWorker(QThread):
                     break
                 self._cache[(m, t)] = self._compose_frame(m, t)
                 self.frame_cached.emit(m, t)
-                done += 1
-                self.progress.emit(int(100 * done / total))
+                fp.advance()
 
             # Emit finished exactly once — right after the priority-M series
             # completes.  The viewer uses this to activate the fast QPixmap

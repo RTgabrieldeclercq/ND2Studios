@@ -56,6 +56,17 @@ from nd2studios.pipeline import (
 )
 from nd2studios.widgets.common import StatusIndicator
 from nd2studios.widgets.custom_grips import CustomGrip
+from nd2studios.widgets.icon_button import icon_button, scaled, tool_button
+
+# Page key → qtawesome icon name for the top tab bar (V1.44).
+_PAGE_ICONS = {
+    "import": "fa5s.folder-open",
+    "recipe": "fa5s.flask",
+    "analysis": "fa5s.microscope",
+    "results": "fa5s.chart-bar",
+    "batch": "fa5s.bolt",
+    "export": "fa5s.save",
+}
 
 
 class MainWindow(QMainWindow):
@@ -101,8 +112,6 @@ class MainWindow(QMainWindow):
 
         self.pages: Dict[str, QWidget] = {}
         self._current_page_key: Optional[str] = None
-        self._sidebar_animation: Optional[QPropertyAnimation] = None
-        self._sidebar_expanded: bool = True
         self._drag_pos = None
         self._is_maximized = False
 
@@ -117,8 +126,21 @@ class MainWindow(QMainWindow):
         self.macro_event_filter = MacroEventFilter(self)
         self._macro_dialog: Optional[object] = None
 
+        # V1.41 — global memory-pressure monitor. Built before pages so
+        # any viewer or worker constructed below can grab the singleton
+        # and subscribe to band signals.
+        from nd2studios.core.memory_monitor import install_global
+        self.memory_monitor = install_global(parent=self)
+        self._memory_modal_shown: bool = False
+        self._heavy_ops_blocked: bool = False
+        self.memory_monitor.sampled.connect(self._on_memory_sampled)
+        self.memory_monitor.critical.connect(self._on_memory_critical)
+        self.memory_monitor.emergency.connect(self._on_memory_emergency)
+        self.memory_monitor.recovered.connect(self._on_memory_recovered)
+
         self._build_ui()
         self._install_grips()
+        self.memory_monitor.start()
 
         # Start with a blank session.
         self.exp_manager.new_experiment("Untitled")
@@ -152,21 +174,11 @@ class MainWindow(QMainWindow):
         # ── Custom title bar ──
         bg_layout.addWidget(self._build_title_bar())
 
-        # ── Body: sidebar + content area ──
-        body = QWidget()
-        body_layout = QHBoxLayout(body)
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        body_layout.setSpacing(0)
+        # ── Top tab bar (V1.44 — migrated from the old left sidebar) ──
+        bg_layout.addWidget(self._build_top_tabs())
 
-        self._body_splitter = QSplitter(Qt.Horizontal)
-        self._body_splitter.setChildrenCollapsible(False)
-        self._body_splitter.addWidget(self._build_sidebar())
-        self._body_splitter.addWidget(self._build_content_area())
-        self._body_splitter.setStretchFactor(0, 0)
-        self._body_splitter.setStretchFactor(1, 1)
-        body_layout.addWidget(self._body_splitter, stretch=1)
-
-        bg_layout.addWidget(body, stretch=1)
+        # ── Body: content area fills the rest ──
+        bg_layout.addWidget(self._build_content_area(), stretch=1)
 
     def _build_title_bar(self) -> QWidget:
         bar = QWidget()
@@ -187,20 +199,17 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
 
-        # Min / Max / Close
-        self._btn_min = QPushButton("—")
-        self._btn_min.setObjectName("titleBarBtn")
-        self._btn_min.setToolTip("Minimize")
+        # Min / Max / Close — crisp DPI-scaling vector icons (V1.44).
+        self._btn_min = icon_button("fa5s.window-minimize", "Minimize",
+                                    object_name="titleBarBtn", icon_px=12)
         self._btn_min.clicked.connect(self.showMinimized)
 
-        self._btn_max = QPushButton("□")
-        self._btn_max.setObjectName("titleBarBtn")
-        self._btn_max.setToolTip("Maximize / Restore")
+        self._btn_max = icon_button("fa5s.window-maximize", "Maximize / Restore",
+                                    object_name="titleBarBtn", icon_px=12)
         self._btn_max.clicked.connect(self._toggle_max_restore)
 
-        self._btn_close = QPushButton("✕")
-        self._btn_close.setObjectName("titleBarCloseBtn")
-        self._btn_close.setToolTip("Close")
+        self._btn_close = icon_button("fa5s.times", "Close",
+                                      object_name="titleBarCloseBtn", icon_px=14)
         self._btn_close.clicked.connect(self.close)
 
         for b in (self._btn_min, self._btn_max, self._btn_close):
@@ -212,58 +221,54 @@ class MainWindow(QMainWindow):
         bar.mouseDoubleClickEvent = self._title_mouse_double_click
         return bar
 
-    def _build_sidebar(self) -> QWidget:
-        sidebar = QWidget()
-        sidebar.setObjectName("leftMenuBg")
-        sidebar.setMinimumWidth(Settings.SIDEBAR_COLLAPSED_WIDTH)
-        self._sidebar = sidebar
+    def _build_top_tabs(self) -> QWidget:
+        """Horizontal tab strip under the title bar (V1.44).
 
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        Replaces the old animated left sidebar. Page tabs sit on the left with
+        crisp DPI-scaling qtawesome icons; the session actions
+        (Save/Load/Configure/Performance/Macro) cluster on the right.
+        """
+        bar = QWidget()
+        bar.setObjectName("topTabBar")
+        bar.setFixedHeight(scaled(46))
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(scaled(8), 0, scaled(8), 0)
+        layout.setSpacing(scaled(4))
 
-        # Toggle (hamburger) at the top.
-        self._toggle_btn = QPushButton("☰")
-        self._toggle_btn.setObjectName("toggleBtn")
-        self._toggle_btn.setToolTip("Collapse / Expand sidebar")
-        self._toggle_btn.clicked.connect(self._toggle_sidebar)
-        layout.addWidget(self._toggle_btn)
-
-        # Nav buttons (one per page).
+        # Page tabs (one per page), exclusive selection.
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
         self._nav_buttons: Dict[str, QPushButton] = {}
 
-        for key, icon, title, tooltip in Settings.PAGES:
-            btn = QPushButton(f"  {icon}    {title}")
-            btn.setObjectName("navBtn")
-            btn.setCheckable(True)
-            btn.setToolTip(tooltip)
-            btn.clicked.connect(lambda _checked, k=key: self._navigate(k))
+        for key, _icon, title, tooltip in Settings.PAGES:
+            btn = tool_button(
+                _PAGE_ICONS.get(key, ""), tooltip, text=title,
+                checkable=True, object_name="topTabBtn",
+            )
+            btn.clicked.connect(lambda _checked=False, k=key: self._navigate(k))
             self._nav_group.addButton(btn)
             self._nav_buttons[key] = btn
             layout.addWidget(btn)
 
         layout.addStretch(1)
 
-        # Controls at the bottom.
-        for label, slot, tooltip in [
-            ("  💾  Save",      self._save_config,   "Save configuration to a .nd2s_cfg file"),
-            ("  📂  Load",      self._load_config,   "Load a .nd2s_cfg configuration file"),
-            ("  🔧  Configure", self._configure,     "Open the pipeline configuration wizard"),
-            ("  ⚙  Performance",
+        # Session actions on the right.
+        for icon_name, label, slot, tooltip in [
+            ("fa5s.save",      "Save",        self._save_config,   "Save configuration to a .nd2s_cfg file"),
+            ("fa5s.folder-open", "Load",      self._load_config,   "Load a .nd2s_cfg configuration file"),
+            ("fa5s.cog",       "Configure",   self._configure,     "Open the pipeline configuration wizard"),
+            ("fa5s.tachometer-alt", "Performance",
              self._open_performance_settings,
              "GPU acceleration and multi-resolution pyramid settings (V1.39)"),
-            ("  🎬  Macro",     self._open_macro,
+            ("fa5s.film",      "Macro",       self._open_macro,
              "Record, edit, and replay action macros across files"),
         ]:
-            btn = QPushButton(label)
-            btn.setObjectName("sessionBtn")
-            btn.setToolTip(tooltip)
+            btn = icon_button(icon_name, tooltip, text=label,
+                              object_name="sessionTabBtn")
             btn.clicked.connect(slot)
             layout.addWidget(btn)
 
-        return sidebar
+        return bar
 
     def _build_content_area(self) -> QWidget:
         content = QWidget()
@@ -333,6 +338,14 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(0)
         self._progress_bar.setVisible(False)
         bb_layout.addWidget(self._progress_bar)
+
+        # V1.41 — live memory-pressure gauge. Sits between progress bar
+        # and status text in the bottom bar.  Colour switches at band
+        # boundaries via ``_on_memory_sampled``.
+        self._memory_gauge = QLabel("RAM —")
+        self._memory_gauge.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        self._memory_gauge.setToolTip("System memory usage")
+        bb_layout.addWidget(self._memory_gauge)
 
         self._status_text = QLabel("Ready")
         self._status_text.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
@@ -446,40 +459,6 @@ class MainWindow(QMainWindow):
                 except Exception:  # noqa: BLE001
                     pass
         super().closeEvent(event)
-
-    # ── Sidebar collapse/expand ────────────────────────────────────
-    def _toggle_sidebar(self) -> None:
-        start = self._sidebar.width()
-        end = (
-            Settings.SIDEBAR_COLLAPSED_WIDTH if self._sidebar_expanded
-            else Settings.SIDEBAR_EXPANDED_WIDTH
-        )
-        self._sidebar_expanded = not self._sidebar_expanded
-
-        anim = QPropertyAnimation(self._sidebar, b"minimumWidth")
-        anim.setDuration(Settings.SIDEBAR_ANIMATION_MS)
-        anim.setStartValue(start)
-        anim.setEndValue(end)
-        anim.setEasingCurve(QEasingCurve.InOutQuart)
-
-        anim2 = QPropertyAnimation(self._sidebar, b"maximumWidth")
-        anim2.setDuration(Settings.SIDEBAR_ANIMATION_MS)
-        anim2.setStartValue(start)
-        anim2.setEndValue(end)
-        anim2.setEasingCurve(QEasingCurve.InOutQuart)
-
-        anim.finished.connect(self._on_sidebar_anim_done)
-        anim.start()
-        anim2.start()
-        # Keep refs alive until they finish.
-        self._sidebar_animation = anim
-        self._sidebar_animation_2 = anim2
-
-    def _on_sidebar_anim_done(self) -> None:
-        if self._sidebar_expanded:
-            # Remove upper bound so the splitter handle can grow the sidebar past 240 px.
-            self._sidebar.setMaximumWidth(16777215)
-        self._reset_active_viewer_zoom()
 
     def _reset_active_viewer_zoom(self) -> None:
         page = self.pages.get(self._current_page_key)
@@ -685,45 +664,59 @@ class MainWindow(QMainWindow):
                 except Exception:  # noqa: BLE001 — viewer must never break on attach
                     pass
 
-    # ── V1.39 Phase 7 — Performance settings dialog ────────────────
+    # ── V1.39 Phase 7 / V1.41 — Performance settings dialog ────────
     def _open_performance_settings(self) -> None:
-        """Show the Performance settings modal.
+        """Show the Performance + Diagnostics settings modal.
 
-        Two checkboxes (GPU analysis, build pyramids) plus a Rebuild
-        Pyramid button. State lives on :class:`Settings` for the
-        lifetime of the process; persisting across launches is a
-        V1.40 follow-up.
+        V1.41 expands the original two-checkbox dialog into a tabbed
+        view:
+
+        * **GPU** — the original opt-in for GPU analysis dispatch.
+        * **Memory** — live RAM gauge + ``LoadStrategy`` override.
+        * **Storage** — recorded storage class probe results.
+        * **Diagnostics** — Run Benchmark + Save Snapshot buttons.
+
+        State still lives on :class:`Settings` for the session;
+        persistence across launches is wired into
+        :mod:`nd2studios.utils.user_config`.
         """
-        # Imports kept local so the main window does not pay for them
-        # at startup if the dialog never opens.
         from PySide6.QtWidgets import (
-            QCheckBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout,
+            QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout,
+            QLabel, QPushButton, QTabWidget, QVBoxLayout, QWidget,
         )
 
         from nd2studios.compute.gpu import configure as gpu_configure
         from nd2studios.compute.gpu import gpu_status
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("Performance")
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(16, 16, 16, 12)
+        dlg.setWindowTitle("Performance & Diagnostics")
+        dlg.resize(560, 420)
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(16, 16, 16, 12)
+        tabs = QTabWidget(dlg)
+        root.addWidget(tabs)
+
+        # ── GPU tab ────────────────────────────────────────────────
+        gpu_tab = QWidget()
+        gpu_layout = QVBoxLayout(gpu_tab)
 
         status = gpu_status()
         if status["available"]:
             mem = status.get("memory_gb", 0.0)
+            free_mem = status.get("free_memory_gb", mem)
             gpu_label = (
-                f"Use GPU acceleration ({status['device_name']}, {mem:.1f} GB)"
+                f"Use GPU acceleration ({status['device_name']}, "
+                f"{mem:.1f} GB total, {free_mem:.1f} GB free)"
             )
             if not status.get("cucim", False):
                 gpu_label += "  — cucim missing; install for full speedup"
         else:
             gpu_label = f"Use GPU acceleration — unavailable: {status['reason']}"
-
         gpu_cb = QCheckBox(gpu_label)
         gpu_cb.setChecked(bool(getattr(Settings, "USE_GPU_ANALYSIS", False))
                           and status["available"])
         gpu_cb.setEnabled(bool(status["available"]))
-        layout.addWidget(gpu_cb)
+        gpu_layout.addWidget(gpu_cb)
 
         pyr_cb = QCheckBox("Build multi-resolution pyramids on import")
         pyr_cb.setChecked(bool(getattr(Settings, "BUILD_PYRAMIDS", True)))
@@ -733,22 +726,88 @@ class MainWindow(QMainWindow):
                 "Pyramids require the optional `zarr` package. "
                 "Install with `pip install zarr`."
             )
-        layout.addWidget(pyr_cb)
+        gpu_layout.addWidget(pyr_cb)
 
-        # Rebuild button + helper label
-        from PySide6.QtWidgets import QPushButton
         rebuild_btn = QPushButton("Rebuild pyramid for current file")
         rebuild_btn.setEnabled(self.session is not None and HAS_ZARR)
-        layout.addWidget(rebuild_btn)
-        layout.addWidget(QLabel(
+        gpu_layout.addWidget(rebuild_btn)
+        gpu_layout.addWidget(QLabel(
             f"Workspace: {self.session.session_dir if self.session else '— (no file imported)'}",
         ))
+        gpu_layout.addStretch(1)
+        tabs.addTab(gpu_tab, "GPU")
 
+        # ── Memory tab ─────────────────────────────────────────────
+        mem_tab = QWidget()
+        mem_layout = QVBoxLayout(mem_tab)
+        from nd2studios.utils.resources import detect
+        res = detect()
+        mem_layout.addWidget(QLabel(
+            f"Total RAM:     {res.total_ram_gb:.1f} GB"
+        ))
+        mem_layout.addWidget(QLabel(
+            f"Available RAM: {res.available_ram_gb:.1f} GB"
+        ))
+        if self.memory_monitor is not None:
+            mem_layout.addWidget(QLabel(
+                f"Current use:   {self.memory_monitor.current_percent():.0f}%"
+                f" (band: {self.memory_monitor.current_band().name})"
+            ))
+        mem_layout.addWidget(QLabel(
+            f"Cache budget:  {(res.available_ram_bytes * 0.4) / 1024**3:.2f} GB "
+            "(40% of available)"
+        ))
+        mem_layout.addWidget(QLabel("Load strategy override:"))
+        strategy_combo = QComboBox()
+        strategy_combo.addItem("Auto", "")
+        strategy_combo.addItem("Force Eager (full)", "eager_full")
+        strategy_combo.addItem("Force Eager (Z-collapsed)", "eager_reduced")
+        strategy_combo.addItem("Force Lazy (cached)", "lazy_cached")
+        current_forced = getattr(Settings, "FORCED_LOAD_STRATEGY", "") or ""
+        idx = max(0, strategy_combo.findData(current_forced))
+        strategy_combo.setCurrentIndex(idx)
+        mem_layout.addWidget(strategy_combo)
+        mem_layout.addStretch(1)
+        tabs.addTab(mem_tab, "Memory")
+
+        # ── Storage tab ───────────────────────────────────────────
+        st_tab = QWidget()
+        st_layout = QVBoxLayout(st_tab)
+        from nd2studios.utils.storage import _load_probe_cache
+        try:
+            probes = _load_probe_cache()
+        except Exception:
+            probes = {}
+        if probes:
+            st_layout.addWidget(QLabel("Cached storage-class probes:"))
+            for drive, fast in sorted(probes.items()):
+                st_layout.addWidget(QLabel(
+                    f"  {drive}  {'fast (NVMe/SSD)' if fast else 'slow / unknown'}"
+                ))
+        else:
+            st_layout.addWidget(QLabel(
+                "No drives probed yet — class is measured on first file open."
+            ))
+        st_layout.addStretch(1)
+        tabs.addTab(st_tab, "Storage")
+
+        # ── Diagnostics tab ───────────────────────────────────────
+        diag_tab = QWidget()
+        diag_layout = QVBoxLayout(diag_tab)
+        diag_layout.addWidget(QLabel(
+            "Save a JSON snapshot of the current detection state for support tickets."
+        ))
+        snapshot_btn = QPushButton("Save snapshot…")
+        diag_layout.addWidget(snapshot_btn)
+        diag_layout.addStretch(1)
+        tabs.addTab(diag_tab, "Diagnostics")
+
+        # ── OK / Cancel ───────────────────────────────────────────
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel,
         )
-        layout.addWidget(buttons)
+        root.addWidget(buttons)
 
         def _do_rebuild() -> None:
             exp = self.exp_manager.active
@@ -759,18 +818,54 @@ class MainWindow(QMainWindow):
             stage = self.pyramid_stage()
             if stage is None:
                 return
-            # Wipe the prior record so the build is forced.
             self.session.remove_stage(stage.name, delete_artifacts=True)  # type: ignore[union-attr]
             self.start_pyramid_build(volume)
             dlg.accept()
 
+        def _save_snapshot() -> None:
+            from datetime import datetime
+            import json
+            snap = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "system": {
+                    "total_ram_gb": res.total_ram_gb,
+                    "available_ram_gb": res.available_ram_gb,
+                    "cpu_physical": res.cpu_count_physical,
+                    "cpu_logical": res.cpu_count_logical,
+                },
+                "gpu": status,
+                "storage_probes": probes,
+                "settings": {
+                    "USE_GPU_DISPLAY": getattr(Settings, "USE_GPU_DISPLAY", None),
+                    "USE_GPU_ANALYSIS": getattr(Settings, "USE_GPU_ANALYSIS", None),
+                    "BUILD_PYRAMIDS": getattr(Settings, "BUILD_PYRAMIDS", None),
+                    "EAGER_MAX_FRACTION": getattr(Settings, "EAGER_MAX_FRACTION", None),
+                },
+            }
+            target, _ = QFileDialog.getSaveFileName(
+                dlg,
+                "Save diagnostics snapshot",
+                f"nd2studios_diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                "JSON (*.json)",
+            )
+            if not target:
+                return
+            try:
+                with open(target, "w", encoding="utf-8") as f:
+                    json.dump(snap, f, indent=2, default=str)
+                self.set_status_text(f"Snapshot saved: {target}")
+            except OSError as exc:
+                QMessageBox.warning(dlg, "Snapshot failed", str(exc))
+
         rebuild_btn.clicked.connect(_do_rebuild)
+        snapshot_btn.clicked.connect(_save_snapshot)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
 
         if dlg.exec() == QDialog.DialogCode.Accepted:
             Settings.USE_GPU_ANALYSIS = bool(gpu_cb.isChecked())
             Settings.BUILD_PYRAMIDS = bool(pyr_cb.isChecked())
+            Settings.FORCED_LOAD_STRATEGY = strategy_combo.currentData() or ""
             effective = gpu_configure(Settings.USE_GPU_ANALYSIS)
             if Settings.USE_GPU_ANALYSIS and not effective:
                 self.set_status_text(
@@ -780,8 +875,16 @@ class MainWindow(QMainWindow):
                 self.set_status_text(
                     "Performance settings updated "
                     f"(GPU analysis: {'on' if effective else 'off'}, "
-                    f"pyramids: {'on' if Settings.BUILD_PYRAMIDS else 'off'})."
+                    f"pyramids: {'on' if Settings.BUILD_PYRAMIDS else 'off'}, "
+                    f"strategy: {Settings.FORCED_LOAD_STRATEGY or 'auto'})."
                 )
+            # Persist to ~/.config/nd2studios/preferences.json so the
+            # next launch picks up the user's choices.
+            try:
+                from nd2studios.utils.user_config import save_user_preferences
+                save_user_preferences()
+            except Exception:  # noqa: BLE001 — never block dialog close on a disk error
+                pass
 
     # ── Macro recorder ─────────────────────────────────────────────
     def _open_macro(self) -> None:
@@ -1067,6 +1170,85 @@ class MainWindow(QMainWindow):
                     released_any = True
         if released_any:
             self.set_status_text("Analysis stage released to workspace.")
+
+    # ── V1.41 memory monitor slots ────────────────────────────────
+    def _on_memory_sampled(self, percent: float) -> None:
+        """Update the bottom-bar gauge on every sample.
+
+        The label uses GB-of-total-RAM-used rather than just the
+        percent so the user knows where the boundary is in absolute
+        terms — 80% of 16 GB and 80% of 64 GB feel very different.
+        """
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            used_gb = (vm.total - vm.available) / (1024 ** 3)
+            total_gb = vm.total / (1024 ** 3)
+            text = f"RAM {used_gb:.1f}/{total_gb:.1f} GB ({percent:.0f}%)"
+        except Exception:  # noqa: BLE001
+            text = f"RAM {percent:.0f}%"
+        # Colour bands match the same thresholds the monitor uses.
+        if percent >= getattr(Settings, "MEMORY_PRESSURE_EMERGENCY_PCT", 95.0):
+            color = Settings.ACCENT_RED
+        elif percent >= getattr(Settings, "MEMORY_PRESSURE_CRITICAL_PCT", 90.0):
+            color = Settings.ACCENT_ORANGE
+        elif percent >= getattr(Settings, "MEMORY_PRESSURE_WARNING_PCT", 80.0):
+            color = Settings.ACCENT_YELLOW
+        else:
+            color = Settings.FG_SECONDARY
+        self._memory_gauge.setStyleSheet(f"color: {color}; font: 8pt;")
+        self._memory_gauge.setText(text)
+
+    def _on_memory_critical(self, percent: float) -> None:
+        """Drop pre-render caches on every active viewer."""
+        self.set_status_text(
+            f"Memory critical ({percent:.0f}%) — dropping render caches."
+        )
+        self._drop_viewer_caches()
+
+    def _on_memory_emergency(self, percent: float) -> None:
+        """Block new heavy ops and surface a one-time modal warning."""
+        self._heavy_ops_blocked = True
+        if self._memory_modal_shown:
+            return
+        self._memory_modal_shown = True
+        QMessageBox.critical(
+            self,
+            "Memory critical",
+            (
+                f"System memory is at {percent:.0f}% — close other "
+                f"applications before starting new recipes, analyses, or "
+                f"exports.  The current session remains usable but new "
+                f"heavy operations are blocked until pressure drops."
+            ),
+        )
+
+    def _on_memory_recovered(self, percent: float) -> None:
+        """Re-enable heavy ops once pressure clears."""
+        self._heavy_ops_blocked = False
+        self._memory_modal_shown = False
+        self.set_status_text(f"Memory recovered ({percent:.0f}%).")
+
+    def _drop_viewer_caches(self) -> None:
+        """Walk active pages and invalidate any viewer render caches.
+
+        Each :class:`~nd2studios.widgets.multi_axis_viewer.MultiAxisViewer`
+        owns its own caches; calling ``_invalidate_render_cache`` on
+        each instance is the cheapest way to free the 6+ GB the
+        pre-render pipeline can occupy.
+        """
+        from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
+        for viewer in self.findChildren(MultiAxisViewer):
+            try:
+                invalidate = getattr(viewer, "_invalidate_render_cache", None)
+                if callable(invalidate):
+                    invalidate()
+            except Exception:  # noqa: BLE001 — best-effort, never crash
+                continue
+
+    def heavy_ops_blocked(self) -> bool:
+        """Public accessor pages consult before starting a heavy worker."""
+        return self._heavy_ops_blocked
 
     # ── Public hooks the pages call ────────────────────────────────
     def set_progress(self, value: int, text: str = "") -> None:

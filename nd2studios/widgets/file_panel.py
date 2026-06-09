@@ -157,6 +157,10 @@ class FilePanel(QWidget):
         self.viewer.coords_changed.connect(self._on_coords_changed)
         self.viewer.channels_changed.connect(self._on_channels_changed)
         self.viewer.stitch_requested.connect(self._on_stitch_clicked)
+        self.viewer.crop_to_selection_requested.connect(self._on_crop_to_selection)
+        self._full_volume = None      # original dataset before any crop
+        self._full_timestamps = None
+        self._crop_worker = None
         self._inner_splitter.addWidget(self.viewer)
 
         self._inner_splitter.setStretchFactor(0, 0)
@@ -289,6 +293,16 @@ class FilePanel(QWidget):
         btn_row.addWidget(self.btn_stitch)
         sl.addLayout(btn_row)
 
+        # V1.43 — revert a tile-strip crop back to the full dataset. Hidden
+        # until a crop is applied.
+        self.btn_revert_crop = QPushButton("Revert to full data")
+        self.btn_revert_crop.setObjectName("compactBtn")
+        self.btn_revert_crop.setToolTip(
+            "Undo the frame crop and restore the full imported dataset.")
+        self.btn_revert_crop.clicked.connect(self._on_revert_crop)
+        self.btn_revert_crop.setVisible(False)
+        sl.addWidget(self.btn_revert_crop)
+
         sl.addStretch(1)
         return ctrl
 
@@ -401,6 +415,12 @@ class FilePanel(QWidget):
         rec.pixel_size_um = float(meta.get("pixel_size_um", 1.0))
 
         volume = payload.get("volume")
+        # V1.43 — a fresh import clears any prior crop and records the full
+        # dataset/timestamps so "Revert to full data" can restore them.
+        self._full_volume = None
+        self._full_timestamps = None
+        self.btn_revert_crop.setVisible(False)
+        self.viewer.set_frame_timestamps(rec._frame_timestamps)
         if volume is not None:
             self.viewer.set_volume(
                 volume,
@@ -457,6 +477,88 @@ class FilePanel(QWidget):
             z_index=int(z), m=int(m), t=int(t), z=int(z),
             stage_xy_um=list((rec.nd2_metadata or {}).get("stage_xy_um") or []),
         )
+
+    # ── V1.43 crop-to-selection ──
+    def _on_crop_to_selection(self, axis: str, sel) -> None:
+        """Crop the dataset to the tile-strip selection (off-thread).
+
+        T selection keeps all M and Z; M/Z selection constrains only that axis.
+        The original file is untouched — the crop builds a fresh in-RAM dataset.
+        """
+        from nd2studios.workers.crop_worker import CropWorker
+
+        rec = self.record
+        volume = rec._raw_volume
+        indices = sorted(sel)
+        if volume is None or len(indices) < 1:
+            return
+        # Remember the full dataset on the first crop so revert can restore it.
+        if self._full_volume is None:
+            self._full_volume = volume
+            self._full_timestamps = rec._frame_timestamps
+
+        if self._cb_status:
+            self._cb_status(f"Cropping to {len(indices)} {axis.upper()} frame(s)…")
+
+        worker = CropWorker(volume, axis, indices, parent=self)
+        self._crop_worker = worker
+        if self._cb_progress:
+            worker.progress.connect(self._cb_progress)
+        if self._cb_status:
+            worker.status.connect(self._cb_status)
+        worker.finished.connect(lambda cropped, ax=axis, idx=indices:
+                                self._on_crop_done(cropped, ax, idx))
+        worker.error.connect(lambda m: self._on_error(m))
+        worker.start()
+
+    def _on_crop_done(self, cropped, axis: str, indices) -> None:
+        rec = self.record
+        rec._raw_volume = cropped
+        # Subset T timestamps to match a T crop so the metadata stays correct.
+        if axis == "t" and self._full_timestamps is not None:
+            try:
+                ts = [self._full_timestamps[i] for i in indices
+                      if 0 <= i < len(self._full_timestamps)]
+                rec._frame_timestamps = ts
+            except Exception:
+                pass
+        m, t, z = self.viewer.coords()
+        self.viewer.set_frame_timestamps(rec._frame_timestamps)
+        self.viewer.set_volume(
+            cropped,
+            channel_display=rec.channel_display,
+            z_mode=self.combo_zproj.currentText(),
+            z_index=0, m=0, t=0, z=0,
+            stage_xy_um=list((rec.nd2_metadata or {}).get("stage_xy_um") or []),
+        )
+        self.btn_revert_crop.setVisible(True)
+        if self._cb_progress:
+            self._cb_progress(0)
+        if self._cb_status:
+            self._cb_status(
+                f"Cropped to {cropped.n_multipoints}×{cropped.n_timepoints}×"
+                f"{cropped.n_zslices} (M×T×Z). Original file untouched.")
+
+    def _on_revert_crop(self) -> None:
+        if self._full_volume is None:
+            return
+        rec = self.record
+        rec._raw_volume = self._full_volume
+        rec._frame_timestamps = self._full_timestamps
+        self.viewer.set_frame_timestamps(self._full_timestamps)
+        self.viewer.set_volume(
+            self._full_volume,
+            channel_display=rec.channel_display,
+            z_mode=self.combo_zproj.currentText(),
+            z_index=rec.z_view_index,
+            m=0, t=0, z=rec.z_view_index,
+            stage_xy_um=list((rec.nd2_metadata or {}).get("stage_xy_um") or []),
+        )
+        self._full_volume = None
+        self._full_timestamps = None
+        self.btn_revert_crop.setVisible(False)
+        if self._cb_status:
+            self._cb_status("Reverted to full dataset.")
 
     def _on_confirm_clicked(self) -> None:
         if self._cb_confirm:

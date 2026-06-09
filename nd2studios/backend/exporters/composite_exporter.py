@@ -19,6 +19,8 @@ from typing import Callable, Dict, Optional, Tuple
 import numpy as np
 import tifffile
 
+from nd2studios.utils.progress import FrameProgress
+
 
 @dataclass
 class ImageAdjustments:
@@ -300,6 +302,7 @@ def export_rgb_composite_tiff(
 
     bigtiff = n * sample.shape[1] * sample.shape[2] * 3 > 3_900_000_000
 
+    fp = FrameProgress(n, progress_cb)
     with tifffile.TiffWriter(filepath, bigtiff=bigtiff) as writer:
         for t in range(n):
             frame_dict = {name: arr[t] for name, arr in channels.items()}
@@ -312,5 +315,4 @@ def export_rgb_composite_tiff(
                 resolutionunit=None,
                 metadata=metadata if t == 0 else None,
             )
-            if progress_cb is not None:
-                progress_cb(int((t + 1) / n * 100))
+            fp.advance()

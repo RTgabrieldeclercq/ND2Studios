@@ -21,10 +21,15 @@ Three rules govern dispatch:
 """
 from __future__ import annotations
 
+import logging
 import os
-from typing import Any
+import time
+from typing import Any, Optional, Set
 
 import numpy as np
+
+
+log = logging.getLogger(__name__)
 
 
 # Hard env override. Same convention as
@@ -39,6 +44,23 @@ _MIN_SIZE_FOR_GPU = 256 * 256
 
 
 _USE_GPU: bool = False
+
+# ── V1.41 proactive VRAM guard ─────────────────────────────────────
+# ``memGetInfo`` is cheap individually but a recipe running 30 ops/sec
+# burns ~6,000 driver calls per minute. Cache the free-bytes value for
+# a short TTL so the guard imposes near-zero amortized cost.
+_VRAM_CACHE_TTL_S = 0.20
+_vram_cache_ts: float = 0.0
+_vram_cache_free_bytes: int = 0
+
+# Names of ops whose VRAM guard has already logged a fallback warning,
+# so a tight loop doesn't spam the log on every frame.
+_VRAM_WARNED: Set[str] = set()
+
+# Default safety multiplier: cuCIM / cupyx kernels allocate intermediate
+# buffers of similar size to the input. 2.5× covers a 2D blur (input +
+# kernel buffer + output ≈ 3× nbytes) with a margin.
+_VRAM_SAFETY_FACTOR_DEFAULT = 2.5
 
 
 def _hard_disabled() -> bool:
@@ -82,21 +104,108 @@ def is_gpu_enabled() -> bool:
     return _USE_GPU
 
 
-def should_dispatch_to_gpu(array: Any) -> bool:
-    """Return True iff this array is big enough to benefit from GPU.
+def _cached_free_vram_bytes() -> int:
+    """Return free VRAM in bytes, cached for :data:`_VRAM_CACHE_TTL_S`.
+
+    Returns 0 on any failure (driver not loaded, CuPy not importable,
+    device gone). Zero is treated as "not enough" by the guard so we
+    fall back to CPU rather than dispatching against an unknown state.
+    """
+    global _vram_cache_ts, _vram_cache_free_bytes
+    now = time.monotonic()
+    if (now - _vram_cache_ts) < _VRAM_CACHE_TTL_S:
+        return _vram_cache_free_bytes
+    try:
+        import cupy as cp
+        free, _total = cp.cuda.runtime.memGetInfo()
+        _vram_cache_free_bytes = int(free)
+    except Exception:  # noqa: BLE001 — never fail the caller
+        _vram_cache_free_bytes = 0
+    _vram_cache_ts = now
+    return _vram_cache_free_bytes
+
+
+def _vram_warn_once(op: str, needed: int, free: int) -> None:
+    """Log a single VRAM-shortage warning per op name.
+
+    Mirrors the pattern in :mod:`compute.gpu.ops` so the operator
+    sees one informative line per op rather than per-frame spam.
+    """
+    if op in _VRAM_WARNED:
+        return
+    _VRAM_WARNED.add(op)
+    log.warning(
+        "GPU op %s skipped to CPU: needs %.2f GB VRAM, %.2f GB free "
+        "— future occurrences silent.",
+        op or "<unspecified>",
+        needed / 1024**3,
+        free / 1024**3,
+    )
+
+
+def should_dispatch_to_gpu(
+    array: Any,
+    *,
+    op: str = "",
+    safety_factor: float = _VRAM_SAFETY_FACTOR_DEFAULT,
+) -> bool:
+    """Return True iff this array is big enough to benefit from GPU
+    *and* fits in current free VRAM.
 
     Used by :mod:`compute.gpu.ops` to decide between transfer-and-run
-    on GPU vs. running CPU in place. The threshold lives here so it
-    can be tuned without touching every op.
+    on GPU vs. running CPU in place. The size threshold filters out
+    transfer-bound tiny arrays; the proactive VRAM check (V1.41)
+    catches the OOM before dispatch instead of catching the
+    :class:`cupy.cuda.memory.OutOfMemoryError` after the kernel has
+    already torched the device pool.
+
+    ``op`` is an optional event name forwarded to
+    :func:`_vram_warn_once` so the log records *which* op fell back.
+    Callers (e.g. ``nd2studios.compute.gpu.ops.gaussian``) already
+    pass their own name.
+
+    ``safety_factor`` accounts for kernel-internal scratch buffers
+    (cuCIM / cupyx temporaries are typically 1–2× the input). The
+    default of 2.5× is conservative; a known-light op can lower it.
     """
     if not _USE_GPU:
         return False
     if array is None:
         return False
     try:
-        return int(np.asarray(array).size) >= _MIN_SIZE_FOR_GPU
-    except Exception:  # noqa: BLE001 — defensive; never fail the caller
+        np_view = np.asarray(array)
+        size = int(np_view.size)
+    except Exception:  # noqa: BLE001
         return False
+    if size < _MIN_SIZE_FOR_GPU:
+        return False
+
+    try:
+        needed = int(np_view.nbytes * float(safety_factor))
+    except Exception:  # noqa: BLE001
+        return True  # If nbytes is unreadable, fall back to size-only check.
+
+    free = _cached_free_vram_bytes()
+    if free <= 0:
+        # VRAM probe failed — be safe and let the op handle its own
+        # fallback (the ops module catches CuPy errors anyway).
+        return True
+    if needed > free:
+        _vram_warn_once(op, needed, free)
+        return False
+    return True
+
+
+def reset_vram_cache() -> None:
+    """Invalidate the cached free-VRAM reading.
+
+    Tests and the diagnostics panel call this so they observe a
+    fresh ``memGetInfo`` value rather than the previous 200 ms-stale
+    one. Not needed during normal operation.
+    """
+    global _vram_cache_ts, _vram_cache_free_bytes
+    _vram_cache_ts = 0.0
+    _vram_cache_free_bytes = 0
 
 
 def to_xp(arr: Any) -> Any:

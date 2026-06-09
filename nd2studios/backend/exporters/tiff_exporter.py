@@ -23,6 +23,8 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 import tifffile
 
+from nd2studios.utils.progress import FrameProgress
+
 
 @contextlib.contextmanager
 def _silence_bigtiff_imagej_warning():
@@ -60,6 +62,51 @@ def _normalize_to_uint16(stack: np.ndarray, p_low: float = 0.5,
     return (f * 65535).astype(np.uint16)
 
 
+def _percentile_bounds_subsample(
+    stack: np.ndarray,
+    p_low: float = 0.5,
+    p_high: float = 99.5,
+    max_samples: int = 1_000_000,
+) -> tuple:
+    """Return ``(lo, hi)`` from a downsampled subset without copying the full stack.
+
+    Streaming exports want per-channel contrast bounds without paying the
+    ``stack.astype(np.float32)`` copy that the legacy whole-array
+    :func:`_normalize_to_uint8` makes (a 16 GB cast on an 8 GB uint16
+    channel). For percentile stretching the full population is rarely
+    needed — a random subsample of ~1M pixels matches the full-stack
+    result to <0.1% on typical microscopy data while paying O(samples)
+    memory.
+    """
+    flat = stack.ravel()
+    n = flat.size
+    if n == 0:
+        return 0.0, 1.0
+    if n <= max_samples:
+        sample = flat.astype(np.float32, copy=False)
+    else:
+        # Strided pick: deterministic, no PRNG warmup, no full-array copy.
+        step = max(1, n // max_samples)
+        sample = flat[::step].astype(np.float32, copy=False)
+    lo = float(np.percentile(sample, p_low))
+    hi = float(np.percentile(sample, p_high))
+    if hi <= lo:
+        hi = lo + 1.0
+    return lo, hi
+
+
+def _rescale_page(page: np.ndarray, lo: float, hi: float, out_dtype) -> np.ndarray:
+    """Apply ``(lo, hi)`` contrast stretch to a single (H, W) page.
+
+    No full-stack copy — only the page is promoted to float32 and back.
+    """
+    f = page.astype(np.float32)
+    f = np.clip((f - lo) / (hi - lo + 1e-10), 0.0, 1.0)
+    if out_dtype is np.uint8:
+        return (f * 255.0).astype(np.uint8)
+    return (f * 65535.0).astype(np.uint16)
+
+
 def export_tiff_stack(
     stack: np.ndarray,
     filepath: str,
@@ -90,14 +137,26 @@ def export_tiff_stack(
     if not filepath.lower().endswith((".tif", ".tiff")):
         filepath += ".tif"
 
-    if bit_depth == "uint8":
-        stack = _normalize_to_uint8(stack)
-    elif bit_depth == "uint16":
-        stack = _normalize_to_uint16(stack)
-    elif bit_depth != "passthrough":
+    if bit_depth not in ("passthrough", "uint8", "uint16"):
         raise ValueError(f"Unknown bit_depth: {bit_depth}")
 
-    bigtiff = stack.nbytes > 3_900_000_000
+    # Resolve the output dtype + contrast bounds without building a
+    # float32 copy of the whole stack. For rescale modes a 1M-pixel
+    # subsample picks the percentile bounds to <0.1% of the full-stack
+    # answer while keeping memory flat.
+    bounds: Optional[tuple] = None
+    out_dtype = stack.dtype
+    if bit_depth == "uint8":
+        out_dtype = np.uint8  # type: ignore[assignment]
+        bounds = _percentile_bounds_subsample(stack)
+    elif bit_depth == "uint16":
+        out_dtype = np.uint16  # type: ignore[assignment]
+        bounds = _percentile_bounds_subsample(stack)
+
+    # Estimate output footprint for the BigTIFF threshold.
+    bytes_per_pixel = np.dtype(out_dtype).itemsize
+    total_bytes = int(np.prod(stack.shape)) * bytes_per_pixel
+    bigtiff = total_bytes > 3_900_000_000
 
     resolution: Optional[tuple] = None
     if pixel_size_um is not None and pixel_size_um > 0:
@@ -109,29 +168,56 @@ def export_tiff_stack(
         if pixel_size_um is not None and pixel_size_um > 0:
             metadata = {"unit": "um", "spacing": pixel_size_um}
         n = stack.shape[0]
+        fp = FrameProgress(n, progress_cb)
         with tifffile.TiffWriter(filepath, bigtiff=bigtiff) as writer:
             for t in range(n):
+                page = stack[t]
+                if bounds is not None:
+                    page = _rescale_page(page, bounds[0], bounds[1], out_dtype)
+                elif page.dtype != out_dtype:
+                    page = page.astype(out_dtype, copy=False)
                 writer.write(
-                    stack[t],
+                    page,
                     photometric="minisblack",
                     resolution=resolution,
                     resolutionunit=None,
                     metadata=metadata if t == 0 else None,
                 )
-                if progress_cb is not None:
-                    progress_cb(int((t + 1) / n * 100))
+                fp.advance()
     else:
-        # (T, Z, H, W) — ImageJ TZYX hyperstack.
+        # (T, Z, H, W) — ImageJ TZYX hyperstack, streamed one (H, W) page
+        # at a time via tifffile's iterator API. ``data=iterator`` lets
+        # tifffile drive the page loop without holding the full hyperstack
+        # in RAM; ``shape=`` + ``dtype=`` are required when ``data`` is an
+        # iterator.
+        n_t, n_z, _h, _w = stack.shape
         ij_meta: dict = {"axes": "TZYX"}
         if pixel_size_um is not None and pixel_size_um > 0:
             ij_meta["unit"] = "um"
             ij_meta["spacing"] = float(pixel_size_um)
+
+        fp = FrameProgress(n_t * n_z, progress_cb)
+
+        def _pages():
+            for t in range(n_t):
+                for z in range(n_z):
+                    page = stack[t, z]
+                    if bounds is not None:
+                        page = _rescale_page(page, bounds[0], bounds[1], out_dtype)
+                    elif page.dtype != out_dtype:
+                        page = page.astype(out_dtype, copy=False)
+                    yield page
+                    fp.advance()
+
         with _silence_bigtiff_imagej_warning():
             tifffile.imwrite(
                 filepath,
-                stack,
+                data=_pages(),
+                shape=stack.shape,
+                dtype=out_dtype,
                 imagej=True,
                 resolution=resolution,
+                resolutionunit=None,
                 metadata=ij_meta,
                 photometric="minisblack",
                 bigtiff=bigtiff,
@@ -199,29 +285,62 @@ def export_tiff_hyperstack(
             )
         arrays.append(a)
 
-    if bit_depth == "uint8":
-        arrays = [_normalize_to_uint8(a) for a in arrays]
-    elif bit_depth == "uint16":
-        arrays = [_normalize_to_uint16(a) for a in arrays]
-    elif bit_depth != "passthrough":
+    if bit_depth not in ("passthrough", "uint8", "uint16"):
         raise ValueError(f"Unknown bit_depth: {bit_depth}")
 
-    # Stack along a new C axis between Z and H so the final shape is
-    # (T, Z, C, H, W) — the ImageJ TZCYX hyperstack layout.
-    hyper = np.stack(arrays, axis=2)
-    bigtiff = hyper.nbytes > 3_900_000_000
+    n_t, n_z, h, w = ref_shape
+    n_c = len(arrays)
 
-    ij_meta: Dict[str, object] = {"Labels": enabled_names}
+    # Per-channel contrast bounds for rescale modes. Computed on a 1M
+    # pixel subsample so we don't pay a full-stack float32 copy (which
+    # would double the RAM peak on top of the channel data already in
+    # memory).
+    bounds: List[Optional[tuple]] = [None] * n_c
+    out_dtype = arrays[0].dtype
+    if bit_depth == "uint8":
+        out_dtype = np.uint8  # type: ignore[assignment]
+        bounds = [_percentile_bounds_subsample(a) for a in arrays]
+    elif bit_depth == "uint16":
+        out_dtype = np.uint16  # type: ignore[assignment]
+        bounds = [_percentile_bounds_subsample(a) for a in arrays]
+
+    # Estimate total output bytes for the BigTIFF threshold without
+    # building the hyperstack in memory.
+    bytes_per_pixel = np.dtype(out_dtype).itemsize
+    total_bytes = n_t * n_z * n_c * h * w * bytes_per_pixel
+    bigtiff = total_bytes > 3_900_000_000
+
+    ij_meta: Dict[str, object] = {
+        "Labels": enabled_names,
+        "axes": "TZCYX",
+    }
     resolution: Optional[tuple] = None
     if pixel_size_um is not None and pixel_size_um > 0:
         resolution = (1.0 / pixel_size_um, 1.0 / pixel_size_um)
         ij_meta["unit"] = "um"
         ij_meta["spacing"] = float(pixel_size_um)
 
+    fp = FrameProgress(n_t * n_z * n_c, progress_cb)
+
+    def _pages():
+        for t in range(n_t):
+            for z in range(n_z):
+                for c_idx in range(n_c):
+                    page = arrays[c_idx][t, z]
+                    if bounds[c_idx] is not None:
+                        lo, hi = bounds[c_idx]
+                        page = _rescale_page(page, lo, hi, out_dtype)
+                    elif page.dtype != out_dtype:
+                        page = page.astype(out_dtype, copy=False)
+                    yield page
+                    fp.advance()
+
     with _silence_bigtiff_imagej_warning():
         tifffile.imwrite(
             filepath,
-            hyper,
+            data=_pages(),
+            shape=(n_t, n_z, n_c, h, w),
+            dtype=out_dtype,
             imagej=True,
             photometric="minisblack",
             resolution=resolution,

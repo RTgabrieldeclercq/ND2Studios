@@ -26,9 +26,13 @@ Example
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import psutil
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -103,3 +107,22 @@ def recommended_worker_count() -> int:
     paths the recipe + analysis pipelines spend time in.
     """
     return min(detect().cpu_count_physical, 8)
+
+
+def log_system_resources() -> None:
+    """Emit a one-line info log summarising host RAM + CPU.
+
+    Called from :func:`nd2studios.__main__.main` after the GPU status
+    line so a single grep in the user's console shows the full
+    startup environment.  Safe to call repeatedly — psutil reads are
+    cheap and ND2Studios does this exactly once per launch.
+    """
+    res = detect()
+    log.info(
+        "System resources: RAM %.1f / %.1f GB available, "
+        "%d physical / %d logical cores",
+        res.available_ram_gb,
+        res.total_ram_gb,
+        res.cpu_count_physical,
+        res.cpu_count_logical,
+    )

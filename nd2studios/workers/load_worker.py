@@ -24,8 +24,38 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from PySide6.QtCore import Signal
 
+from nd2studios.utils.resource_strategy import (
+    LoadStrategy, StrategyDecision, choose_strategy, log_decision,
+)
 from nd2studios.workers.base_worker import BaseWorker
+
+
+def _meta_like_from_dataset_meta(ext_meta: Dict[str, Any]) -> Any:
+    """Adapt the dict-shaped extended metadata into a duck-typed object
+    that :func:`choose_strategy` can read footprint fields off of.
+
+    The TIFF / multi-file paths build their metadata as dicts; rather
+    than reshape them into :class:`ND2Metadata`, we wrap with
+    :class:`types.SimpleNamespace` so ``getattr(meta, ...)`` lookups
+    succeed identically.
+    """
+    import types
+    dtype_raw = ext_meta.get("dtype", "uint16")
+    if isinstance(dtype_raw, str):
+        dtype = np.dtype(dtype_raw)
+    else:
+        dtype = np.dtype(dtype_raw)
+    return types.SimpleNamespace(
+        n_multipoints=ext_meta.get("n_multipoints", 1),
+        n_timepoints=ext_meta.get("n_timepoints", 1),
+        n_zslices=ext_meta.get("n_zslices", 1),
+        n_channels=ext_meta.get("n_channels", 1),
+        height=ext_meta.get("height", 0),
+        width=ext_meta.get("width", 0),
+        dtype=dtype,
+    )
 
 
 class LoadWorker(BaseWorker):
@@ -37,7 +67,18 @@ class LoadWorker(BaseWorker):
     files along ``chain_axis`` (one of ``T`` / ``M`` / ``Z`` / ``C``).
     The format is inferred from the file extensions — all files in a
     single import must share a format.
+
+    V1.41 emits :attr:`strategy_chosen` after metadata is read so the
+    GUI can show which :class:`~nd2studios.utils.resource_strategy.LoadStrategy`
+    will run.  The decision is also returned under the ``strategy``
+    key on the finished payload so callers that don't connect the
+    signal can still inspect it.  Loads that don't fit raise
+    :class:`~nd2studios.utils.resource_strategy.StrategyError` which
+    surfaces through :attr:`BaseWorker.error` with a clear message
+    rather than allowing Python to OOM mid-decode.
     """
+
+    strategy_chosen = Signal(object)
 
     def __init__(
         self,
@@ -92,14 +133,29 @@ class LoadWorker(BaseWorker):
     # ── ND2 path ──
     def _load_nd2(self) -> Dict[str, Any]:
         from nd2studios.backend.nd2_loader import (
-            read_nd2_metadata, read_nd2_metadata_extended,
+            read_nd2_metadata, read_or_cache_nd2_metadata,
         )
         from nd2studios.backend.materialized_loader import materialize_nd2
 
         self.set_status("Reading metadata…")
         meta = read_nd2_metadata(self.filepath)
-        ext_meta = read_nd2_metadata_extended(self.filepath)
+        # V1.42 — sidecar cache. First open writes a small JSON next
+        # to the ND2; subsequent opens skip the multi-second chunk
+        # scan when the source file's mtime is unchanged.
+        ext_meta = read_or_cache_nd2_metadata(self.filepath)
         self.set_progress(15)
+
+        # V1.41 pre-flight: decide a load strategy from the host RAM
+        # budget. Raises StrategyError (→ BaseWorker.error signal) when
+        # even the projected footprint can't fit; that surfaces to the
+        # user as a modal with actionable wording rather than an OOM.
+        decision = choose_strategy(meta, self.filepath)
+        log_decision(decision)
+        self.strategy_chosen.emit(decision)
+        self.set_status(
+            f"Plan: {decision.strategy.value} ({decision.estimated_gb:.2f} GB "
+            f"into {decision.available_gb:.1f} GB available)"
+        )
 
         n_channels = meta.n_channels
         channel_names: List[str] = list(ext_meta.get("channel_names")
@@ -140,6 +196,7 @@ class LoadWorker(BaseWorker):
             "frame_timestamps_s": ts_array,
             "volume": dataset,
             "source_type": "nd2",
+            "strategy": decision,
         }
 
     # ── ND2 multi-file path (V1.28 — chain along T/M/Z/C) ──
@@ -160,6 +217,20 @@ class LoadWorker(BaseWorker):
             self.filepaths, axis, chain_mapping=mapping,
         )
         self.set_progress(15)
+
+        # Pre-flight resource decision before opening the composite
+        # volume. The composite's child file handles allocate non-
+        # trivial OS resources, so we'd rather refuse early than open
+        # them only to discover the data won't fit in RAM.
+        meta_adapter = _meta_like_from_dataset_meta(ext_meta)
+        decision = choose_strategy(meta_adapter, self.filepaths[0])
+        log_decision(decision)
+        self.strategy_chosen.emit(decision)
+        self.set_status(
+            f"Plan: {decision.strategy.value} "
+            f"({decision.estimated_gb:.2f} GB into "
+            f"{decision.available_gb:.1f} GB available)"
+        )
 
         self.set_status(f"Opening composite volume (chain {axis})…")
         composite = LazyMultiFileND2Volume(
@@ -205,6 +276,7 @@ class LoadWorker(BaseWorker):
             "frame_timestamps_s": ts_array,
             "volume": dataset,
             "source_type": "nd2_multi",
+            "strategy": decision,
         }
 
     # ── TIFF multi-file path (V1.28) ──
@@ -230,6 +302,26 @@ class LoadWorker(BaseWorker):
             self.filepaths, axis, chain_mapping=self.chain_mapping,
         )
         self.set_progress(25)
+
+        # Pre-flight resource decision once the composite reports its
+        # dimensions. Same modal-fail-fast behavior as the ND2 paths.
+        composite_meta = _meta_like_from_dataset_meta({
+            "n_multipoints": getattr(composite, "n_multipoints", 1),
+            "n_timepoints": getattr(composite, "n_timepoints", 1),
+            "n_zslices": getattr(composite, "n_zslices", 1),
+            "n_channels": getattr(composite, "n_channels", 1),
+            "height": getattr(composite, "height", 0),
+            "width": getattr(composite, "width", 0),
+            "dtype": str(getattr(composite, "dtype", "uint16")),
+        })
+        decision = choose_strategy(composite_meta, self.filepaths[0])
+        log_decision(decision)
+        self.strategy_chosen.emit(decision)
+        self.set_status(
+            f"Plan: {decision.strategy.value} "
+            f"({decision.estimated_gb:.2f} GB into "
+            f"{decision.available_gb:.1f} GB available)"
+        )
 
         self.set_status(
             f"Materializing {n_files}-file composite TIFF into RAM…"
@@ -295,6 +387,7 @@ class LoadWorker(BaseWorker):
             "frame_timestamps_s": None,
             "volume": dataset,
             "source_type": "tiff_multi",
+            "strategy": decision,
         }
 
     # ── TIFF path ──
@@ -306,6 +399,25 @@ class LoadWorker(BaseWorker):
         self.set_status("Inspecting TIFF…")
         composite = LazyMultiFileTIFFVolume([self.filepath], chain_axis="Z")
         self.set_progress(20)
+
+        # Pre-flight resource decision before materializing.
+        composite_meta = _meta_like_from_dataset_meta({
+            "n_multipoints": getattr(composite, "n_multipoints", 1),
+            "n_timepoints": getattr(composite, "n_timepoints", 1),
+            "n_zslices": getattr(composite, "n_zslices", 1),
+            "n_channels": getattr(composite, "n_channels", 1),
+            "height": getattr(composite, "height", 0),
+            "width": getattr(composite, "width", 0),
+            "dtype": str(getattr(composite, "dtype", "uint16")),
+        })
+        decision = choose_strategy(composite_meta, self.filepath)
+        log_decision(decision)
+        self.strategy_chosen.emit(decision)
+        self.set_status(
+            f"Plan: {decision.strategy.value} "
+            f"({decision.estimated_gb:.2f} GB into "
+            f"{decision.available_gb:.1f} GB available)"
+        )
 
         self.set_status("Materializing TIFF into RAM…")
 
@@ -366,4 +478,5 @@ class LoadWorker(BaseWorker):
             "frame_timestamps_s": None,
             "volume": dataset,
             "source_type": "tiff",
+            "strategy": decision,
         }

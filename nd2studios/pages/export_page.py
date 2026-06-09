@@ -685,11 +685,15 @@ class ExportPage(QWidget):
             chosen_mode = self.combo_tiff_zproj.currentText()
             if chosen_mode != exp.z_view_mode:
                 vol = exp._raw_volume
+                # Keep these lazy — the heavy per-frame read happens inside
+                # ExportWorker (export_tiff_hyperstack calls np.asarray per
+                # channel off the GUI thread). Materializing here would block
+                # the GUI on a multi-GB read (V1.41 smoothness).
                 channels = {
                     ch_name: vol.to_lazy_channel(
                         c_idx, m=exp.m_index,
                         z_mode=chosen_mode, z_index=0,
-                    ).materialize()
+                    )
                     for c_idx, ch_name in enumerate(vol.channel_names)
                 }
             suffix = f"_z{chosen_mode}"

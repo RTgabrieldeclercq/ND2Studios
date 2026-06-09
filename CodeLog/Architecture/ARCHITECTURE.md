@@ -1,6 +1,121 @@
 # ND2Studios Architecture
 
-**Version:** V1.40
+**Version:** V1.44
+
+## V1.44 additions (GUI Overhaul + Button Revamp)
+
+- **`widgets/icon_button.py`** — `ui_scale()` / `scaled()` DPI helper +
+  `qtawesome` icon factories (`make_icon`, `icon_button`, `tool_button`,
+  `bind_toggle_icon`). The single source of DPI scaling and modern vector
+  icons for the chrome (title bar, top tabs, play controls).
+- **Top tab bar** replaces the left sidebar in `core/main_window.py`
+  (`_build_top_tabs`); the `QStackedWidget` page model and `_navigate`
+  are unchanged. New `#topTabBar` / `#topTabBtn` / `#sessionTabBtn` QSS.
+- **Pinned metadata** at the bottom of the right `LutSidebar`
+  (`set_metadata_text`, `#metaBox`), updated from
+  `MultiAxisViewer._update_axis_labels`.
+- New dependency: **`qtawesome`**.
+
+## V1.43 additions (Tile-Strip Frame Navigator)
+
+- **`widgets/frame_strip.py`** — `FrameStrip`, a single-`paintEvent`
+  strip of rectangular frame tiles (fills width, wraps to rows below a
+  DPI-scaled min tile width). Selection / range / keyboard stepping /
+  crop-request. One per axis in `MultiAxisViewer`, backed by a hidden
+  `QSlider` (the index model) for zero-churn integration with existing
+  playback / value code.
+- **`MaterializedDataset.subset(m, t, z)`** + **`workers/crop_worker.py`**
+  — "crop to selected frames" builds a new in-RAM dataset (`np.ix_`
+  copy) off the GUI thread; the source is never mutated. A T crop keeps
+  all M/Z (hierarchy rule). `file_panel.py` swaps `record._raw_volume`
+  to the crop and offers "Revert to full data"; downstream tabs read the
+  active dataset so they honor the crop.
+- Per-axis metadata tooltips on the strip (T timestamps/Δt/elapsed, M
+  pixel-size/resolution/FOV, Z step/height-in-range) via
+  `MultiAxisViewer.set_frame_timestamps` + `_frame_meta_text`.
+
+## V1.42 additions (Viewer Optimizations from Industry Comparison)
+
+Five techniques borrowed from Bio-Formats, napari, and BigDataViewer
+after a comparative pass on what popular microscopy viewers do.
+
+- **Metadata sidecar (`.nd2idx.json`)** — `read_or_cache_nd2_metadata`
+  in `backend/nd2_loader.py` is the Bio-Formats Memoizer analogue.
+  First open writes the full extended metadata to a JSON sidecar;
+  subsequent opens load it when fresh (mtime check) instead of
+  walking ND2 chunks.  10×+ faster re-open on multi-GB files.
+- **`LazyND2Channel` LRU read cache** — opt-in `cache_max_bytes`
+  parameter (BDV `CellCache` pattern).  Disabled by default; future
+  `LoadStrategy.LAZY_CACHED` path will set a budget.  Cached frames
+  are flagged read-only.
+- **`MultiAxisViewer.attach_pyramid(reader)`** — wires the existing
+  `PyramidReader.pick_level_for_viewport` into the view path.  When
+  zoomed out far enough that one screen pixel covers many image
+  pixels, `_read_volume_plane` reads from the pyramid level whose
+  width still beats the viewport — much less GPU upload on large
+  mosaics.
+- **`_invalidate_render_cache(*, lut_only=True)`** — napari shader-
+  LUT decoupling.  GPU-canvas-active path makes LUT change a no-op
+  (pyqtgraph re-applies levels each paint).  CPU-canvas path keeps
+  existing cache entries and lets the pre-render worker overwrite
+  them in-place rather than starting from scratch.
+- **`utils/request_queue.py`** — cancel-first `SingleSlotMailbox`
+  and `PriorityLanes` primitives (napari NAP-4 pattern).  Workers
+  poll `token.cancelled` at checkpoints; new requests immediately
+  invalidate in-flight peers.  Utility shipped; consumers wire it
+  in incrementally.
+
+## V1.41 additions (Pipeline Smoothness + Resource-Aware Loading)
+
+- **`utils/progress.py`** — `FrameProgress` accountant + `total_frames_for`
+  helper. The single progress contract: every long op counts real
+  `T·M·Z·C` frames and emits integer percent only on change (1 % thresholds).
+  Consumed by all exporters and the recipe / export / pre-render workers; the
+  GUI-facing signal stays `BaseWorker.set_progress(int)`.
+- **`utils/perf.py`** — process-wide perf instrumentation gated by
+  `ND2_PERF_LOG=1`. `perf_log` decorator, `perf_block` context
+  manager, `log_event` raw row emitter. Output appends to
+  `~/.nd2studios/perf.csv`. Decorator is a no-op passthrough when
+  disabled — zero call-site overhead in normal operation.
+- **`utils/resource_strategy.py`** — pre-flight `choose_strategy`
+  picks among `EAGER_FULL` / `EAGER_REDUCED` / `LAZY_CACHED` from
+  RAM availability and the dataset footprint. Hard cap of
+  `2× available` rejects loads via `StrategyError`. Test seam:
+  `ND2_FAKE_RAM_GB` env override. **Wired into `LoadWorker` as a
+  pre-flight gate (V1.41); the EAGER_REDUCED and LAZY_CACHED
+  branches in `materialize_nd2` are deferred to V1.42** — today the
+  budgeter rejects oversized loads but doesn't yet collapse Z or
+  return lazy proxies.
+- **`core/memory_monitor.py`** — `QObject` singleton polling
+  `psutil.virtual_memory().percent` at 1.5 s. Banded signals with
+  hysteresis: `warning` (80→75), `critical` (90→85, drops pre-render
+  caches), `emergency` (95→90, modal warning + heavy-op block),
+  `recovered` (back to NORMAL). Subscribed by `MainWindow`; emergency
+  band sets `MainWindow.heavy_ops_blocked()` for pages to consult.
+- **`utils/user_config.py`** — round-trips a small subset of
+  `Settings` to `%APPDATA%/nd2studios/preferences.json` (or
+  `~/.config/...` on POSIX). Loaded by `__main__` before UI build;
+  saved on Performance dialog accept.
+- **`compute/gpu/array.py`** — `should_dispatch_to_gpu` now consults
+  free VRAM via a 200 ms-TTL-cached `memGetInfo()` and falls back to
+  CPU with a `_vram_warn_once` log when needed × safety_factor > free.
+- **`utils/storage.py`** — Windows storage probe via 16 MB read, JSON
+  cached per drive letter. `log_default_storage_class` surfaces the
+  verdict at startup and defers if no probeable file is present.
+- **Streaming exporters** — `tiff_exporter.py` and `movie_exporter.py`
+  now feed `tifffile.imwrite(data=iter, shape=..., dtype=...)` and
+  `imageio.get_writer(...).append_data(...)` per frame/page. Peak
+  RAM during export drops from full-stack-in-list to single frame.
+- **`Settings.FORCED_LOAD_STRATEGY`, `EAGER_MAX_FRACTION`,
+  `MEMORY_PRESSURE_*`** — runtime-overridable constants driving the
+  new subsystems.
+- **`widgets/video_player.py` deleted** — unused dead code. The real
+  playback path is `MultiAxisViewer._axis_tick → _do_refresh`, and
+  the cache-aware hot paths in `_do_refresh` (lines 987–1038)
+  already implement what V1.41's plan attributed to a separate
+  `FrameCache`.
+
+## V1.40
 
 ## System Overview
 

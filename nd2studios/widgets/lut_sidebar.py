@@ -174,7 +174,37 @@ class LutSidebar(QFrame):
         self._body.setWidget(self._inner)
         outer.addWidget(self._body, stretch=1)
 
+        # V1.44 — file metadata pinned at the bottom of the right panel,
+        # always visible (outside the scroll area).
+        self._meta_box = QFrame()
+        self._meta_box.setObjectName("metaBox")
+        self._meta_box.setStyleSheet(
+            "QFrame#metaBox { background: %s; border-top: 1px solid %s; }"
+            % (Settings.BG_SECONDARY, Settings.BORDER_COLOR)
+        )
+        meta_layout = QVBoxLayout(self._meta_box)
+        meta_layout.setContentsMargins(8, 6, 8, 6)
+        meta_layout.setSpacing(2)
+        meta_title = QLabel("Metadata")
+        meta_title.setStyleSheet(
+            f"color: {Settings.ACCENT_CYAN}; font: bold 8pt 'Helvetica Neue';")
+        meta_layout.addWidget(meta_title)
+        self._meta_label = QLabel("—")
+        self._meta_label.setWordWrap(True)
+        self._meta_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._meta_label.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: 8pt 'Helvetica Neue';")
+        meta_layout.addWidget(self._meta_label)
+        outer.addWidget(self._meta_box)
+
         self._update_collapse_glyph()
+
+    def set_metadata_text(self, text: str) -> None:
+        """Update the pinned bottom-of-panel metadata block (V1.44)."""
+        self._meta_label.setText(text or "—")
+        # Hide the whole block when the sidebar is collapsed to its rail.
+        self._meta_box.setVisible(self._expanded)
 
     # ── Whole-sidebar collapse ──
     @property

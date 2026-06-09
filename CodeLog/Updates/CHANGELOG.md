@@ -4,6 +4,359 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-06-09 (V1.44 GUI Overhaul + Button Revamp)
+
+Navigation moves from a left sidebar to a top tab bar; buttons become modern,
+DPI-scaling qtawesome vector icons; file metadata is pinned at the bottom of the
+right panel. Plan:
+[CodeLog/ClaudesPlan/V1.44_gui_overhaul_buttons.md](CodeLog/ClaudesPlan/V1.44_gui_overhaul_buttons.md).
+
+### Added
+
+- **`nd2studios/widgets/icon_button.py`** (new) — DPI-aware icon button system.
+  `ui_scale()` / `scaled(px)` derive a scale factor from the primary screen's
+  logical DPI; `make_icon()` builds recolored `qtawesome` vector icons on the
+  Dracula palette; `icon_button()` / `tool_button()` are DPI-scaled button
+  factories; `bind_toggle_icon()` swaps a checkable button's icon on toggle
+  (play ⇄ pause). qtawesome import is guarded (degrades to text if absent).
+- **`qtawesome`** dependency (added to `requirements.txt`).
+- **Top tab bar** ([main_window.py](nd2studios/core/main_window.py)
+  `_build_top_tabs`) — horizontal `#topTabBar` under the title bar with page
+  tabs (icon + text, accent underline when active) and session actions on the
+  right. New QSS `#topTabBar` / `#topTabBtn` / `#sessionTabBtn` in
+  [theme.py](nd2studios/core/theme.py).
+- **Pinned metadata block** — `LutSidebar.set_metadata_text()` adds an
+  always-visible `#metaBox` at the bottom of the right panel
+  ([lut_sidebar.py](nd2studios/widgets/lut_sidebar.py)), fed by
+  `MultiAxisViewer._update_axis_labels` with the current T/M/Z metadata.
+
+### Changed
+
+- **Navigation migrated from the left sidebar to the top tab bar.** The
+  collapsible sidebar, its animation, and the `_sidebar*` / `_toggle_sidebar` /
+  `_on_sidebar_anim_done` machinery were removed from
+  [main_window.py](nd2studios/core/main_window.py). Page switching still flows
+  through `_navigate` → `QStackedWidget`.
+- **Title-bar Min/Max/Close** and **per-axis play buttons** now use qtawesome
+  icons (`fa5s.window-minimize/maximize/times`, `fa5s.play`⇄`fa5s.pause`).
+  `MultiAxisViewer._set_axis_playing` no longer swaps button text.
+
+## [Unreleased] - 2026-06-09 (V1.43 Tile-Strip Frame Navigator)
+
+A Nikon NIS-Elements-style rectangular tile strip replaces the per-axis slider,
+adding frame selection, range/keyboard navigation, play-only-selected, and a
+crop-to-selection that builds a new in-RAM dataset without touching the
+original file. Plan:
+[CodeLog/ClaudesPlan/V1.43_tile_strip_navigator.md](CodeLog/ClaudesPlan/V1.43_tile_strip_navigator.md).
+
+### Added
+
+- **`nd2studios/widgets/frame_strip.py`** (new) — `FrameStrip(QWidget)`, a
+  single-`paintEvent` strip of rectangular frame tiles that fill the viewer
+  width and **wrap to additional rows** below a DPI-scaled minimum tile width
+  (≥ half a cursor). Current frame highlighted in the theme accent; selection in
+  a translucent accent. Click selects; **Shift-click** selects an inclusive
+  range from the current frame; **Ctrl-click** toggles a tile. Keyboard:
+  `←`/`→` ±1, `Shift` ±5, `Ctrl` ±10. Right-click → Crop / Clear. Signals:
+  `current_changed(int)`, `selection_changed(frozenset)`,
+  `crop_requested(frozenset)`; per-frame tooltip via an injected `meta_fn`.
+- **`MaterializedDataset.subset(*, m, t, z, progress_cb)`**
+  ([materialized_dataset.py](nd2studios/backend/materialized_dataset.py)) —
+  `np.ix_` advanced-indexing copy of the selected M/T/Z indices (H/W preserved).
+  Returns a **new** dataset; the source is never mutated. Out-of-range/empty
+  selections fall back to keeping the whole axis.
+- **`nd2studios/workers/crop_worker.py`** (new) — `CropWorker(BaseWorker)` runs
+  `subset` off the GUI thread with frame-accurate progress.
+- **`MultiAxisViewer.set_frame_timestamps()`** and per-axis metadata tooltips
+  (T: time imaged / Δt / total elapsed; M: pixel size / resolution / field of
+  view; Z: µm step / height within Z range). New
+  `crop_to_selection_requested(axis, frozenset)` signal.
+- **"Revert to full data"** control on the import file panel
+  ([file_panel.py](nd2studios/widgets/file_panel.py)) — restores the full
+  dataset after a crop.
+
+### Changed
+
+- **`MultiAxisViewer`** ([multi_axis_viewer.py](nd2studios/widgets/multi_axis_viewer.py))
+  — each axis's `QSlider` is now a *hidden backing model* parented to a visible
+  `FrameStrip`; the two sync bidirectionally so all existing playback / value
+  code is unchanged. `_configure_slider` drives the strip's count + visibility.
+  Playback (`_axis_tick` → new `_next_playback_value`) loops **only the selected
+  frames** when a tile selection exists. A **T crop automatically keeps all M and
+  Z** (`subset(t=…)`); M-only / Z-only crops constrain just that axis.
+
+## [Unreleased] - 2026-06-09 (V1.41 Frame-Accurate Progress)
+
+Every long-running operation now reports progress against the file's *real*
+total frame count (`T·M·Z·C`) instead of a T-only or phase-based estimate, so a
+multi-position / multi-Z file no longer jumps to 100 % after the first position.
+Part of the all-around QoL initiative
+([CodeLog/ClaudesPlan/V1.41_pipeline_smoothness_resource_aware.md](CodeLog/ClaudesPlan/V1.41_pipeline_smoothness_resource_aware.md)).
+
+### Added
+
+- **`nd2studios/utils/progress.py`** (new) — `FrameProgress(total_frames,
+  emit_cb, *, lo=0, hi=100)` progress accountant. `.advance(n=1)` counts
+  processed frames and emits an integer percent **only when it changes** (1 %
+  thresholds → at most 101 emissions regardless of frame count, so the GUI is
+  never flooded). Optional output band `(lo, hi)` lets a worker reserve a slice
+  of the bar for one phase. Helper `total_frames_for(meta, *, channels=...,
+  z_collapsed=..., include_channels=...)` derives `T·M·Z·C` from an
+  `ND2Metadata`-like object.
+
+### Changed
+
+- **Exporters now count real pages/frames** instead of `(t+1)/n_t*100`:
+  [tiff_exporter.py](nd2studios/backend/exporters/tiff_exporter.py) counts
+  `T·Z` (stack) / `T·Z·C` (hyperstack) pages;
+  [movie_exporter.py](nd2studios/backend/exporters/movie_exporter.py) and
+  [composite_exporter.py](nd2studios/backend/exporters/composite_exporter.py)
+  count `T` composites (their input is already single-position, Z-projected);
+  [image_sequence_exporter.py](nd2studios/backend/exporters/image_sequence_exporter.py)
+  counts `T` (channels path) / `M·T·Z` (volume path) via `FrameProgress`.
+- **`RecipeWorker`** ([recipe_worker.py](nd2studios/workers/recipe_worker.py))
+  — replaced phase accounting with frame-equivalent counting: total =
+  `n_channels · T · (read + normalize? + n_steps)`. Frame reads advance one at a
+  time (so the bar tracks slow disk I/O), each recipe step credits a full
+  `T`-block on completion.
+- **`ExportWorker._export_tiff_zstack`**
+  ([export_worker.py](nd2studios/workers/export_worker.py)) — the Z-stack read
+  loop now counts every `C·T·Z` plane in the 0–80 % band (was T-only and assumed
+  a single position) before the hyperstack write fills 80–100 %.
+- **`PreRenderWorker`** ([pre_render_worker.py](nd2studios/workers/pre_render_worker.py))
+  — converted its `M·T` progress to `FrameProgress` for consistent 1 % throttling.
+
+### Bug Fixes
+
+- **Export page no longer freezes the GUI when changing the TIFF z-projection
+  mode at export time.** `_on_export_tiff`
+  ([export_page.py](nd2studios/pages/export_page.py)) kept the re-projected
+  channels lazy instead of calling `.materialize()` on the GUI thread; the heavy
+  per-frame read now happens inside `ExportWorker` via `np.asarray`.
+
+## [Unreleased] - 2026-06-09 (V1.42 Viewer Optimizations from Industry Comparison)
+
+Five techniques borrowed from popular microscopy viewers (Bio-Formats
+Memoizer, napari, BigDataViewer) after a comparative research pass.
+
+### Added
+
+- **`read_or_cache_nd2_metadata(filepath)`** in
+  [nd2studios/backend/nd2_loader.py](nd2studios/backend/nd2_loader.py)
+  — Bio-Formats Memoizer-style sidecar.  On first open, writes
+  `<file>.nd2idx.json` next to the ND2 with the full result of
+  `read_nd2_metadata_extended`.  Subsequent opens load the sidecar
+  when its mtime is ≥ the source ND2's, skipping the multi-second
+  chunk scan.  Stale or wrong-version sidecars are silently
+  regenerated.  Wired into [load_worker.py](nd2studios/workers/load_worker.py)
+  `_load_nd2`.
+
+- **`LazyND2Channel` LRU read cache** — BigDataViewer `CellCache`
+  pattern.  New `cache_max_bytes` constructor arg (default `0` =
+  disabled) plus `configure_cache()` / `clear_cache()` methods.
+  When enabled, `_read_frame` consults an `OrderedDict[t_local]`
+  before hitting nd2/Dask; LRU eviction respects the byte budget.
+  Read-only flag set on cached arrays so callers can't accidentally
+  mutate them.
+
+- **`MultiAxisViewer.attach_pyramid(reader)`** +
+  **`_choose_pyramid_level()`** — BigDataViewer mipmap pattern.
+  Stores a `PyramidReader`; `_read_volume_plane` short-circuits to
+  `reader.get_frame(level, …)` when the canvas's viewport zoom would
+  benefit from a coarser level.  Uses the existing
+  [PyramidReader.pick_level_for_viewport](nd2studios/pipeline/stages/pyramid_stage.py)
+  helper that was already there but not wired into the view path.
+  Effect: zoom-out on large mosaics reads small arrays from the
+  zarr pyramid instead of pushing the full level-0 plane to the
+  GPU canvas.
+
+- **`nd2studios/utils/request_queue.py`** (new) — cancel-first
+  `SingleSlotMailbox` and `PriorityLanes` primitives borrowed from
+  napari's NAP-4 async slicer.  Mailbox holds one in-flight
+  `RequestToken`; submitting a new one cancels the previous.
+  Workers cooperate by polling `token.cancelled` at known
+  checkpoints.  `PriorityLanes` adds a background lane that's
+  cancelled wholesale when foreground work needs the device.
+  Utility ships in this release; consumers (the existing pre-render
+  worker, future async slice loader) opt in incrementally.
+
+- **CodeLog plan** —
+  `CodeLog/ClaudesPlan/V1.42_viewer_optimizations.md`.
+
+### Changed
+
+- **`MultiAxisViewer._invalidate_render_cache(*, lut_only=False)`**
+  — V1.42 napari shader-LUT pattern.  When `lut_only=True`:
+  - On GPU canvas (`USE_GPU_DISPLAY=True`): completely no-op.
+    `GpuImageCanvas` re-applies LUT/levels as a pyqtgraph uniform
+    on every paint, so the existing per-(m,t) cache is never read
+    and there is nothing to invalidate.
+  - On CPU canvas: keep the existing cache dicts; restart the
+    pre-render worker which overwrites entries in-place as it
+    visits them.  User sees brief stale-LUT frames during
+    scrubbing instead of dropping all the way to the slow
+    live-compose path while the worker rebuilds.
+  Bumps `_pp_version` so overlay caches re-render on demand.
+  `_rebuild_render_cache_after_lut` (the 250 ms debounce target)
+  now calls `_invalidate_render_cache(lut_only=True)`; channel
+  enable / color / Z-mode changes keep the full
+  `_invalidate_render_cache()` semantics.
+
+- **`LazyND2Channel.crop`** — propagates new LRU fields to the
+  cropped view so `_read_frame` overrides keep working.
+
+### Architecture
+
+See [CodeLog/Architecture/ARCHITECTURE.md](CodeLog/Architecture/ARCHITECTURE.md)
+V1.42 section for how the five additions fit into the existing
+viewer / loader / pyramid pipeline.
+
+## [Unreleased] - 2026-06-09 (V1.41 Pipeline Smoothness + Resource-Aware Loading)
+
+### Added
+
+- **`nd2studios/utils/perf.py`** — lightweight CSV perf instrumentation
+  gated by `ND2_PERF_LOG=1`. Exports `perf_log` decorator, `perf_block`
+  context manager, and `log_event` for ad-hoc rows. When disabled the
+  decorator returns the original function unchanged so there is zero
+  call-site overhead in normal operation. Output appends to
+  `~/.nd2studios/perf.csv` with `(timestamp_ns, event, duration_us,
+  frame_idx, cache_hit, extra)` columns. Annotated the real playback
+  hot paths in `MultiAxisViewer._do_refresh`, `_axis_tick`, and
+  `_compose_current_frame` so cache hit / live-compose timings can be
+  diff'd between baseline and after each optimisation.
+
+- **`nd2studios/utils/resource_strategy.py`** — pre-flight
+  `choose_strategy(meta, path)` that picks between `EAGER_FULL`,
+  `EAGER_REDUCED`, and `LAZY_CACHED` based on
+  `psutil.virtual_memory().available` and the dataset footprint.
+  `StrategyDecision` dataclass exposes the inputs and the human-readable
+  reason. Refuses loads whose projected footprint exceeds 2× available
+  RAM via `StrategyError`. Test seam: `ND2_FAKE_RAM_GB` env var
+  overrides the available-RAM reading.
+
+- **`nd2studios/core/memory_monitor.py`** — banded
+  `MemoryMonitor(QObject)` singleton polling `virtual_memory().percent`
+  on a `QTimer`. Signals `warning` (80%), `critical` (90%, drops the
+  pre-render cache), `emergency` (95%, modal + heavy-op block), and
+  `recovered` (back to NORMAL). Hysteresis at 75/85/90 to prevent
+  signal oscillation across jittering boundaries.
+
+- **`nd2studios/utils/user_config.py`** — JSON persistence for the
+  tracked subset of `Settings` (GPU flags, pyramid flag, eager
+  fraction, memory pressure thresholds, forced load strategy). Path:
+  `%APPDATA%\nd2studios\preferences.json` on Windows or
+  `~/.config/nd2studios/preferences.json` elsewhere. Loaded by
+  `__main__` before any UI construction; saved by the Performance
+  dialog on Accept.
+
+- **`Settings.EAGER_MAX_FRACTION`, `MEMORY_RESERVE_OVERHEAD`,
+  `MEMORY_PRESSURE_*`, `MEMORY_MONITOR_INTERVAL_MS`,
+  `FORCED_LOAD_STRATEGY`** — new module-level constants on
+  `nd2studios/core/settings.py` driving the resource-aware load /
+  memory monitor subsystems. Overridable via the Performance dialog
+  and persisted by `user_config`.
+
+- **`LoadWorker.strategy_chosen = Signal(object)`** — emitted between
+  metadata read and materialize so the GUI can show the chosen
+  `StrategyDecision`. The decision is also returned under the
+  `"strategy"` key on the finished payload.
+
+- **Memory gauge in bottom bar** — `_memory_gauge` `QLabel` in
+  `MainWindow._build_content_area` shows `RAM 9.6 / 31.7 GB (30%)`
+  and changes colour through yellow / orange / red at the pressure
+  thresholds.
+
+- **Performance dialog tabs** — `_open_performance_settings` rebuilt
+  as a `QTabWidget` with GPU, Memory, Storage, and Diagnostics tabs.
+  Memory tab exposes a `LoadStrategy` override dropdown (Auto / Force
+  Eager / Force Eager Z-collapsed / Force Lazy). Diagnostics tab has
+  a "Save snapshot…" button that writes a JSON capturing the current
+  detection state.
+
+- **Streaming TIFF + movie exports** — `export_tiff_stack`,
+  `export_tiff_hyperstack`, and `export_movie` now stream pages /
+  frames via `tifffile.imwrite(data=iter, shape=..., dtype=...)` and
+  `imageio.get_writer(...).append_data(...)`. RAM peak during export
+  drops from full-stack/list to single-frame.
+  `_percentile_bounds_subsample` computes per-channel percentile
+  bounds from a 1M-pixel subsample so rescale modes no longer require
+  the full-stack `astype(np.float32)` copy.
+
+- **Proactive GPU VRAM guard** — `should_dispatch_to_gpu(array, *,
+  op="", safety_factor=2.5)` now consults a 200 ms-cached
+  `cp.cuda.runtime.memGetInfo()` and falls back to CPU before
+  dispatch when the array (× safety factor) doesn't fit. Per-op
+  warn-once via `_vram_warn_once` mirrors the existing `_WARNED`
+  pattern from `ops.py`.
+
+- **Windows storage probe** — `windows_is_fast_storage(path)` reads
+  16 MB from the target file, classifies ≥400 MB/s as "fast", and
+  caches the verdict per drive letter in
+  `%APPDATA%\nd2studios\storage_probe.json`. Wired through
+  `is_fast_storage` so existing callers benefit automatically.
+
+- **Startup diagnostic sequence** — `__main__` now logs RAM/CPU
+  (`log_system_resources()`) and default storage class
+  (`log_default_storage_class()`) immediately after the GPU status
+  line, then auto-disables `BUILD_PYRAMIDS` on <8 GB-available
+  machines and `USE_GPU_DISPLAY` on <2 GB-VRAM cards so first-launch
+  defaults match the host.
+
+- **CodeLog plan doc** — `CodeLog/ClaudesPlan/V1.41_pipeline_smoothness_resource_aware.md`.
+
+### Changed
+
+- **`MultiAxisViewer._do_refresh` cache-hit marking** — sets
+  `_last_cache_hit` at each fast-path branch so the V1.41 perf log
+  records hit/miss explicitly. Pure metadata; no functional change.
+
+- **`movie_exporter.export_movie`** — pre-rendered frame list replaced
+  with a per-frame generator feeding the codec writer. MP4 path now
+  downscales one frame at a time after computing scale parameters
+  from the first frame only. GIF / TIF / fallback codecs use
+  `imageio.get_writer(...).append_data(...)` instead of `mimsave`.
+
+- **`export_tiff_hyperstack`** — the `(T, Z, C, H, W)` `np.stack`
+  intermediate is gone; pages flow through
+  `tifffile.imwrite(data=_pages(), shape=..., imagej=True)` directly.
+  BigTIFF threshold is now computed from the projected output
+  footprint rather than the source ndarray nbytes.
+
+- **`compute.gpu.ops`** — every `should_dispatch_to_gpu(image)` call
+  now passes `op="<name>"` so VRAM-guard warnings name the op that
+  fell back.
+
+- **Performance dialog** — tabbed redesign; OK now also persists the
+  tracked subset of `Settings` via `save_user_preferences()`.
+
+### Removed
+
+- **`nd2studios/widgets/video_player.py`** — `VideoPlayer` was never
+  instantiated anywhere in the codebase. The real playback path lives
+  in `MultiAxisViewer._axis_tick`. Deleted along with its 145 lines of
+  dead code; perf instrumentation now annotates the actual hot path.
+
+### Notes
+
+- The `EAGER_REDUCED` and `LAZY_CACHED` strategy branches in
+  `materialize_nd2` / `materialize_from_volume` are **deferred** to
+  V1.42. Today the strategy budgeter is a pre-flight gate: it logs
+  the chosen strategy, emits the signal, and raises `StrategyError`
+  when the load definitely won't fit. Files that fit eager but would
+  have benefited from Z-collapse still take the eager path until the
+  branch lands.
+
+- **WSL2 integration** is also deferred per the V1.41 plan. The two
+  cuCIM-only ops (`gaussian` and `threshold_otsu` in tear detection)
+  continue to fall back to CPU on Windows.
+
+- The `MainWindow.heavy_ops_blocked()` flag set by the emergency-band
+  modal is a soft block — it's a public accessor that pages can
+  consult before launching new heavy workers. The check isn't wired
+  into every button click site yet; V1.42 will add per-entrypoint
+  guards.
+
 ## [Unreleased] - 2026-05-27 (V1.40 Mask Analysis — Custom Mask Creator)
 
 ### Added

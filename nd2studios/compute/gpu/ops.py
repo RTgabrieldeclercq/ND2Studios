@@ -105,7 +105,7 @@ def gaussian(image, sigma: float, *, preserve_range: bool = True):
     here because those are the only kwargs the V1.38 callers pass.
     Add more keyword passthroughs if a new caller needs them.
     """
-    if not should_dispatch_to_gpu(image):
+    if not should_dispatch_to_gpu(image, op="gaussian"):
         return _sk_gaussian(image, sigma=sigma, preserve_range=preserve_range)
 
     cucim = _try_cucim_filters()
@@ -122,7 +122,7 @@ def gaussian(image, sigma: float, *, preserve_range: bool = True):
 
 def gaussian_filter(image, sigma):
     """:func:`scipy.ndimage.gaussian_filter` shape-compatible."""
-    if not should_dispatch_to_gpu(image):
+    if not should_dispatch_to_gpu(image, op="gaussian_filter"):
         return _scipy_gaussian_filter(image, sigma=sigma)
 
     cupyx_ndi = _try_cupyx_ndimage()
@@ -139,7 +139,7 @@ def gaussian_filter(image, sigma):
 
 def gaussian_laplace(image, sigma):
     """:func:`scipy.ndimage.gaussian_laplace` shape-compatible."""
-    if not should_dispatch_to_gpu(image):
+    if not should_dispatch_to_gpu(image, op="gaussian_laplace"):
         return _scipy_gaussian_laplace(image, sigma=sigma)
 
     cupyx_ndi = _try_cupyx_ndimage()
@@ -161,7 +161,7 @@ def threshold_otsu(image) -> float:
     compare against literal numeric thresholds without an explicit
     cast.
     """
-    if not should_dispatch_to_gpu(image):
+    if not should_dispatch_to_gpu(image, op="threshold_otsu"):
         return float(_sk_threshold_otsu(image))
 
     cucim = _try_cucim_filters()

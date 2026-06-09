@@ -26,6 +26,7 @@ import numpy as np
 from nd2studios.backend.exporters.composite_exporter import (
     CHANNEL_COLORS, ImageAdjustments, _composite_frame, _percentile_uint8,
 )
+from nd2studios.utils.progress import FrameProgress
 
 
 @dataclass
@@ -263,16 +264,16 @@ def export_movie(
     codec = (opts.codec or ext).lower()
 
     channel_names = list(channels.keys())
+    timestamps_arr = (
+        np.asarray(frame_timestamps_s) if frame_timestamps_s is not None else None
+    )
 
-    # Render all frames first so we can use format-specific writers that
-    # don't suffer from imageio's plugin auto-routing (which can silently
-    # pick tifffile and then fail on the 'fps' write kwarg).
-    rendered: List[np.ndarray] = []
-    for t in range(n):
+    def _render_frame(t: int) -> np.ndarray:
+        """Compose one timepoint with overlays. Returns (H, W, 3) uint8."""
         frame_dict = {name: arr[t] for name, arr in channels.items()}
         rgb = _composite_frame(frame_dict, colors, enabled, lut_settings,
                                image_adjustments=image_adjustments)
-        rgb_with_overlays = _draw_overlays(
+        return _draw_overlays(
             rgb,
             t_index=t,
             opts=opts,
@@ -280,27 +281,32 @@ def export_movie(
             channel_colors=colors,
             channel_enabled=enabled,
             channel_names=channel_names,
-            frame_timestamps=(
-                np.asarray(frame_timestamps_s)
-                if frame_timestamps_s is not None else None
-            ),
+            frame_timestamps=timestamps_arr,
         )
-        rendered.append(rgb_with_overlays)
-        if progress_cb is not None:
-            progress_cb(int((t + 1) / n * 90))
+
+    # Probe the first frame so we can pick the output dimensions / MP4
+    # downscale parameters without holding every frame in RAM.  Cost is
+    # one extra render of frame 0 vs. building the full list.
+    first_frame = _render_frame(0)
+    src_h, src_w = first_frame.shape[:2]
+    # One composite frame per timepoint is this export's true unit (the
+    # channels handed in are already Z-projected for a single position).
+    # Reserve 0–95 % for rendering, 100 % for finalization.
+    fp = FrameProgress(n, progress_cb, lo=0, hi=95)
 
     if codec == "gif":
-        from PIL import Image as _PILImage
-        duration_ms = max(1, int(1000.0 / opts.fps))
-        pil_frames = [_PILImage.fromarray(f) for f in rendered]
-        pil_frames[0].save(
-            filepath,
-            save_all=True,
-            append_images=pil_frames[1:],
-            duration=duration_ms,
-            loop=0,
-            optimize=False,
-        )
+        # Stream through imageio's writer so peak RAM is one frame, not T.
+        # ``imageio.mimsave`` in v2 still wants a sequence, so use the
+        # explicit writer + ``append_data`` loop.
+        duration_s = 1.0 / max(opts.fps, 0.1)
+        with imageio.get_writer(
+            filepath, mode="I", duration=duration_s, loop=0
+        ) as writer:
+            writer.append_data(first_frame)
+            fp.advance()
+            for t in range(1, n):
+                writer.append_data(_render_frame(t))
+                fp.advance()
     elif codec in {"mp4", "mov", "m4v"}:
         try:
             import imageio_ffmpeg as _iffmpeg
@@ -309,35 +315,27 @@ def export_movie(
                 "imageio-ffmpeg is required for MP4 export. "
                 "Install it with: pip install imageio-ffmpeg"
             ) from exc
-        # Cap the longest edge so the H.264 encoder doesn't bail with
-        # "frame MB size > level limit" on stitched-panorama outputs.
-        # Returns the input list unchanged when no resize is needed but
-        # still pads odd dimensions to even for yuv420p.
-        in_h, in_w = rendered[0].shape[:2]
-        rendered, scale = _downscale_for_mp4(rendered)
-        h, w = rendered[0].shape[:2]
-        if (in_h, in_w) != (h, w):
+        # Decide downscale parameters from the first frame's shape only.
+        # Reuses the legacy single-frame downscaler so per-frame behavior
+        # stays identical; the difference is we don't buffer T frames.
+        sample_out, scale = _downscale_for_mp4([first_frame])
+        out_h, out_w = sample_out[0].shape[:2]
+        if (src_h, src_w) != (out_h, out_w):
             msg = (
-                f"MP4: downscaled {in_w}×{in_h} → {w}×{h} "
+                f"MP4: downscaled {src_w}×{src_h} → {out_w}×{out_h} "
                 f"(scale {scale:.3f}) — H.264 Level 6.2 frame-MB cap"
             )
             if status_cb is not None:
                 status_cb(msg)
             else:
-                # No status callback wired: at least make it visible in
-                # the console so the user sees the downscale happened.
                 import sys as _sys
                 print(f"[ND2Studios] {msg}", file=_sys.stderr)
-        # Hard guard: if for any reason the downscale failed to bring
-        # the longest edge under the H.264 frame-MB ceiling, fail loudly
-        # here with an actionable error rather than handing libx264 an
-        # input it'll reject (producing an unplayable MP4).
         max_mb_per_dim = MAX_MP4_LONGEST_EDGE // 16
-        mb_w = (w + 15) // 16
-        mb_h = (h + 15) // 16
+        mb_w = (out_w + 15) // 16
+        mb_h = (out_h + 15) // 16
         if mb_w > max_mb_per_dim or mb_h > max_mb_per_dim:
             raise RuntimeError(
-                f"MP4 export: frame {w}×{h} ({mb_w}×{mb_h} macroblocks) "
+                f"MP4 export: frame {out_w}×{out_h} ({mb_w}×{mb_h} macroblocks) "
                 f"exceeds H.264 Level 6.2 limits even after downscale. "
                 f"Use GIF export, the TIFF Z-stack exporter, or pre-crop "
                 f"the canvas."
@@ -345,12 +343,9 @@ def export_movie(
         # Level 6.2 is libx264's highest supported H.264 level; combined
         # with refs=2 and no B-frames it covers ~3840 px on the longest
         # edge within the DPB macroblock budget.
-        # Level 6.2 is libx264's highest supported H.264 level; combined
-        # with refs=2 and no B-frames it covers ~3840 px on the longest
-        # edge within the DPB macroblock budget.
         writer_gen = _iffmpeg.write_frames(
             filepath.replace("%", "%%"),
-            size=(w, h),
+            size=(out_w, out_h),
             fps=opts.fps,
             pix_fmt_in="rgb24",
             pix_fmt_out="yuv420p",
@@ -365,13 +360,31 @@ def export_movie(
             ],
         )
         writer_gen.send(None)
-        for frame in rendered:
-            writer_gen.send(frame.astype(np.uint8).tobytes())
+
+        def _maybe_downscale(frame: np.ndarray) -> np.ndarray:
+            if (src_h, src_w) == (out_h, out_w):
+                return frame
+            return _downscale_for_mp4([frame])[0][0]
+
+        # The first frame is already rendered; downscale and send.
+        writer_gen.send(_maybe_downscale(first_frame).astype(np.uint8).tobytes())
+        fp.advance()
+        for t in range(1, n):
+            frame = _render_frame(t)
+            writer_gen.send(_maybe_downscale(frame).astype(np.uint8).tobytes())
+            fp.advance()
         writer_gen.close()
-    elif codec in {"tif", "tiff"}:
-        imageio.mimsave(filepath, rendered)
     else:
-        imageio.mimsave(filepath, rendered, fps=opts.fps)
+        # tif/tiff and default fallback path: stream via get_writer so
+        # we don't buffer the whole sequence (imageio v2 mimsave wants
+        # a real sequence).
+        writer_kwargs = {} if codec in {"tif", "tiff"} else {"fps": opts.fps}
+        with imageio.get_writer(filepath, mode="I", **writer_kwargs) as writer:
+            writer.append_data(first_frame)
+            fp.advance()
+            for t in range(1, n):
+                writer.append_data(_render_frame(t))
+                fp.advance()
 
     if progress_cb is not None:
         progress_cb(100)

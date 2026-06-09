@@ -194,7 +194,8 @@ class LazyND2Channel:
     def __init__(self, filepath: str, channel_index: int,
                  t_start: int, t_end: int, z_start: int, z_end: int,
                  z_projection: str, height: int, width: int, dtype,
-                 t_stride: int = 1, m_index: int = 0):
+                 t_stride: int = 1, m_index: int = 0,
+                 cache_max_bytes: int = 0):
         self._filepath = filepath
         self._ch = channel_index
         self._m = int(m_index)
@@ -213,6 +214,16 @@ class LazyND2Channel:
         self._file = None
         self._dask = None
         self._dim_order = None
+        # V1.42 — optional LRU frame cache for the lazy path.  Disabled
+        # by default (0 bytes) so direct callers see no behavior change.
+        # The future ``LAZY_CACHED`` load strategy will pass a budget
+        # derived from :func:`recommended_cache_budget_bytes`.  Keyed
+        # by ``t_local`` (post-stride frame index); values are read-
+        # only ``(H, W)`` ndarrays.
+        from collections import OrderedDict
+        self._cache_max_bytes: int = max(0, int(cache_max_bytes))
+        self._cache_bytes: int = 0
+        self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
 
     # ── file management ──
     def _ensure_open(self):
@@ -239,8 +250,69 @@ class LazyND2Channel:
     def __len__(self):
         return self.shape[0]
 
+    # ── V1.42 LRU cache helpers ──
+    def configure_cache(self, max_bytes: int) -> None:
+        """Resize the LRU read cache.
+
+        Sets the byte budget; immediately evicts excess entries.
+        Pass ``0`` to disable caching (the cache is also cleared).
+        """
+        self._cache_max_bytes = max(0, int(max_bytes))
+        self._evict_until_fits()
+        if self._cache_max_bytes == 0:
+            self._cache.clear()
+            self._cache_bytes = 0
+
+    def clear_cache(self) -> None:
+        """Drop every frame from the LRU cache. Frees RAM immediately."""
+        self._cache.clear()
+        self._cache_bytes = 0
+
+    def _evict_until_fits(self) -> None:
+        """Remove LRU entries until the cache fits the budget."""
+        while self._cache_bytes > self._cache_max_bytes and self._cache:
+            _, ev = self._cache.popitem(last=False)  # FIFO = LRU end
+            self._cache_bytes -= int(ev.nbytes)
+
+    def _cache_get(self, t_local: int):
+        """Hit → move to MRU end and return the cached frame, or ``None``."""
+        if self._cache_max_bytes == 0:
+            return None
+        frame = self._cache.get(t_local)
+        if frame is None:
+            return None
+        # Move to MRU end (OrderedDict semantics).
+        self._cache.move_to_end(t_local, last=True)
+        return frame
+
+    def _cache_put(self, t_local: int, frame: np.ndarray) -> None:
+        """Insert frame into the cache, evicting LRU entries to fit."""
+        if self._cache_max_bytes == 0:
+            return
+        nbytes = int(getattr(frame, "nbytes", 0))
+        if nbytes <= 0 or nbytes > self._cache_max_bytes:
+            # A single frame already exceeds budget — caching it would
+            # immediately evict it, so skip the insert.
+            return
+        if t_local in self._cache:
+            self._cache_bytes -= int(self._cache[t_local].nbytes)
+            del self._cache[t_local]
+        self._cache[t_local] = frame
+        self._cache_bytes += nbytes
+        self._evict_until_fits()
+
     def _read_frame(self, t_local: int) -> np.ndarray:
-        """Read frame `t_local` (0-based, post-stride) and return (H, W)."""
+        """Read frame `t_local` (0-based, post-stride) and return (H, W).
+
+        V1.42 — consults an LRU cache first so back-and-forth scrubbing
+        across the same time range pays one decode per visited frame
+        instead of one per scrub.  Cache is opt-in via the
+        ``cache_max_bytes`` constructor arg (defaults to 0 = disabled).
+        """
+        cached = self._cache_get(t_local)
+        if cached is not None:
+            return cached
+
         self._ensure_open()
         t_abs = self._t0 + t_local * self._t_stride
         sizes = self._file.sizes
@@ -260,17 +332,27 @@ class LazyND2Channel:
         if Z_total > 1 and self._zproj != "none":
             z_stack = np.asarray(self._dask[_idx(slice(self._z0, self._z1))])
             if z_stack.ndim == 3:
-                if self._zproj == "max":  return z_stack.max(axis=0)
-                if self._zproj == "mean": return z_stack.mean(axis=0).astype(self.dtype)
-                if self._zproj == "min":  return z_stack.min(axis=0)
-                return z_stack[0]
-            if z_stack.ndim == 2:
-                return z_stack
-            return z_stack.squeeze()
+                if self._zproj == "max":   frame = z_stack.max(axis=0)
+                elif self._zproj == "mean": frame = z_stack.mean(axis=0).astype(self.dtype)
+                elif self._zproj == "min": frame = z_stack.min(axis=0)
+                else:                       frame = z_stack[0]
+            elif z_stack.ndim == 2:
+                frame = z_stack
+            else:
+                frame = z_stack.squeeze()
         else:
             z_val = self._z0 if "Z" in sizes else 0
-            frame = np.asarray(self._dask[_idx(z_val)])
-            return frame if frame.ndim == 2 else frame.squeeze()
+            raw = np.asarray(self._dask[_idx(z_val)])
+            frame = raw if raw.ndim == 2 else raw.squeeze()
+
+        # Mark read-only so callers can't mutate the cached array.
+        if hasattr(frame, "setflags"):
+            try:
+                frame.setflags(write=False)
+            except Exception:  # noqa: BLE001
+                pass
+        self._cache_put(t_local, frame)
+        return frame
 
     def __getitem__(self, key):
         """Support arr[t], arr[t, ...], arr[t0:t1], arr[:, y0:y1, x0:x1]."""
@@ -361,6 +443,16 @@ class LazyND2Channel:
         view._file = None
         view._dask = None
         view._dim_order = None
+        # V1.42 — crop views get their own (empty) LRU cache state so
+        # ``_read_frame`` keeps working after the override below.  The
+        # parent's cache is reused implicitly because we delegate to
+        # ``parent_read`` which still hits the parent's cache; the
+        # view-local cache stays at the default-off setting unless the
+        # caller turns it on explicitly.
+        from collections import OrderedDict
+        view._cache_max_bytes = 0
+        view._cache_bytes = 0
+        view._cache = OrderedDict()
         # Wrap _read_frame to slice spatially.
         parent_read = self._read_frame
         view._read_frame = lambda t_local, _y0=y0, _y1=y1, _x0=x0, _x1=x1: \
@@ -630,6 +722,114 @@ def read_nd2_metadata_extended(filepath):
             }
             for lp in (_safe(lambda: f.experiment, default=[]) or [])
         ]
+
+    return out
+
+
+# ── V1.42 — Metadata sidecar (Bio-Formats Memoizer pattern) ───────
+
+import json as _json
+import logging as _logging
+import os as _os
+import time as _time
+
+_sidecar_log = _logging.getLogger(__name__)
+
+# Sidecar schema version. Bumped when the on-disk payload changes in
+# an incompatible way so stale sidecars are ignored instead of
+# silently misleading the loader.
+NDF2_SIDECAR_VERSION = 1
+NDF2_SIDECAR_SUFFIX = ".nd2idx.json"
+
+
+def _sidecar_path(filepath: str) -> str:
+    """Return the on-disk path of the metadata sidecar for ``filepath``."""
+    return str(filepath) + NDF2_SIDECAR_SUFFIX
+
+
+def _is_sidecar_fresh(sidecar: str, filepath: str) -> bool:
+    """True if the sidecar exists and was written after the ND2's mtime."""
+    try:
+        if not _os.path.exists(sidecar) or not _os.path.exists(filepath):
+            return False
+        return _os.path.getmtime(sidecar) >= _os.path.getmtime(filepath)
+    except OSError:
+        return False
+
+
+def _jsonable(obj):
+    """Recursively coerce numpy / tuple types into JSON-serialisable ones.
+
+    The metadata dict contains numpy scalars, ``np.ndarray`` (frame
+    timestamps, stage XY arrays), tuples (voxel_size_um), and ints
+    keyed off `nd2`'s C-extension types. Without coercion ``json.dump``
+    raises ``TypeError`` mid-write and corrupts the sidecar.
+    """
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    # Fallback: stringify so the sidecar still round-trips, even if
+    # the field isn't structurally exact.
+    try:
+        return str(obj)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def read_or_cache_nd2_metadata(filepath: str) -> Dict[str, Any]:
+    """Return the extended ND2 metadata, using an on-disk cache when fresh.
+
+    Behaviour mirrors Bio-Formats' Memoizer: after a successful scan,
+    a JSON sidecar is written next to the ND2 (``<file>.nd2idx.json``).
+    The next call checks the sidecar's mtime against the ND2's; if
+    the sidecar is newer (or equal) it is loaded and parsed in a few
+    ms instead of re-walking multi-GB chunks. Stale sidecars (older
+    mtime, wrong version, malformed JSON) are silently regenerated.
+
+    The sidecar holds the same dict :func:`read_nd2_metadata_extended`
+    returns, plus a ``_sidecar_version`` and ``_sidecar_source_mtime``
+    field for safety checks. No image data is cached — just the
+    metadata, which is small (a few KB even for hundreds of frames).
+    """
+    sidecar = _sidecar_path(filepath)
+    if _is_sidecar_fresh(sidecar, filepath):
+        try:
+            with open(sidecar, "r", encoding="utf-8") as fh:
+                payload = _json.load(fh)
+            if int(payload.get("_sidecar_version", 0)) == NDF2_SIDECAR_VERSION:
+                payload.pop("_sidecar_version", None)
+                payload.pop("_sidecar_source_mtime", None)
+                _sidecar_log.info("ND2 metadata sidecar hit: %s", sidecar)
+                return payload
+            _sidecar_log.debug("sidecar version mismatch; regenerating: %s", sidecar)
+        except Exception as exc:  # noqa: BLE001
+            _sidecar_log.debug("sidecar read failed (%s); regenerating", exc)
+
+    start = _time.perf_counter()
+    out = read_nd2_metadata_extended(filepath)
+    dur_ms = (_time.perf_counter() - start) * 1000.0
+    _sidecar_log.info("ND2 metadata scan: %.0f ms", dur_ms)
+
+    try:
+        payload = dict(_jsonable(out))
+        payload["_sidecar_version"] = NDF2_SIDECAR_VERSION
+        payload["_sidecar_source_mtime"] = _os.path.getmtime(filepath)
+        tmp = sidecar + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            _json.dump(payload, fh)
+        _os.replace(tmp, sidecar)
+        _sidecar_log.info("ND2 metadata sidecar written: %s", sidecar)
+    except Exception as exc:  # noqa: BLE001
+        # Best-effort; a write failure is logged but does not affect
+        # the returned metadata.
+        _sidecar_log.warning("sidecar write failed for %s: %s", sidecar, exc)
 
     return out
 

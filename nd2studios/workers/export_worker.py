@@ -21,6 +21,7 @@ import numpy as np
 from nd2studios.workers.base_worker import BaseWorker
 from nd2studios.backend.exporters.composite_exporter import ImageAdjustments
 from nd2studios.backend.exporters.movie_exporter import MovieOptions
+from nd2studios.utils.progress import FrameProgress
 
 
 @dataclass
@@ -122,8 +123,12 @@ class ExportWorker(BaseWorker):
 
         n_ch = len(enabled_channels)
         n_t = vol.n_timepoints
+        n_z = vol.n_zslices
         cx, cy, cw, ch_px = req.crop_rect if req.crop_rect else (0, 0, 0, 0)
 
+        # Reading is the heavy half (every C·T·Z plane off the volume).
+        # Reserve 0–80 % for reads, 80–100 % for the hyperstack write.
+        fp = FrameProgress(n_ch * n_t * n_z, self.set_progress, lo=0, hi=80)
         channels: Dict[str, np.ndarray] = {}
         enabled: Dict[str, bool] = {}
         for ch_i, (c, name) in enumerate(enabled_channels):
@@ -133,15 +138,13 @@ class ExportWorker(BaseWorker):
             frames: List[np.ndarray] = []
             for t in range(n_t):
                 z_frames = []
-                for z in range(vol.n_zslices):
+                for z in range(n_z):
                     frame = vol.get_frame(c=c, m=req.m_index, t=t, z=z, z_mode="none")
                     if req.crop_rect is not None:
                         frame = frame[cy:cy + ch_px, cx:cx + cw]
                     z_frames.append(frame)
+                    fp.advance()
                 frames.append(np.stack(z_frames, axis=0))  # (Z, H, W)
-                self.set_progress(
-                    int((ch_i / n_ch + (t + 1) / n_t / n_ch) * 80)
-                )
             channels[name] = np.stack(frames, axis=0)  # (T, Z, H, W)
             enabled[name] = True
 
