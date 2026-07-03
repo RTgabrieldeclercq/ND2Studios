@@ -272,3 +272,70 @@ def log_decision(decision: StrategyDecision) -> None:
         decision.worker_count,
         decision.cache_budget_gb,
     )
+
+
+def should_stream_analysis(
+    volume,
+    *,
+    decision: Optional[StrategyDecision] = None,
+    monitor=None,
+    force: Optional[bool] = None,
+) -> bool:
+    """Decide whether analysis/results compute should STREAM (V1.46).
+
+    Streaming reads frames on demand from a lazy reader and spills label masks
+    to disk frame-by-frame, keeping peak RAM bounded — the Fiji/NIS-Elements
+    "virtual stack + streaming sink" model. The fast in-RAM path is used when
+    the data is already resident and fits.
+
+    Decision order (first match wins):
+
+    1. ``force`` — explicit override (e.g. a pipeline's ``needs_full_stack``
+       passes ``force=False`` to keep it in RAM).
+    2. **Dataset type** — a :class:`MaterializedDataset` is already in RAM →
+       in-RAM (``False``); a lazy volume (``LazyND2Volume`` /
+       ``LazyMultiFileND2Volume``, duck-typed via a truthy ``is_lazy`` attr or
+       class name) → stream (``True``).
+    3. ``decision.strategy`` — ``LAZY_CACHED`` → stream; ``EAGER_*`` → in-RAM.
+    4. ``monitor`` — if memory pressure is at/above CRITICAL, stream even when
+       the dataset is eager. ``monitor`` is duck-typed (``current_band()``
+       returning an int-comparable band) so this module stays Qt-free.
+
+    Defaults to ``False`` (in-RAM) when nothing else applies.
+    """
+    if force is not None:
+        return bool(force)
+
+    # 2. Dataset type — the primary, zero-config signal.
+    if volume is not None:
+        try:
+            from nd2studios.backend.materialized_dataset import MaterializedDataset
+            if isinstance(volume, MaterializedDataset):
+                # Eager unless memory pressure says otherwise (checked below).
+                pass
+            else:
+                cls_name = type(volume).__name__
+                if getattr(volume, "is_lazy", False) or "Lazy" in cls_name:
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 3. Explicit strategy decision.
+    if decision is not None:
+        if decision.strategy == LoadStrategy.LAZY_CACHED:
+            return True
+        if decision.strategy in (LoadStrategy.EAGER_FULL,
+                                 LoadStrategy.EAGER_REDUCED):
+            # Eager — but still allow the memory-pressure escape hatch below.
+            pass
+
+    # 4. Memory-pressure escape hatch (CRITICAL band == 2).
+    if monitor is not None:
+        try:
+            band = monitor.current_band()
+            if int(band) >= 2:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+
+    return False

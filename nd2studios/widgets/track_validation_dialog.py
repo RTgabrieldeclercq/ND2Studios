@@ -1,26 +1,35 @@
 """
-TrackValidationDialog — step-through validation UI for tracked objects.
+TrackValidationDialog — step-through review UI for identified objects.
 
-Supports three display modes:
-  1-up   — one track fills the canvas area
-  2-up   — two tracks side by side
-  4-up   — 2×2 grid of four tracks
+Reviews objects **by unit** in a 1/2/4-up grid of cropped panels.  A unit is
+either a *track* (all frames sharing a ``track_id``, when a Track Objects node
+linked them) or a *single object* (one label on one frame).  Passing
+``include_untracked=True`` makes every object reviewable even when nothing was
+tracked — so the Review Objects node works with or without an upstream Track
+Objects node.
 
-All visible tracks share one T slider ("Play All").  Each panel has its own
-Accept / Reject buttons.  Once every panel in the current batch has been
-decided the next batch loads automatically.
+All visible units share one T slider ("Play All").  Each panel has its own
+Accept / Reject buttons.  Once every panel in the current batch has been decided
+the next batch loads automatically.
 
-Crop size is 3× the union bounding box of the track (center ± 1.5× bbox
+Crop size is 3× the union bounding box of the unit (center ± 1.5× bbox
 half-extent), clamped to the full FOV.
+
+Decisions are exposed as row references (``accepted_rows`` / ``rejected_rows``)
+plus the derived ``accepted_track_ids`` / ``rejected_track_ids`` (back-compat for
+the Results page, which only ever reviews tracks).
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
+    QColorDialog,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QGridLayout,
@@ -38,21 +47,64 @@ from nd2studios.backend.exporters.composite_exporter import (
     _composite_frame,
 )
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.common import MplCanvas
 from nd2studios.widgets.image_viewer import ImageCanvas
 
 
-# Highlight colour for the mask overlay (R, G, B).
-_HIGHLIGHT = np.array([255, 200, 50], dtype=np.float32)
-_HIGHLIGHT_ALPHA = 0.55
+# Cell-boundary outline colour for the cropped cell, matching CellTracker's
+# Results (Cells) cell-detail panel (R, G, B), drawn at full opacity.
+_BOUNDARY = np.array([255, 80, 80], dtype=np.uint8)
 
 # Crop expansion factor: total crop side = CROP_FACTOR × object bbox side.
 _CROP_FACTOR = 3.0
 
 
-# ── Per-track panel ───────────────────────────────────────────────────────────
+class _ReviewUnit:
+    """One reviewable thing: a track (many frames) or a single object (one row)."""
+
+    def __init__(self, uid: str, rows: List[Dict[str, Any]],
+                 track_id: Optional[int]) -> None:
+        self.uid = uid
+        self.rows = rows
+        self.track_id = track_id
+        self.first_frame = min(int(r.get("frame", 0)) for r in rows)
+
+    @property
+    def label_text(self) -> str:
+        if self.track_id is not None:
+            n = len(self.rows)
+            return f"Track {self.track_id}  •  {n} frame{'s' if n != 1 else ''}"
+        r = self.rows[0]
+        return f"Object {r.get('label_id')}  •  frame {int(r.get('frame', 0)) + 1}"
+
+
+def _build_units(
+    measurements: List[Dict[str, Any]], include_untracked: bool,
+) -> List[_ReviewUnit]:
+    """Group rows into review units (tracks + optionally single objects)."""
+    by_track: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    singles: List[Dict[str, Any]] = []
+    for r in measurements:
+        tid = r.get("track_id")
+        if tid is not None:
+            by_track[int(tid)].append(r)
+        elif include_untracked:
+            singles.append(r)
+    units: List[_ReviewUnit] = [
+        _ReviewUnit(f"t{tid}", rows, tid) for tid, rows in by_track.items()
+    ]
+    for r in singles:
+        uid = (f"o{int(r.get('frame', 0))}_{r.get('label_id')}_"
+               f"{r.get('segmentation_channel', '')}")
+        units.append(_ReviewUnit(uid, [r], None))
+    units.sort(key=lambda u: (u.first_frame, str(u.uid)))
+    return units
+
+
+# ── Per-unit panel ──────────────────────────────────────────────────────────────
 
 class _TrackPanel(QWidget):
-    """One slot in the validation grid — image canvas + per-track controls."""
+    """One slot in the review grid — image canvas + per-unit controls."""
 
     accept_clicked = Signal(int)   # emits panel_index
     reject_clicked = Signal(int)   # emits panel_index
@@ -67,14 +119,17 @@ class _TrackPanel(QWidget):
         self.setObjectName("trackPanel")
         self._idx = panel_idx
         self._crop_frames: List[np.ndarray] = []
-        self._track_id: Optional[int] = None
+        self._info_texts: List[str] = []
+        self._trace_frames: List[int] = []
+        self._uid: Optional[str] = None
         self._decided: Optional[str] = None   # "accepted" | "rejected" | None
+        self._marker = None                    # current-frame line on the trace
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        # Track info label.
+        # Unit info label.
         self._lbl = QLabel("")
         self._lbl.setAlignment(Qt.AlignCenter)
         self._lbl.setStyleSheet(
@@ -82,10 +137,23 @@ class _TrackPanel(QWidget):
         )
         layout.addWidget(self._lbl)
 
-        # Image canvas.
+        # Image canvas (cropped cell with red boundary outline).
         self._canvas = ImageCanvas(self)
         self._canvas.setMinimumSize(120, 120)
-        layout.addWidget(self._canvas, stretch=1)
+        layout.addWidget(self._canvas, stretch=2)
+
+        # Per-frame cell-detail text (frame / area / ecc / intensity).
+        self._info = QLabel("")
+        self._info.setAlignment(Qt.AlignCenter)
+        self._info.setWordWrap(True)
+        self._info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        layout.addWidget(self._info)
+
+        # Per-cell metric trace over the unit's frames (CellTracker-style).
+        self._trace = MplCanvas(self, width=3.0, height=1.4, dpi=90)
+        self._trace.setMinimumHeight(96)
+        self._trace_ax = self._trace.add_subplot(111)
+        layout.addWidget(self._trace, stretch=1)
 
         # Accept / Reject buttons.
         btn_row = QHBoxLayout()
@@ -107,33 +175,38 @@ class _TrackPanel(QWidget):
 
     def load(
         self,
-        track_id: int,
+        uid: str,
         crop_frames: List[np.ndarray],
-        track_length: int,
+        label_text: str,
+        info_texts: Optional[List[str]] = None,
+        trace: Optional[Tuple[List[int], List[float], str]] = None,
     ) -> None:
-        """Attach new crop data and reset decided state."""
-        self._track_id = track_id
+        """Attach new crop data + per-frame info + metric trace; reset decision."""
+        self._uid = uid
         self._crop_frames = crop_frames
+        self._info_texts = info_texts or []
         self._decided = None
-        self._lbl.setText(
-            f"Track {track_id}  •  {track_length} frame{'s' if track_length != 1 else ''}"
-        )
+        self._lbl.setText(label_text)
         self._btn_accept.setEnabled(True)
         self._btn_reject.setEnabled(True)
         self._set_border(self._BORDER_NEUTRAL)
+        self._draw_trace(trace)
         self.show_frame(0)
 
     def clear(self) -> None:
         """Display an empty (placeholder) state."""
-        self._track_id = None
+        self._uid = None
         self._crop_frames = []
+        self._info_texts = []
         self._decided = None
         self._lbl.setText("—")
+        self._info.setText("")
         self._btn_accept.setEnabled(False)
         self._btn_reject.setEnabled(False)
         self._canvas.set_image(
             np.zeros((64, 64, 3), dtype=np.uint8)
         )
+        self._draw_trace(None)
         self._set_border(self._BORDER_NEUTRAL)
 
     def show_frame(self, t: int) -> None:
@@ -141,6 +214,35 @@ class _TrackPanel(QWidget):
             return
         t = max(0, min(t, len(self._crop_frames) - 1))
         self._canvas.set_image(self._crop_frames[t])
+        if 0 <= t < len(self._info_texts):
+            self._info.setText(self._info_texts[t])
+        self._update_marker(t)
+
+    def _draw_trace(self, trace: Optional[Tuple[List[int], List[float], str]]) -> None:
+        """Render the per-cell metric trace (static per unit); marker moves with T."""
+        ax = self._trace_ax
+        ax.clear()
+        self._marker = None
+        self._trace_frames = []
+        if trace is not None:
+            frames, values, ylabel = trace
+            self._trace_frames = list(frames)
+            if frames:
+                ax.plot(frames, values, color=Settings.ACCENT_CYAN, lw=1.4,
+                        marker="o", ms=2.5)
+                ax.set_ylabel(ylabel, fontsize=7)
+                self._marker = ax.axvline(frames[0], color=Settings.ACCENT_YELLOW,
+                                          lw=1.0, ls="--")
+        ax.tick_params(labelsize=6)
+        ax.set_xlabel("frame", fontsize=7)
+        self._trace.fig.tight_layout(pad=0.4)
+        self._trace.draw_idle()
+
+    def _update_marker(self, t: int) -> None:
+        if self._marker is None:
+            return
+        self._marker.set_xdata([t, t])
+        self._trace.draw_idle()
 
     def mark_decided(self, decision: str) -> None:
         """Visually lock the panel after a decision has been made."""
@@ -159,8 +261,8 @@ class _TrackPanel(QWidget):
             )
 
     @property
-    def track_id(self) -> Optional[int]:
-        return self._track_id
+    def uid(self) -> Optional[str]:
+        return self._uid
 
     @property
     def decided(self) -> Optional[str]:
@@ -177,7 +279,7 @@ class _TrackPanel(QWidget):
 # ── Main dialog ───────────────────────────────────────────────────────────────
 
 class TrackValidationDialog(QDialog):
-    """Step-through validation for tracked objects with 1/2/4-up display modes."""
+    """Step-through review of objects with 1/2/4-up display modes."""
 
     def __init__(
         self,
@@ -186,46 +288,58 @@ class TrackValidationDialog(QDialog):
         channels: Dict[str, np.ndarray],
         channel_display: Dict[str, Dict[str, Any]],
         parent: Optional[QWidget] = None,
+        include_untracked: bool = False,
+        overlay_style: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Parameters
         ----------
         measurements:
-            Full list from ResultsPage._measurements (already tracked).
+            Full list of measurement rows (already tracked, if applicable).
         label_masks:
             {seg_channel: (T, H, W) int32} — raw label arrays.
         channels:
             {ch_name: (T, H, W)} materialized image arrays.
         channel_display:
             exp.channel_display — provides color/LUT/enabled per channel.
+        include_untracked:
+            When True, objects without a track_id are each reviewed as their own
+            single-object unit (so review works with no Track Objects node). When
+            False (default), only tracked objects are queued — the Results-page
+            behaviour.
         """
         super().__init__(parent)
-        self.setWindowTitle("Validate Tracked Objects")
+        self.setWindowTitle("Review Objects")
         self.setModal(True)
 
         self._measurements = measurements
         self._label_masks = label_masks
         self._channels = channels
+        # Overlay rendering for the cropped cell, matching the segmentation
+        # overlay format. Defaults to a red outline (StarDist/CellTracker look);
+        # the caller can seed it from the viewer's overlay style.
+        st = overlay_style or {}
+        self._ov_outline: bool = not (st.get("enabled") and st.get("multicolor"))
+        self._ov_color: tuple = tuple(st.get("color") or _BOUNDARY.tolist())
+        self._ov_weight: int = int(st.get("weight", 1)) if st.get("enabled") else 1
         self._channel_display = channel_display
 
-        # ── Track queue ───────────────────────────────────────────────────────
-        seen: Dict[int, int] = {}   # track_id -> first_frame
-        for r in measurements:
-            tid = r.get("track_id")
-            if tid is None:
-                continue
-            f = int(r.get("frame", 0))
-            if tid not in seen or f < seen[tid]:
-                seen[tid] = f
-        self._track_queue: List[int] = sorted(seen.keys(), key=lambda t: seen[t])
+        # ── Per-cell metric options (CellTracker-style: intensity / area / ecc) ──
+        self._metric_options = self._build_metric_options(measurements)
+        self._metric_idx = 0
+
+        # ── Unit queue ──────────────────────────────────────────────────────────
+        self._units: List[_ReviewUnit] = _build_units(measurements, include_untracked)
+        self._units_by_uid: Dict[str, _ReviewUnit] = {u.uid: u for u in self._units}
+        self._unit_queue: List[str] = [u.uid for u in self._units]
 
         # ── State ─────────────────────────────────────────────────────────────
         self._mode: int = 1           # 1 | 2 | 4
-        self._batch_start: int = 0    # index into _track_queue of batch[0]
+        self._batch_start: int = 0    # index into _unit_queue of batch[0]
         self._panels: List[_TrackPanel] = []
         self._panel_crops: List[List[np.ndarray]] = []  # [panel][t] -> rgb
-        self._rejected_track_ids: Set[int] = set()
-        self._accepted_track_ids: Set[int] = set()
+        self._rejected_uids: Set[str] = set()
+        self._accepted_uids: Set[str] = set()
 
         # Global T / playback state.
         self._n_t: int = 1
@@ -254,10 +368,10 @@ class TrackValidationDialog(QDialog):
         self._build_ui()
         self._apply_style()
 
-        if self._track_queue:
+        if self._unit_queue:
             self._load_batch(0)
         else:
-            self._lbl_progress.setText("No tracked objects to validate.")
+            self._lbl_progress.setText("No objects to review.")
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -274,6 +388,41 @@ class TrackValidationDialog(QDialog):
             f"color: {Settings.FG_PRIMARY}; font: bold 11pt;"
         )
         top_bar.addWidget(self._lbl_progress, stretch=1)
+
+        # Metric selector for the per-cell trace (CellTracker's "Metric" combo).
+        top_bar.addWidget(
+            QLabel("Metric:", styleSheet=f"color: {Settings.FG_SECONDARY};")
+        )
+        self._combo_metric = QComboBox()
+        self._combo_metric.addItems([label for (label, _k, _c) in self._metric_options])
+        self._combo_metric.setEnabled(len(self._metric_options) > 1)
+        self._combo_metric.currentIndexChanged.connect(self._on_metric_changed)
+        top_bar.addWidget(self._combo_metric)
+        top_bar.addSpacing(12)
+
+        # Overlay choice — how the reviewed cell is drawn on its crop, using the
+        # same segmentation overlay format (outline vs filled, color, weight).
+        top_bar.addWidget(
+            QLabel("Overlay:", styleSheet=f"color: {Settings.FG_SECONDARY};")
+        )
+        self._combo_overlay = QComboBox()
+        self._combo_overlay.addItems(["Outline", "Filled"])
+        self._combo_overlay.setCurrentIndex(0 if self._ov_outline else 1)
+        self._combo_overlay.currentIndexChanged.connect(self._on_overlay_choice_changed)
+        top_bar.addWidget(self._combo_overlay)
+        self._btn_ov_color = QPushButton()
+        self._btn_ov_color.setFixedSize(28, 22)
+        self._btn_ov_color.setToolTip("Overlay color")
+        self._btn_ov_color.clicked.connect(self._on_overlay_color)
+        self._refresh_ov_color_btn()
+        top_bar.addWidget(self._btn_ov_color)
+        self._spin_ov_weight = QSpinBox()
+        self._spin_ov_weight.setRange(1, 12)
+        self._spin_ov_weight.setValue(self._ov_weight)
+        self._spin_ov_weight.setToolTip("Outline thickness (px)")
+        self._spin_ov_weight.valueChanged.connect(self._on_overlay_choice_changed)
+        top_bar.addWidget(self._spin_ov_weight)
+        top_bar.addSpacing(12)
 
         top_bar.addWidget(
             QLabel("View:", styleSheet=f"color: {Settings.FG_SECONDARY};")
@@ -437,7 +586,7 @@ class TrackValidationDialog(QDialog):
             btn.setChecked(n == mode)
             btn.blockSignals(False)
 
-        # Realign batch_start to new mode boundary so we don't skip tracks.
+        # Realign batch_start to new mode boundary so we don't skip units.
         self._batch_start = (self._batch_start // mode) * mode
 
         self._load_batch(self._batch_start)
@@ -445,20 +594,20 @@ class TrackValidationDialog(QDialog):
     # ── Batch loading ─────────────────────────────────────────────────────────
 
     def _load_batch(self, batch_start: int) -> None:
-        """Render and display the next up-to-`_mode` tracks from `batch_start`."""
+        """Render and display the next up-to-`_mode` units from `batch_start`."""
         self._stop_playback()
         self._batch_start = batch_start
 
-        # Build track ids for this batch (may be fewer than _mode at end of queue).
-        batch_ids: List[int] = []
+        # Build uids for this batch (may be fewer than _mode at end of queue).
+        batch_uids: List[str] = []
         for i in range(self._mode):
             idx = batch_start + i
-            if idx < len(self._track_queue):
-                batch_ids.append(self._track_queue[idx])
+            if idx < len(self._unit_queue):
+                batch_uids.append(self._unit_queue[idx])
 
         # Update progress label.
-        total = len(self._track_queue)
-        if batch_ids:
+        total = len(self._unit_queue)
+        if batch_uids:
             end_num = min(batch_start + self._mode, total)
             self._lbl_progress.setText(
                 f"Objects {batch_start + 1}–{end_num} of {total}"
@@ -467,13 +616,13 @@ class TrackValidationDialog(QDialog):
             self._lbl_progress.setText("All objects reviewed.")
 
         # Rebuild grid panels.
-        self._rebuild_panels(len(batch_ids) if batch_ids else 0)
+        self._rebuild_panels(len(batch_uids) if batch_uids else 0)
 
         # Pre-render crops and load into panels.
         self._panel_crops = []
-        for i, tid in enumerate(batch_ids):
-            track_rows = [r for r in self._measurements if r.get("track_id") == tid]
-            track_length = track_rows[0].get("track_length", 1) if track_rows else 1
+        for i, uid in enumerate(batch_uids):
+            unit = self._units_by_uid[uid]
+            track_rows = unit.rows
 
             r0, r1, c0, c1 = self._compute_crop(track_rows)
             frame_to_row: Dict[int, Dict[str, Any]] = {
@@ -485,12 +634,16 @@ class TrackValidationDialog(QDialog):
             ]
             self._panel_crops.append(crops)
 
+            info_texts = self._info_texts_for_unit(frame_to_row)
+            trace = self._series_for_unit(unit)
+
             panel = self._panels[i]
             # Preserve already-made decisions (mode switch preserves state).
-            panel.load(tid, crops, track_length)
-            if tid in self._accepted_track_ids:
+            panel.load(uid, crops, unit.label_text,
+                       info_texts=info_texts, trace=trace)
+            if uid in self._accepted_uids:
                 panel.mark_decided("accepted")
-            elif tid in self._rejected_track_ids:
+            elif uid in self._rejected_uids:
                 panel.mark_decided("rejected")
 
         # Reset T slider.
@@ -540,18 +693,20 @@ class TrackValidationDialog(QDialog):
     # ── Per-panel decision handling ───────────────────────────────────────────
 
     def _on_panel_accepted(self, panel_idx: int) -> None:
-        tid = self._panels[panel_idx].track_id
-        if tid is None:
+        uid = self._panels[panel_idx].uid
+        if uid is None:
             return
-        self._accepted_track_ids.add(tid)
+        self._accepted_uids.add(uid)
+        self._rejected_uids.discard(uid)
         self._panels[panel_idx].mark_decided("accepted")
         self._check_batch_complete()
 
     def _on_panel_rejected(self, panel_idx: int) -> None:
-        tid = self._panels[panel_idx].track_id
-        if tid is None:
+        uid = self._panels[panel_idx].uid
+        if uid is None:
             return
-        self._rejected_track_ids.add(tid)
+        self._rejected_uids.add(uid)
+        self._accepted_uids.discard(uid)
         self._panels[panel_idx].mark_decided("rejected")
         self._check_batch_complete()
 
@@ -559,8 +714,8 @@ class TrackValidationDialog(QDialog):
         """Accept every undecided panel in the current batch."""
         any_decided = False
         for panel in self._panels:
-            if panel.track_id is not None and panel.decided is None:
-                self._accepted_track_ids.add(panel.track_id)
+            if panel.uid is not None and panel.decided is None:
+                self._accepted_uids.add(panel.uid)
                 panel.mark_decided("accepted")
                 any_decided = True
         if any_decided:
@@ -570,8 +725,8 @@ class TrackValidationDialog(QDialog):
         """Reject every undecided panel in the current batch."""
         any_decided = False
         for panel in self._panels:
-            if panel.track_id is not None and panel.decided is None:
-                self._rejected_track_ids.add(panel.track_id)
+            if panel.uid is not None and panel.decided is None:
+                self._rejected_uids.add(panel.uid)
                 panel.mark_decided("rejected")
                 any_decided = True
         if any_decided:
@@ -580,17 +735,107 @@ class TrackValidationDialog(QDialog):
     def _check_batch_complete(self) -> None:
         """Advance to next batch once every active panel has a decision."""
         for panel in self._panels:
-            if panel.track_id is not None and panel.decided is None:
+            if panel.uid is not None and panel.decided is None:
                 return   # still undecided panels remain
         # Short pause so the user can see the final decision colours, then advance.
         QTimer.singleShot(400, self._advance_batch)
 
     def _advance_batch(self) -> None:
         next_start = self._batch_start + self._mode
-        if next_start >= len(self._track_queue):
-            self.accept()   # all tracks reviewed
+        if next_start >= len(self._unit_queue):
+            self.accept()   # all units reviewed
             return
         self._load_batch(next_start)
+
+    # ── Per-cell metric / detail ────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_metric_options(
+        measurements: List[Dict[str, Any]],
+    ) -> List[Tuple[str, str, str]]:
+        """(label, kind, column) options for the per-cell trace, derived from the
+        columns actually present: one per intensity channel, plus area and (if
+        measured) eccentricity. Mirrors CellTracker's Results-page Metric combo."""
+        chans: Set[str] = set()
+        has_ecc = False
+        for r in measurements:
+            for k in r.keys():
+                if k.startswith("mean_intensity_"):
+                    chans.add(k[len("mean_intensity_"):])
+            if r.get("eccentricity") is not None:
+                has_ecc = True
+        opts: List[Tuple[str, str, str]] = [
+            (f"Intensity: {ch}", "intensity", f"mean_intensity_{ch}")
+            for ch in sorted(chans)
+        ]
+        opts.append(("Area (px²)", "area", "area_px"))
+        if has_ecc:
+            opts.append(("Eccentricity", "ecc", "eccentricity"))
+        return opts
+
+    def _on_metric_changed(self, idx: int) -> None:
+        if 0 <= idx < len(self._metric_options) and idx != self._metric_idx:
+            self._metric_idx = idx
+            self._load_batch(self._batch_start)   # recompute traces + info text
+
+    # ── Overlay choice (segmentation-format cell rendering) ─────────────────
+    def _refresh_ov_color_btn(self) -> None:
+        r, g, b = self._ov_color
+        self._btn_ov_color.setStyleSheet(
+            f"background-color: rgb({r}, {g}, {b}); border: 1px solid #888;")
+
+    def _on_overlay_color(self) -> None:
+        r, g, b = self._ov_color
+        col = QColorDialog.getColor(QColor(r, g, b), self, "Overlay color")
+        if col.isValid():
+            self._ov_color = (col.red(), col.green(), col.blue())
+            self._refresh_ov_color_btn()
+            self._load_batch(self._batch_start)
+
+    def _on_overlay_choice_changed(self, *_args) -> None:
+        self._ov_outline = (self._combo_overlay.currentIndex() == 0)
+        self._ov_weight = int(self._spin_ov_weight.value())
+        self._load_batch(self._batch_start)   # re-render crops with the new style
+
+    def _series_for_unit(
+        self, unit: "_ReviewUnit",
+    ) -> Tuple[List[int], List[float], str]:
+        """(frames, values, ylabel) for the current metric over the unit's rows."""
+        label, _kind, col = self._metric_options[self._metric_idx]
+        frames: List[int] = []
+        values: List[float] = []
+        for r in sorted(unit.rows, key=lambda rr: int(rr.get("frame", 0))):
+            v = r.get(col)
+            if v is None:
+                continue
+            frames.append(int(r.get("frame", 0)))
+            values.append(float(v))
+        return frames, values, label
+
+    def _info_texts_for_unit(
+        self, frame_to_row: Dict[int, Dict[str, Any]],
+    ) -> List[str]:
+        """Per-frame cell-detail text (frame · area · ecc · intensity)."""
+        int_col = next(
+            (c for (_l, k, c) in self._metric_options if k == "intensity"), None)
+        texts: List[str] = []
+        for t in range(self._n_t):
+            row = frame_to_row.get(t)
+            if row is None:
+                texts.append(f"frame {t + 1}/{self._n_t} — not in track")
+                continue
+            parts = [f"frame {t + 1}/{self._n_t}"]
+            area = row.get("area_px")
+            if area is not None:
+                parts.append(f"{int(float(area))} px²")
+            ecc = row.get("eccentricity")
+            if ecc is not None:
+                parts.append(f"ecc {float(ecc):.2f}")
+            if int_col is not None and row.get(int_col) is not None:
+                ch = int_col[len("mean_intensity_"):]
+                parts.append(f"{ch} {float(row[int_col]):.0f}")
+            texts.append("  ·  ".join(parts))
+        return texts
 
     # ── Crop computation ──────────────────────────────────────────────────────
 
@@ -675,13 +920,19 @@ class TrackValidationDialog(QDialog):
             if mask_arr is not None and label_id is not None:
                 t_idx = min(t, mask_arr.shape[0] - 1)
                 mask_crop = mask_arr[t_idx, r0:r1, c0:c1]
-                pixels = mask_crop == int(label_id)
-                if pixels.any():
-                    bg = rgb[pixels].astype(np.float32)
-                    rgb[pixels] = np.clip(
-                        bg * (1.0 - _HIGHLIGHT_ALPHA) + _HIGHLIGHT * _HIGHLIGHT_ALPHA,
-                        0, 255,
-                    ).astype(np.uint8)
+                cell = (mask_crop == int(label_id))
+                if cell.any():
+                    # Render the cell with the SAME segmentation overlay format
+                    # (outline / filled, color, weight) via the shared helper, per
+                    # the dialog's overlay choice.
+                    from nd2studios.pages.analysis_page import _overlay_labels
+                    single = cell.astype(np.int32)
+                    rgb = _overlay_labels(
+                        rgb, single,
+                        alpha=1.0 if self._ov_outline else 0.5,
+                        color=self._ov_color,
+                        outline=self._ov_outline,
+                        thickness=self._ov_weight)
         return rgb
 
     # ── Playback ──────────────────────────────────────────────────────────────
@@ -740,10 +991,32 @@ class TrackValidationDialog(QDialog):
 
     # ── Public results ────────────────────────────────────────────────────────
 
+    def _rows_for(self, uids: Set[str]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for uid in uids:
+            unit = self._units_by_uid.get(uid)
+            if unit is not None:
+                out.extend(unit.rows)
+        return out
+
+    @property
+    def rejected_rows(self) -> List[Dict[str, Any]]:
+        """The actual measurement-row dicts the user rejected (references)."""
+        return self._rows_for(self._rejected_uids)
+
+    @property
+    def accepted_rows(self) -> List[Dict[str, Any]]:
+        """The actual measurement-row dicts the user accepted (references)."""
+        return self._rows_for(self._accepted_uids)
+
     @property
     def rejected_track_ids(self) -> Set[int]:
-        return self._rejected_track_ids
+        return {u.track_id for uid in self._rejected_uids
+                if (u := self._units_by_uid.get(uid)) is not None
+                and u.track_id is not None}
 
     @property
     def accepted_track_ids(self) -> Set[int]:
-        return self._accepted_track_ids
+        return {u.track_id for uid in self._accepted_uids
+                if (u := self._units_by_uid.get(uid)) is not None
+                and u.track_id is not None}

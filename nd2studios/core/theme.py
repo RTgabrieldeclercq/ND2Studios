@@ -378,10 +378,12 @@ QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
     background-color: #5a5e72;
 }
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
-    width: 7px; height: 5px;
+    image: url("__UP_ARROW__");
+    width: 10px; height: 10px;
 }
 QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
-    width: 7px; height: 5px;
+    image: url("__DOWN_ARROW__");
+    width: 10px; height: 10px;
 }
 QComboBox {
     background-color: #343b48;
@@ -394,10 +396,8 @@ QComboBox {
 QComboBox:hover { border: 1px solid #bd93f9; }
 QComboBox::drop-down { border: none; width: 24px; }
 QComboBox::down-arrow {
-    image: none;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 6px solid #bd93f9;
+    image: url("__COMBO_ARROW__");
+    width: 12px; height: 12px;
     margin-right: 8px;
 }
 QComboBox QAbstractItemView {
@@ -610,4 +610,82 @@ QFileDialog QPushButton {
     border: 1px solid #5a5e72; border-radius: 5px; padding: 4px 14px;
 }
 QFileDialog QPushButton:hover { background-color: #5a5e72; color: #f8f8f2; }
+
+/* ── Pipelines tab (V1.45) ─────────────────────────────────────────── */
+#nodeBoard { background-color: #282a36; }
+#subTabBar { background: transparent; }
+#pipelineControlBar { background: transparent; }
+#pipelineToolBtn {
+    background-color: #343b48; color: #f8f8f2;
+    border: 1px solid #44475a; border-radius: 5px; padding: 4px 10px;
+}
+#pipelineToolBtn:hover { background-color: #44475a; }
+#pipelineToolBtn:checked { border: 1px solid #8be9fd; color: #8be9fd; }
+#pipelineToolBtn:disabled { color: #6b6f7d; border-color: #34384a; }
+#nodeNameEdit {
+    background-color: #21252b; color: #f8f8f2;
+    border: 1px solid #ffc83d; border-radius: 4px; padding: 1px 4px;
+    selection-background-color: #343b48;
+}
+#nodeParamPopup { background: transparent; }
+#nodeParamPopupFrame {
+    background-color: #21252b;
+    border: 1px solid #8be9fd; border-radius: 8px;
+}
+#pipelinePreviewProgress {
+    background-color: #21252b;
+    border: 1px solid #44475a; border-radius: 5px;
+}
+#pipelinePreviewProgress::chunk {
+    background-color: #8be9fd; border-radius: 4px;
+}
+/* Add-node catalog dialog (V1.45.1). */
+#addNodeDialog { background-color: #282a36; }
+#addNodeList {
+    background-color: #21252b; color: #f8f8f2;
+    border: 1px solid #44475a; border-radius: 6px; padding: 4px;
+}
+#addNodeList::item { padding: 5px 8px; border-radius: 4px; }
+#addNodeList::item:selected { background-color: #44475a; color: #8be9fd; }
+#addNodeList::item:hover { background-color: #343b48; }
+#addNodeDescScroll, #addNodeDescScroll > QWidget > QWidget { background: transparent; }
+#addNodeDesc { background: transparent; }
+#addNodePreview {
+    background-color: #21252b;
+    border: 1px solid #44475a; border-radius: 8px;
+}
+#addNodeThumb {
+    background-color: #1b1e24;
+    border: 1px solid #44475a; border-radius: 6px;
+    color: #6b6f7d;
+}
 """
+
+
+def build_stylesheet() -> str:
+    """Return the stylesheet with real arrow images injected (V1.44).
+
+    QSS ``::down-arrow`` / ``::up-arrow`` only render reliably from an
+    ``image: url(...)``; the previous border-triangle / empty rules showed
+    nothing. We render crisp qtawesome chevrons (recolored to the palette) to
+    cached PNGs and substitute their paths. Must be called after a
+    ``QApplication`` exists (QPixmap needs it). Falls back to the bare
+    stylesheet if qtawesome/rendering is unavailable.
+    """
+    from nd2studios.core.settings import Settings
+    from nd2studios.widgets.icon_button import arrow_png
+
+    down = arrow_png("fa5s.chevron-down", Settings.ACCENT_PURPLE, 12)
+    up = arrow_png("fa5s.chevron-up", Settings.ACCENT_PURPLE, 12)
+    combo = arrow_png("fa5s.chevron-down", Settings.ACCENT_PURPLE, 12)
+    qss = STYLESHEET
+    if down and up and combo:
+        qss = (qss.replace("__DOWN_ARROW__", down)
+                  .replace("__UP_ARROW__", up)
+                  .replace("__COMBO_ARROW__", combo))
+    else:
+        # No images — drop the image rules so Qt falls back to native arrows.
+        qss = (qss.replace('image: url("__UP_ARROW__");', "")
+                  .replace('image: url("__DOWN_ARROW__");', "")
+                  .replace('image: url("__COMBO_ARROW__");', ""))
+    return qss

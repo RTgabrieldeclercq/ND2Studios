@@ -30,12 +30,13 @@ from skimage.morphology import disk
 # V1.39 Phase 7: route ``gaussian`` and ``threshold_otsu`` through the
 # GPU-aware shim. Identical signatures to ``skimage.filters``; falls
 # back to skimage when GPU mode is off or unavailable.
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from nd2studios.backend.analysis.plane_runner import (
+    make_frame_cb, make_label_writers, run_planes_to_labels,
+)
+from nd2studios.backend.analysis.source_utils import read_plane, source_shape
 from nd2studios.compute.gpu.ops import gaussian, threshold_otsu
 from nd2studios.core.analysis_registry import AnalysisPipeline, AnalysisResult
 from nd2studios.core.plugin_registry import ParamSpec
-from nd2studios.utils.resources import recommended_worker_count
 
 
 @AnalysisPipeline.register
@@ -117,16 +118,15 @@ class TearDetectionPipeline(AnalysisPipeline):
         if ch not in channels:
             ch = next(iter(channels))
 
-        volume: np.ndarray = np.asarray(channels[ch])
-        if volume.ndim == 2:
-            volume = volume[np.newaxis]
-        T, H, W = volume.shape
+        # V1.46 — keep sources lazy; read each plane on demand so a streamed
+        # dataset never materializes the whole stack.
+        source = channels[ch]
+        T, H, W = source_shape(source)
 
         cs_name: str = params.get("counterstain_channel", "None")
-        cs_volume: Optional[np.ndarray] = None
+        cs_source = None
         if cs_name != "None" and cs_name in channels:
-            cs_arr = np.asarray(channels[cs_name])
-            cs_volume = cs_arr[np.newaxis] if cs_arr.ndim == 2 else cs_arr
+            cs_source = channels[cs_name]
 
         pixel_size_um: float = float(metadata.get("pixel_size_um", 1.0))
         px2 = pixel_size_um ** 2
@@ -141,24 +141,16 @@ class TearDetectionPipeline(AnalysisPipeline):
         if progress_cb:
             progress_cb(0)
 
-        label_stack = np.zeros((T, H, W), dtype=np.int32)
-        measurements: List[Dict[str, Any]] = []
-
-        # Addendum Phase 5 Improvement 1: the per-frame work
-        # (`_tissue_mask`, `_homogeneity_score`, `regionprops`) lives
-        # entirely in scipy / scikit-image / numpy, all of which
-        # release the GIL. Parallelise across T with a thread pool so a
-        # 100-frame stack on a 4-core machine drops from ~N×t to ~N×t/4
-        # without touching the per-frame code. We collect per-frame
-        # outputs and stitch them back in T-order at the bottom so the
-        # ``label_stack`` and ``measurements`` shapes are byte-equivalent
-        # to the V1.19 sequential path.
+        # Per-frame work (`_tissue_mask`, `_homogeneity_score`, `regionprops`)
+        # is scipy/skimage/numpy — all GIL-releasing — so run_planes_to_labels
+        # parallelises across T. V1.46: the label output streams to disk when
+        # the dataset is lazy (adaptive), else stays an in-RAM (T,H,W) array.
 
         def _process_one(t: int):
-            frame = volume[t].astype(np.float32)
+            frame = read_plane(source, t).astype(np.float32)
             cs_frame = (
-                cs_volume[t].astype(np.float32)
-                if cs_volume is not None else None
+                read_plane(cs_source, t).astype(np.float32)
+                if cs_source is not None else None
             )
             tissue_mask = _tissue_mask(frame)
             score_map = _homogeneity_score(frame, tissue_mask, win)
@@ -195,33 +187,16 @@ class TearDetectionPipeline(AnalysisPipeline):
                     "eccentricity": round(float(region.eccentricity), 4),
                 })
                 new_id += 1
-            return accepted, frame_rows
+            return accepted, frame_rows, None
 
-        per_t: Dict[int, Any] = {}
-        n_workers = recommended_worker_count()
-        with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            futures = {ex.submit(_process_one, t): t for t in range(T)}
-            done = 0
-            for fut in as_completed(futures):
-                if cancelled_cb and cancelled_cb():
-                    # Stop scheduling further results; in-flight tasks
-                    # finish their current plane before unwinding.
-                    for f in futures:
-                        f.cancel()
-                    break
-                t_key = futures[fut]
-                per_t[t_key] = fut.result()
-                done += 1
-                if progress_cb:
-                    progress_cb(int(done / T * 100))
-
-        # Stitch in T-order so ``label_stack[t]`` and the per-frame
-        # measurement order match the pre-parallel V1.19 layout
-        # exactly. Cancelled frames simply stay as zeros.
-        for t in sorted(per_t.keys()):
-            accepted, rows = per_t[t]
-            label_stack[t] = accepted
-            measurements.extend(rows)
+        primary_writer, _ = make_label_writers(params, ch, (T, H, W))
+        out = run_planes_to_labels(
+            n_frames=T, height=H, width=W, per_frame_fn=_process_one,
+            primary_writer=primary_writer,
+            progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+            frame_cb=make_frame_cb(params),
+        )
+        measurements = out.measurements
 
         areas = [m["area_px"] for m in measurements]
         summary: Dict[str, Any] = {
@@ -234,7 +209,7 @@ class TearDetectionPipeline(AnalysisPipeline):
         }
 
         return AnalysisResult(
-            label_masks={ch: label_stack},
+            label_masks={ch: out.primary},
             measurements=measurements,
             summary=summary,
         )

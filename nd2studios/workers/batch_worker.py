@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import os
+import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -152,17 +153,12 @@ class BatchWorker(BaseWorker):
             t_stride=t_stride,
         )
         load_result = load_worker.run_task()
+        # V1.46 — keep M=0 channels LAZY; the pipeline + compute_measurements
+        # read frames on demand, so a memory-constrained host never holds the
+        # whole file in RAM. The load strategy decides streaming below.
         channels_m0: Dict[str, Any] = load_result.get("channels", {})
         metadata: Dict[str, Any] = load_result.get("metadata", {})
-
-        # Materialise lazy proxies for M=0
-        channels_m0 = {
-            k: (
-                v.materialize() if hasattr(v, "materialize") and callable(v.materialize)
-                else np.asarray(v)
-            )
-            for k, v in channels_m0.items()
-        }
+        load_strategy = load_result.get("strategy")
 
         if self.cancelled:
             return []
@@ -189,16 +185,15 @@ class BatchWorker(BaseWorker):
             if self.cancelled:
                 break
 
-            # Build channels for this M position.
+            # Build channels for this M position — kept LAZY (no materialize);
+            # t-stride is applied by the lazy channel itself.
             if raw_volume is not None and multi_m:
-                channels: Dict[str, np.ndarray] = {}
+                channels: Dict[str, Any] = {}
                 for c_idx, ch_name in enumerate(raw_volume.channel_names):
-                    arr = raw_volume.to_lazy_channel(
-                        c_idx, m=m, z_mode=z_mode, z_index=z_index
-                    ).materialize()
-                    if t_stride > 1 and arr.ndim == 3:
-                        arr = arr[::t_stride]
-                    channels[ch_name] = arr
+                    channels[ch_name] = raw_volume.to_lazy_channel(
+                        c_idx, m=m, z_mode=z_mode, z_index=z_index,
+                        t_stride=t_stride,
+                    )
             else:
                 channels = dict(channels_m0)
 
@@ -222,6 +217,14 @@ class BatchWorker(BaseWorker):
                 f"[{file_idx + 1}/{total}] {pipeline_name} M{m}: {basename}…"
                 if multi_m else f"[{file_idx + 1}/{total}] {pipeline_name}: {basename}…"
             )
+            # V1.46 — adaptive streaming of label masks to a temp scratch so a
+            # constrained host never holds the whole mask stack. Batch keeps no
+            # masks (only the aggregate CSV + optional images), so the scratch
+            # is removed after this M.
+            m_scratch = self._inject_label_streaming(
+                analysis_params, raw_volume or channels_m0, load_strategy,
+                pipeline_cls, m,
+            )
             pipeline = pipeline_cls()
             analysis_result = pipeline.run(
                 channels,
@@ -232,6 +235,8 @@ class BatchWorker(BaseWorker):
             )
 
             if self.cancelled:
+                if m_scratch:
+                    shutil.rmtree(m_scratch, ignore_errors=True)
                 break
 
             # 4. Compute measurements
@@ -267,4 +272,44 @@ class BatchWorker(BaseWorker):
                 except Exception:
                     pass  # image export failure should not abort the batch
 
+            # Masks for this M have been measured + (optionally) exported; the
+            # streamed scratch is no longer needed.
+            if m_scratch:
+                # Drop references so the memmap/zarr file can be removed.
+                analysis_result.label_masks = {}
+                analysis_result.secondary_label_masks = {}
+                shutil.rmtree(m_scratch, ignore_errors=True)
+
         return all_rows
+
+    def _inject_label_streaming(
+        self, analysis_params: Dict[str, Any], volume, decision,
+        pipeline_cls, m: int,
+    ) -> Optional[str]:
+        """Inject the reserved streaming params when this run should stream.
+
+        Returns the per-M scratch dir (to be removed after the M is done) or
+        ``None`` when running eager / in-RAM.
+        """
+        from nd2studios.utils.resource_strategy import should_stream_analysis
+        from nd2studios.pipeline.storage import LabelStackWriter
+
+        force = (False if getattr(pipeline_cls, "needs_full_stack", False)
+                 else None)
+        if not should_stream_analysis(volume, decision=decision, force=force):
+            analysis_params.pop("_stream_labels", None)
+            analysis_params.pop("_label_sink_factory", None)
+            return None
+
+        scratch = os.path.join(self.output_dir, ".labels_scratch",
+                               f"m{m:03d}")
+        os.makedirs(scratch, exist_ok=True)
+
+        def _sink_factory(name: str, shape):
+            safe = "".join(c if c.isalnum() else "_" for c in str(name))
+            return LabelStackWriter(os.path.join(scratch, f"labels_{safe}"),
+                                    shape)
+
+        analysis_params["_stream_labels"] = True
+        analysis_params["_label_sink_factory"] = _sink_factory
+        return scratch

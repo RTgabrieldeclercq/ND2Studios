@@ -87,8 +87,17 @@ class RecipeWorker(BaseWorker):
                     fp.advance(n_t)
                     continue
                 plugin = plugin_cls()
-                current = plugin.execute(current, params, progress_cb=None)
-                fp.advance(n_t)
+                # Per-frame progress *during* the step: built-in plugins call
+                # progress_cb(0..100) per frame. Map that onto this step's
+                # T-frame block so the bar advances frame-by-frame instead of
+                # freezing until the whole step finishes (V1.44).
+                step_base = fp.done
+
+                def _step_cb(pct: int, _base=step_base) -> None:
+                    fp.set_done(_base + int(n_t * max(0, min(100, pct)) / 100))
+
+                current = plugin.execute(current, params, progress_cb=_step_cb)
+                fp.set_done(step_base + n_t)
 
             results[ch_name] = current
 

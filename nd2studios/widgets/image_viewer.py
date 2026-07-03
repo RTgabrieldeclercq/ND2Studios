@@ -10,6 +10,7 @@ import numpy as np
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QComboBox, QCheckBox, QSizePolicy, QPushButton,
+    QColorDialog, QSpinBox, QGridLayout, QMenu, QWidgetAction,
 )
 from PySide6.QtCore import Qt, Signal, QPoint, QRectF, QPointF
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QBrush, QColor, QPolygonF
@@ -98,11 +99,28 @@ def composite_channels(
 
 class ZoomToolbar(QWidget):
     """Home / Zoom-in / Zoom-out button row bound to an ImageCanvas,
-    with a live zoom-level readout."""
+    with an overlay-style control, a live zoom readout, and a pixel-hover
+    readout (intensity + position with an image/stage coordinate toggle)."""
+
+    # Emitted when the user changes the overlay style (color / weight /
+    # multicolor / alpha) — pages read it via ``MultiAxisViewer.overlay_style``.
+    overlay_style_changed = Signal(dict)
+    # Emitted when the hover coordinate toggle flips. True = stage (µm).
+    coord_mode_changed = Signal(bool)
 
     def __init__(self, canvas: "ImageCanvas", parent=None):
         super().__init__(parent)
         self._canvas = canvas
+        # Overlay style state read by the overlay painters. ``enabled`` False =
+        # use each result's built-in colors (current behavior) until the user
+        # opts into a custom style.
+        self._overlay_style: Dict[str, object] = {
+            "enabled": False,
+            "color": (255, 50, 50),
+            "multicolor": False,
+            "weight": 1,
+            "alpha": 1.0,
+        }
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -148,6 +166,17 @@ class ZoomToolbar(QWidget):
         # Keep the button in sync if pan_mode is changed elsewhere.
         canvas.pan_mode_changed.connect(self._on_pan_mode_changed)
 
+        # Overlay style control — sits right after Pan, before the zoom %.
+        self.btn_overlay = QPushButton("Overlay")
+        self.btn_overlay.setObjectName("compactBtn")
+        self.btn_overlay.setToolTip(
+            "Overlay appearance: uniform color, line weight, multicolor, opacity.")
+        self.btn_overlay.setFixedSize(BTN_W, BTN_H)
+        self._overlay_menu = self._build_overlay_menu()
+        self.btn_overlay.setMenu(self._overlay_menu)
+        self.btn_overlay.setVisible(False)   # shown only when an overlay is active
+        layout.addWidget(self.btn_overlay)
+
         self.lbl_zoom = QLabel("100%")
         self.lbl_zoom.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
         self.lbl_zoom.setMinimumWidth(48)
@@ -155,6 +184,23 @@ class ZoomToolbar(QWidget):
 
         # Update label whenever the canvas updates its zoom.
         canvas.zoom_changed.connect(self._on_zoom_changed)
+
+        # Pixel-hover readout (intensity + position) to the right of the zoom %,
+        # with a px / µm toggle for image vs stage coordinates.
+        self.btn_coord = QPushButton("px")
+        self.btn_coord.setObjectName("compactBtn")
+        self.btn_coord.setCheckable(True)
+        self.btn_coord.setFixedSize(BTN_H, BTN_H)
+        self.btn_coord.setToolTip("Toggle hover coordinates: image pixels (px) ↔ "
+                                  "stage micrometers (µm).")
+        self.btn_coord.toggled.connect(self._on_coord_toggled)
+        layout.addWidget(self.btn_coord)
+
+        self.lbl_hover = QLabel("")
+        self.lbl_hover.setObjectName("hoverReadout")
+        self.lbl_hover.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_hover.setMinimumWidth(60)
+        layout.addWidget(self.lbl_hover)
 
     def _on_home(self):
         self._canvas.reset_zoom()
@@ -175,11 +221,93 @@ class ZoomToolbar(QWidget):
             self.btn_pan.setChecked(enabled)
             self.btn_pan.blockSignals(False)
 
+    # ── Overlay style control ─────────────────────────────────────────────
+    def _build_overlay_menu(self) -> QMenu:
+        menu = QMenu(self)
+        w = QWidget()
+        grid = QGridLayout(w)
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setSpacing(6)
+
+        self._ov_enabled = QCheckBox("Custom overlay style")
+        self._ov_enabled.setToolTip(
+            "Off = use each result's built-in colors. On = apply the settings below.")
+        self._ov_enabled.toggled.connect(self._on_overlay_changed)
+        grid.addWidget(self._ov_enabled, 0, 0, 1, 2)
+
+        grid.addWidget(QLabel("Color"), 1, 0)
+        self._ov_color_btn = QPushButton()
+        self._ov_color_btn.setFixedSize(44, 20)
+        self._ov_color_btn.setToolTip("Uniform overlay color")
+        self._ov_color_btn.clicked.connect(self._on_pick_color)
+        grid.addWidget(self._ov_color_btn, 1, 1)
+        self._update_color_swatch()
+
+        self._ov_multicolor = QCheckBox("Multicolor (per object / track)")
+        self._ov_multicolor.setToolTip(
+            "Color each object/track distinctly instead of the uniform color.")
+        self._ov_multicolor.toggled.connect(self._on_overlay_changed)
+        grid.addWidget(self._ov_multicolor, 2, 0, 1, 2)
+
+        grid.addWidget(QLabel("Weight"), 3, 0)
+        self._ov_weight = QSpinBox()
+        self._ov_weight.setRange(1, 12)
+        self._ov_weight.setValue(1)
+        self._ov_weight.setToolTip("Outline / vector line thickness (px).")
+        self._ov_weight.valueChanged.connect(self._on_overlay_changed)
+        grid.addWidget(self._ov_weight, 3, 1)
+
+        grid.addWidget(QLabel("Opacity"), 4, 0)
+        self._ov_alpha = QSlider(Qt.Orientation.Horizontal)
+        self._ov_alpha.setRange(10, 100)
+        self._ov_alpha.setValue(100)
+        self._ov_alpha.valueChanged.connect(self._on_overlay_changed)
+        grid.addWidget(self._ov_alpha, 4, 1)
+
+        act = QWidgetAction(menu)
+        act.setDefaultWidget(w)
+        menu.addAction(act)
+        return menu
+
+    def _update_color_swatch(self) -> None:
+        r, g, b = self._overlay_style["color"]  # type: ignore[misc]
+        self._ov_color_btn.setStyleSheet(
+            f"background-color: rgb({r}, {g}, {b}); border: 1px solid #888;")
+
+    def _on_pick_color(self) -> None:
+        r, g, b = self._overlay_style["color"]  # type: ignore[misc]
+        col = QColorDialog.getColor(QColor(r, g, b), self, "Overlay color")
+        if col.isValid():
+            self._overlay_style["color"] = (col.red(), col.green(), col.blue())
+            self._update_color_swatch()
+            self._on_overlay_changed()
+
+    def _on_overlay_changed(self, *_args) -> None:
+        self._overlay_style["enabled"] = self._ov_enabled.isChecked()
+        self._overlay_style["multicolor"] = self._ov_multicolor.isChecked()
+        self._overlay_style["weight"] = int(self._ov_weight.value())
+        self._overlay_style["alpha"] = self._ov_alpha.value() / 100.0
+        self.overlay_style_changed.emit(dict(self._overlay_style))
+
+    def overlay_style(self) -> Dict[str, object]:
+        return dict(self._overlay_style)
+
+    def set_overlay_button_visible(self, on: bool) -> None:
+        self.btn_overlay.setVisible(bool(on))
+
+    def set_hover_text(self, text: str) -> None:
+        self.lbl_hover.setText(text or "")
+
+    def _on_coord_toggled(self, checked: bool) -> None:
+        self.btn_coord.setText("µm" if checked else "px")
+        self.coord_mode_changed.emit(bool(checked))
+
 
 class ImageCanvas(QLabel):
     """QLabel that displays a scaled QPixmap with overlay painting and click reporting."""
 
     clicked = Signal(float, float)            # image-space y, x
+    hover = Signal(float, float)              # image-space y, x; (-1, -1) = left image
     zoom_changed = Signal(float)              # current zoom multiplier (1.0 = fit)
     pan_mode_changed = Signal(bool)           # True if pan tool is active
     crop_rect_selected = Signal(int, int, int, int)  # x, y, w, h (image pixels)
@@ -289,6 +417,16 @@ class ImageCanvas(QLabel):
     def zoom_out(self):
         self._zoom = max(self._zoom / 1.3, 0.1)
         self.zoom_changed.emit(self._zoom)
+        self.update()
+
+    def set_zoom_level(self, zoom: float, pan=None) -> None:
+        """Set absolute zoom (and optional ``(pan_x, pan_y)`` in image px).
+
+        Used to mirror one viewer's zoom/pan onto another (Recipe page raw ⇄
+        processed sync, V1.44)."""
+        self._zoom = max(0.1, min(float(zoom), 50.0))
+        if pan is not None:
+            self._pan_x, self._pan_y = float(pan[0]), float(pan[1])
         self.update()
 
     def set_pan_mode(self, enabled: bool):
@@ -491,9 +629,40 @@ class ImageCanvas(QLabel):
         painter.end()
 
     def wheelEvent(self, event):
-        """Wheel/pinch zoom is disabled — too sensitive on trackpads.
-        Use the toolbar (+ / − / Home) or the Pan toggle instead."""
-        event.ignore()
+        """Smooth wheel zoom toward the cursor (V1.44).
+
+        Small multiplicative steps (1.12×/notch) give a smooth feel; the image
+        point under the cursor is kept fixed so zooming tracks where you point.
+        """
+        if self._source_pixmap is None:
+            event.ignore()
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+        steps = delta / 120.0
+        factor = 1.12 ** steps
+        new_zoom = max(0.1, min(self._zoom * factor, 50.0))
+        if abs(new_zoom - self._zoom) < 1e-6:
+            event.accept()
+            return
+        # Keep the image coordinate under the cursor stationary.
+        pos = event.position()
+        before_iy, before_ix = self.widget_to_image(pos.x(), pos.y())
+        self._zoom = new_zoom
+        # Recompute scale for the new zoom, then adjust pan so (before_ix,
+        # before_iy) maps back to the same widget point.
+        pw, ph = self._source_pixmap.width(), self._source_pixmap.height()
+        ww, wh = self.width(), self.height()
+        base_scale = min(ww / pw, wh / ph)
+        scale = base_scale * self._zoom
+        # widget = (ww - sw)/2 - pan*scale + img*scale  →  solve pan for fixed widget
+        self._pan_x = before_ix - (pos.x() - (ww - pw * scale) / 2) / scale
+        self._pan_y = before_iy - (pos.y() - (wh - ph * scale) / 2) / scale
+        self.zoom_changed.emit(self._zoom)
+        self.update()
+        event.accept()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -549,7 +718,18 @@ class ImageCanvas(QLabel):
             return
         super().mousePressEvent(event)
 
+    def leaveEvent(self, event):
+        self.hover.emit(-1.0, -1.0)
+        super().leaveEvent(event)
+
     def mouseMoveEvent(self, event):
+        # Live pixel-hover readout (fires for every move, independent of tools).
+        hy, hx = self.widget_to_image(event.pos().x(), event.pos().y())
+        if 0 <= hx < self._img_w and 0 <= hy < self._img_h:
+            self.hover.emit(hy, hx)
+        else:
+            self.hover.emit(-1.0, -1.0)
+
         if (self._edit_vertices is not None
                 and self._edit_drag_idx is not None):
             iy, ix = self.widget_to_image(event.pos().x(), event.pos().y())

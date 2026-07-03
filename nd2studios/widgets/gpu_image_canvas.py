@@ -47,7 +47,7 @@ os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 # var is the belt; this is the suspenders.
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal  # noqa: E402
 from PySide6.QtGui import (  # noqa: E402
-    QBrush, QColor, QPainter, QPen, QPolygonF,
+    QBrush, QColor, QImage, QPainter, QPen, QPolygonF,
 )
 from PySide6.QtWidgets import (  # noqa: E402
     QGraphicsItem, QSizePolicy, QVBoxLayout, QWidget,
@@ -220,6 +220,7 @@ class GpuImageCanvas(QWidget):
 
     # ── Signals (mirror legacy ImageCanvas) ───────────────────────
     clicked = Signal(float, float)              # iy, ix (image pixels)
+    hover = Signal(float, float)                # iy, ix; (-1, -1) = left image
     zoom_changed = Signal(float)                # zoom multiplier (1.0 = fit)
     pan_mode_changed = Signal(bool)             # True if pan tool is active
     crop_rect_selected = Signal(int, int, int, int)  # x, y, w, h
@@ -352,7 +353,13 @@ class GpuImageCanvas(QWidget):
 
     def set_channel_visible(self, c: int, on: bool) -> None:
         if 0 <= c < len(self._channels):
-            self._channels[c].set_visible(on)
+            layer = self._channels[c]
+            # Remember the intent, but only reflect it on screen in per-channel
+            # mode. In composite/overlay mode the channel layers must stay hidden
+            # so they never cover the overlaid image; ``update_channel`` reapplies
+            # the ``_visible`` flag when it switches back to channels mode.
+            layer._visible = bool(on)
+            layer.item.setVisible(bool(on) if self._mode == "channels" else False)
 
     def set_channel_levels(self, c: int, levels: Tuple[float, float]) -> None:
         if 0 <= c < len(self._channels):
@@ -372,11 +379,13 @@ class GpuImageCanvas(QWidget):
         two paths don't double-up."""
         if rgb_array is None:
             return
-        if self._mode != "composite":
-            for layer in self._channels:
-                layer.item.setVisible(False)
-            self._composite_item.setVisible(True)
-            self._mode = "composite"
+        # Always hide every per-channel layer while a composite/overlay image is
+        # shown — not just on the first transition — so a stray channel-visibility
+        # change can never leave a base channel painted over the overlay.
+        for layer in self._channels:
+            layer.item.setVisible(False)
+        self._composite_item.setVisible(True)
+        self._mode = "composite"
         a = np.ascontiguousarray(rgb_array)
         if a.ndim == 3 and a.shape[2] in (3, 4):
             h, w = a.shape[:2]
@@ -392,6 +401,25 @@ class GpuImageCanvas(QWidget):
         self._composite_item.setImage(
             a, autoLevels=False, levels=(0, 255), autoDownsample=True,
         )
+
+    def set_pixmap_direct(self, pixmap) -> None:
+        """Legacy-parity hot-path: display a pre-rendered ``QPixmap``.
+
+        The legacy :class:`ImageCanvas` blits the pixmap straight into its
+        QLabel. The GPU canvas has no QLabel, so convert the pixmap to an
+        ``(H, W, 3) uint8`` array once and route it through the composite
+        layer. Used by the post-process overlay cache (analysis page) and the
+        V1.41 playback pixmap cache when the GPU canvas is active.
+        """
+        if pixmap is None or pixmap.isNull():
+            return
+        img = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
+        w, h = img.width(), img.height()
+        bpl = img.bytesPerLine()
+        buf = img.constBits()
+        arr = np.frombuffer(buf, dtype=np.uint8, count=bpl * h).reshape(h, bpl)
+        arr = arr[:, : w * 3].reshape(h, w, 3).copy()
+        self.set_image(arr)
 
     def set_grayscale(self, gray_uint8: np.ndarray) -> None:
         """Composite-fallback path with an explicit grayscale array."""
@@ -471,6 +499,19 @@ class GpuImageCanvas(QWidget):
     def zoom_out(self) -> None:
         self._viewbox.scaleBy((1.3, 1.3))
         self._emit_zoom()
+
+    def set_zoom_level(self, zoom: float, pan=None) -> None:
+        """Match an absolute zoom level (Recipe page raw ⇄ processed sync,
+        V1.44). Fits the image then scales to ``zoom``; ``pan`` is ignored
+        because pyqtgraph manages panning via the ViewBox."""
+        z = max(0.1, min(float(zoom), 50.0))
+        try:
+            self._viewbox.autoRange()
+            if abs(z - 1.0) > 1e-3:
+                self._viewbox.scaleBy((1.0 / z, 1.0 / z))
+            self._zoom = z
+        except Exception:  # noqa: BLE001
+            pass
 
     def set_pan_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -618,10 +659,13 @@ class GpuImageCanvas(QWidget):
         ev.accept()
 
     def _on_scene_moved(self, scene_pos) -> None:
-        # Currently unused — drag updates go through the eventFilter
-        # for correct release-vs-move ordering. Keeping the hookup
-        # so future phases (status-bar pixel readout) can fill in.
-        return
+        # Live pixel-hover readout. (Drag/tool updates still go through the
+        # eventFilter for correct release-vs-move ordering.)
+        iy, ix = self._scene_to_image(scene_pos)
+        if 0 <= ix < self._img_w and 0 <= iy < self._img_h:
+            self.hover.emit(float(iy), float(ix))
+        else:
+            self.hover.emit(-1.0, -1.0)
 
     # ── Press / move / release via viewport event filter ──────────
     def eventFilter(self, obj, event) -> bool:

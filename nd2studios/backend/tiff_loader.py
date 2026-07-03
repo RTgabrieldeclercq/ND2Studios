@@ -182,9 +182,21 @@ def read_imagej_tiff_metadata(filepath: str) -> dict:
         n_c = int(ij.get("channels", 1))
         n_t = int(ij.get("frames", 1))
         n_z = int(ij.get("slices", 1))
-        labels = ij.get("Labels") or []
+        # ImageJ "Labels" is a per-slice list (one entry per page), but tifffile
+        # returns a bare string when the stack carries a single label. Treat that
+        # as a one-element list — otherwise ``labels[:n_c]`` slices the *string*
+        # ("H2B-iRFP670"[:1] → "H"), corrupting the channel name. The first n_c
+        # slice labels are the channel names (C varies fastest in an ImageJ
+        # hyperstack); pad with generic names when there aren't enough.
+        labels = ij.get("Labels")
+        if isinstance(labels, str):
+            labels = [labels]
+        elif labels is None:
+            labels = []
+        else:
+            labels = list(labels)
         if len(labels) < n_c:
-            labels = list(labels) + [f"Ch{i}" for i in range(len(labels), n_c)]
+            labels = labels + [f"Ch{i}" for i in range(len(labels), n_c)]
         page0 = tif.pages[0]
         pixel_size_um: Optional[float] = None
         x_res = page0.tags.get("XResolution")
@@ -196,7 +208,7 @@ def read_imagej_tiff_metadata(filepath: str) -> dict:
             "n_channels": n_c,
             "n_timepoints": n_t,
             "n_zslices": n_z,
-            "channel_names": labels[:n_c],
+            "channel_names": [str(x) for x in labels[:n_c]],
             "pixel_size_um": pixel_size_um,
             "n_pages_total": len(tif.pages),
             "page_shape": page0.shape,

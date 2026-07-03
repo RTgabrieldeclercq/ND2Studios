@@ -27,12 +27,12 @@ from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDoubleSpinBox, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QSplitter, QVBoxLayout, QWidget,
+    QHBoxLayout, QMessageBox, QSplitter, QVBoxLayout, QWidget,
 )
 
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.widgets.file_panel import FilePanel
+from nd2studios.widgets.play_all_banner import PlayAllBanner
 
 
 class ImportPage(QWidget):
@@ -53,39 +53,11 @@ class ImportPage(QWidget):
         root.setContentsMargins(8, 8, 8, 4)
         root.setSpacing(4)
 
-        # Toolbar row
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
-        lbl = QLabel("Import", objectName="sectionHeader")
-        toolbar.addWidget(lbl)
-        toolbar.addStretch(1)
-        self._btn_add = QPushButton("+ Add File")
-        self._btn_add.setObjectName("primaryBtn")
-        self._btn_add.setToolTip(
-            "Open another ND2 / TIFF file in a new side-by-side panel"
-        )
-        self._btn_add.clicked.connect(self._add_panel)
-        toolbar.addWidget(self._btn_add)
-
-        self._btn_play_all = QPushButton("> Play All")
-        self._btn_play_all.setObjectName("secondaryBtn")
-        self._btn_play_all.setCheckable(True)
-        self._btn_play_all.setToolTip("Play / pause T-axis on all open panels")
-        self._btn_play_all.toggled.connect(self._on_play_all_toggled)
-        toolbar.addWidget(self._btn_play_all)
-
-        fps_lbl = QLabel("FPS:")
-        toolbar.addWidget(fps_lbl)
-        self._spin_fps = QDoubleSpinBox()
-        self._spin_fps.setRange(0.1, 60.0)
-        self._spin_fps.setValue(10.0)
-        self._spin_fps.setSingleStep(1.0)
-        self._spin_fps.setDecimals(1)
-        self._spin_fps.setFixedWidth(64)
-        self._spin_fps.setToolTip("Playback speed for Play All")
-        toolbar.addWidget(self._spin_fps)
-
-        root.addLayout(toolbar)
+        # V1.44 — "+ Add File" moved into each panel's left controls; the old
+        # toolbar Play All + FPS is replaced by a universal banner (below) that
+        # only appears when multiple files are loaded.
+        self._play_all_banner = PlayAllBanner()
+        root.addWidget(self._play_all_banner)
 
         # Outer splitter — one child per FilePanel
         self._outer_splitter = QSplitter(Qt.Horizontal)
@@ -109,6 +81,7 @@ class ImportPage(QWidget):
             on_stitch=(
                 self._on_stitch_primary if is_primary else None
             ),
+            on_add_file=self._add_panel,
             show_close_button=True,
         )
         if is_primary and self.main_window is not None:
@@ -124,6 +97,7 @@ class ImportPage(QWidget):
         n = len(self._panels)
         total = max(self._outer_splitter.width(), 800)
         self._outer_splitter.setSizes([total // n] * n)
+        self._refresh_play_all_banner()
 
     def _remove_panel(self, panel: FilePanel) -> None:
         """Remove *panel* — the primary panel (index 0) cannot be removed."""
@@ -133,22 +107,17 @@ class ImportPage(QWidget):
         self._panels.pop(idx)
         panel.setParent(None)  # type: ignore[arg-type]
         panel.deleteLater()
+        self._refresh_play_all_banner()
+
+    def _refresh_play_all_banner(self) -> None:
+        self._play_all_banner.set_target_viewers(
+            [p.viewer for p in self._panels])
 
     # ── Splitter callback ────────────────────────────────────────────
 
     def _on_outer_splitter_moved(self, _pos: int, _idx: int) -> None:
         for panel in self._panels:
             panel.fit_viewer()
-
-    # ── Play All ─────────────────────────────────────────────────────
-
-    def _on_play_all_toggled(self, playing: bool) -> None:
-        fps = self._spin_fps.value()
-        self._btn_play_all.setText("|| Stop All" if playing else "> Play All")
-        for panel in self._panels:
-            viewer = panel.viewer
-            if viewer is not None and hasattr(viewer, "set_t_playing"):
-                viewer.set_t_playing(playing, fps=fps)
 
     # ── Confirmed records ────────────────────────────────────────────
 

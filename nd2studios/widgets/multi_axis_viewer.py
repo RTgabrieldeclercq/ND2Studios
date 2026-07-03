@@ -126,6 +126,8 @@ class MultiAxisViewer(QWidget):
 
     # M, T, Z (the page persists these on the experiment record).
     coords_changed = Signal(int, int, int)
+    # Frame-strip tile selection changed: (axis "m"/"t"/"z", frozenset[int]).
+    selection_changed = Signal(str, object)
     # Any channel toggle / color / LUT change.
     channels_changed = Signal()
     # Click on the corner tile preview overlay.
@@ -289,8 +291,20 @@ class MultiAxisViewer(QWidget):
         zoom_row.addStretch(1)
         left_layout.addLayout(zoom_row)
 
+        self._zoom_toolbar_widget = self.zoom_toolbar  # for set_controls_visible
+
+        # Pixel-hover readout + overlay-style control wiring (V1.46).
+        self.canvas.hover.connect(self._on_pixel_hover)
+        self.zoom_toolbar.overlay_style_changed.connect(self._on_overlay_style_changed)
+        self.zoom_toolbar.coord_mode_changed.connect(self._on_coord_mode_changed)
+        self._hover_stage: bool = False
+        self._last_hover: Optional[Tuple[float, float]] = None
+        self._hover_plane_cache: Dict[str, np.ndarray] = {}
+        self._hover_plane_key: Optional[tuple] = None
+
         # M / T / Z sliders (each row includes a ▶/⏸ play button + fps spinbox).
         slider_box = QFrame()
+        self._slider_box = slider_box
         slider_box.setObjectName("contentArea")
         slider_layout = QVBoxLayout(slider_box)
         slider_layout.setContentsMargins(8, 4, 8, 4)
@@ -317,6 +331,11 @@ class MultiAxisViewer(QWidget):
             lambda s: self._on_strip_crop("t", s))
         self._z_strip.crop_requested.connect(
             lambda s: self._on_strip_crop("z", s))
+        # V1.44 — strip current changes (click / drag / arrow keys) take a
+        # direct fast-refresh path instead of the debounced slider cascade.
+        self._m_strip.current_changed.connect(lambda v: self._on_strip_current("m", v))
+        self._t_strip.current_changed.connect(lambda v: self._on_strip_current("t", v))
+        self._z_strip.current_changed.connect(lambda v: self._on_strip_current("z", v))
         # Per-axis selections (frozenset of indices). T drives M/Z inheritance.
         self._axis_selection = {"m": frozenset(), "t": frozenset(), "z": frozenset()}
         self._t_strip.set_meta_fn(lambda i: self._frame_meta_text("t", i))
@@ -331,13 +350,17 @@ class MultiAxisViewer(QWidget):
         self._m_timer.timeout.connect(lambda: self._axis_tick(self.m_slider))
         self._t_timer.timeout.connect(lambda: self._axis_tick(self.t_slider))
         self._z_timer.timeout.connect(lambda: self._axis_tick(self.z_slider))
-        slider_layout.addLayout(self._m_row)
+        # V1.44 — axis order is T (top), M, Z (bottom). (The "Play All" control
+        # is no longer per-viewer; it's a universal banner across the whole
+        # viewer area — see PlayAllBanner — shown only with multiple files.)
         slider_layout.addLayout(self._t_row)
+        slider_layout.addLayout(self._m_row)
         slider_layout.addLayout(self._z_row)
         left_layout.addWidget(slider_box)
 
         # Chip strip — compact toggle + color, one row across.
         chip_box = QFrame()
+        self._chip_box = chip_box
         chip_box.setObjectName("contentArea")
         self._chip_layout = QHBoxLayout(chip_box)
         self._chip_layout.setContentsMargins(8, 2, 8, 4)
@@ -379,24 +402,28 @@ class MultiAxisViewer(QWidget):
         slider.setRange(0, 0)
         slider.setParent(strip)
         slider.hide()
-        # Bidirectional sync: strip → slider drives the real refresh cascade
-        # (slider.valueChanged is already wired to _on_*_changed); slider →
-        # strip keeps the tiles visually current without a feedback loop.
-        strip.current_changed.connect(slider.setValue)
+        # slider → strip keeps the tiles current when the slider is driven by
+        # other code. The strip → refresh direction is wired in __init__ via
+        # _on_strip_current (V1.44), which does a *direct* fast refresh and
+        # bypasses the per-axis debounce so arrow/drag stepping is as smooth as
+        # FPS playback (M/Z debounce was 80/50 ms and made arrows feel choppy).
         slider.valueChanged.connect(lambda v: strip.set_current(v, emit=False))
         # Editable current-frame number (user can type to jump).
         info_edit = QLineEdit("1")
         info_edit.setObjectName("axisFrameEdit")
         info_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
         info_edit.setFixedWidth(36)
+        info_edit.setFixedHeight(26)
         info_edit.setToolTip("Current frame — type a number and press Enter to jump")
         row.addWidget(info_edit)
-        # Static total — plain text, not editable.
+        # Static total — same font size as the counter and vertically centred
+        # to its height so "/N" reads cleanly next to the current frame (V1.44).
         info_total = QLabel("/1")
-        info_total.setFixedWidth(28)
+        info_total.setFixedWidth(30)
+        info_total.setFixedHeight(26)
         info_total.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         info_total.setStyleSheet(
-            f"color: {Settings.FG_SECONDARY}; font: 9pt 'Helvetica Neue';")
+            f"color: {Settings.FG_SECONDARY}; font: 10pt 'Helvetica Neue';")
         row.addWidget(info_total)
         play_btn = icon_button("fa5s.play", f"Play / pause {label} axis",
                                checkable=True, object_name="playBtn",
@@ -420,6 +447,34 @@ class MultiAxisViewer(QWidget):
         row.setAlignment(fps_spin, Qt.AlignmentFlag.AlignTop)
         return row, slider, info_edit, info_total, play_btn, fps_spin, strip
 
+    def refresh(self) -> None:
+        """Re-render the current frame, dropping caches so the volume is re-read.
+
+        Use when a lazy volume's backing data changes *in place* (e.g. the
+        Pipelines preview re-points which plane is recipe-processed) — unlike
+        :meth:`set_volume` this preserves the frame selection, LUTs and slider
+        positions.
+        """
+        self._render_cache.clear()
+        self._pixmap_cache.clear()
+        self._pp_cache.clear()
+        self._pp_pixmap_cache.clear()
+        self._cache_m = -1
+        self._cache_ready = False
+        self._refresh()
+
+    def set_current_frame(self, m: Optional[int] = None,
+                          t: Optional[int] = None) -> None:
+        """Programmatically navigate to ``(m, t)`` — used for live run streaming.
+
+        Reuses the immediate strip-step path (no debounce) so the display updates
+        right away as each analysed frame arrives. Out-of-range values are clamped.
+        """
+        if m is not None and int(m) != self._m:
+            self._on_strip_current("m", int(m))
+        if t is not None and int(t) != self._t:
+            self._on_strip_current("t", int(t))
+
     def invalidate_post_process_cache(self) -> None:
         """Discard cached overlay composites so the next refresh recomputes them.
 
@@ -439,8 +494,103 @@ class MultiAxisViewer(QWidget):
         Pass None to remove any active hook.
         """
         self._frame_post_process = fn
+        # The overlay-style control only applies when an overlay is active.
+        self.zoom_toolbar.set_overlay_button_visible(fn is not None)
         self.invalidate_post_process_cache()
         self._do_refresh()
+
+    # ── Overlay style + pixel-hover readout (V1.46) ───────────────────────
+    def overlay_style(self) -> Dict[str, Any]:
+        """The current overlay-style settings (color / weight / multicolor /
+        alpha / enabled) — read by the page overlay painters."""
+        return self.zoom_toolbar.overlay_style()
+
+    def _on_overlay_style_changed(self, _style: Dict[str, Any]) -> None:
+        # Overlay content (not the base) changed → recompute only the overlay.
+        self.invalidate_post_process_cache()
+        self._do_refresh()
+
+    def _on_coord_mode_changed(self, stage: bool) -> None:
+        self._hover_stage = bool(stage)
+        if self._last_hover is not None:
+            self._on_pixel_hover(*self._last_hover)
+
+    def _plane_for_channel(self, name: str) -> Optional[np.ndarray]:
+        """Raw 2-D intensity plane for ``name`` at the current (m, t, z),
+        cached per coordinate so repeated hovers are O(1)."""
+        key = (self._m, self._t, self._z, self._z_mode)
+        if self._hover_plane_key != key:
+            self._hover_plane_cache = {}
+            self._hover_plane_key = key
+        if name in self._hover_plane_cache:
+            return self._hover_plane_cache[name]
+        plane: Optional[np.ndarray] = None
+        if self._volume is not None:
+            try:
+                c_idx = list(self._volume.channel_names).index(name)
+                plane = self._read_volume_plane(c_idx, name)
+            except (ValueError, Exception):  # noqa: BLE001
+                plane = None
+        else:
+            data = self._channels.get(name)
+            if data is not None:
+                try:
+                    arr = np.asarray(data)
+                    plane = arr if arr.ndim == 2 else arr[min(self._t, arr.shape[0] - 1)]
+                except Exception:  # noqa: BLE001
+                    plane = None
+        if plane is not None:
+            plane = np.asarray(plane)
+            if plane.ndim != 2:
+                plane = None
+        self._hover_plane_cache[name] = plane
+        return plane
+
+    def _pixel_to_stage(self, row: int, col: int) -> Optional[Tuple[float, float]]:
+        """Image pixel → absolute stage µm, matching ``results_engine``'s
+        centroid_*_stage_um formula (origin at the frame center)."""
+        if self._volume is None or not self._stage_xy_um:
+            return None
+        if self._m >= len(self._stage_xy_um):
+            return None
+        sx, sy = self._stage_xy_um[self._m]
+        px = float(getattr(self._volume, "pixel_size_um", 0.0) or 0.0)
+        if px <= 0:
+            return None
+        h = float(self._volume.height)
+        w = float(self._volume.width)
+        stage_x = sx + (col - w / 2.0) * px
+        stage_y = sy + (row - h / 2.0) * px
+        return stage_x, stage_y
+
+    def _on_pixel_hover(self, iy: float, ix: float) -> None:
+        """Update the toolbar readout with position + per-channel intensity."""
+        if iy < 0 or ix < 0:
+            self._last_hover = None
+            self.zoom_toolbar.set_hover_text("")
+            return
+        row, col = int(iy), int(ix)
+        self._last_hover = (float(iy), float(ix))
+
+        if self._hover_stage:
+            stage = self._pixel_to_stage(row, col)
+            if stage is not None:
+                pos = f"X {stage[0]:.1f}µm  Y {stage[1]:.1f}µm"
+            else:
+                pos = f"X {col}  Y {row} (px)"   # no stage data → fall back
+        else:
+            pos = f"X {col}  Y {row}"
+
+        parts = [pos]
+        for chip in self._chip_strip:
+            if not getattr(chip, "enabled", False):
+                continue
+            plane = self._plane_for_channel(chip.name)
+            if plane is None or not (0 <= row < plane.shape[0] and 0 <= col < plane.shape[1]):
+                continue
+            val = plane[row, col]
+            parts.append(f"{chip.name} {int(val)}")
+        self.zoom_toolbar.set_hover_text("   ".join(parts))
 
     # ── Crop tool ──
     def set_crop_mode(self, enabled: bool) -> None:
@@ -457,6 +607,96 @@ class MultiAxisViewer(QWidget):
     ) -> None:
         """Enter vertex-edit mode on the canvas with draggable handles."""
         self.canvas.set_edit_vertices(vertices)
+
+    def set_channel_contrast(self, name: str, lo: float, hi: float,
+                             gamma: float = 1.0) -> None:
+        """Programmatically set a channel's LUT contrast and refresh.
+
+        Used by the Recipe page (V1.44) to mirror the processed viewer's LUT
+        onto the raw viewer so the two can be compared at matched intensities.
+        """
+        lut = self.lut_sidebar.lut_for(name)
+        if lut is None:
+            return
+        lut.set_contrast(float(lo), float(hi), float(gamma))
+        self._on_lut_contrast_changed(name, float(lo), float(hi), float(gamma))
+
+    def lut_effective_max(self, name: str) -> float:
+        """Effective intensity max for a channel's LUT — the actual data max
+        (histogram top edge) when known, else the dtype max. Lets callers map
+        contrast between viewers of different bit depths by percentage."""
+        lut = self.lut_sidebar.lut_for(name)
+        if lut is None:
+            return 65535.0
+        edges = getattr(lut, "_hist_edges", None)
+        if edges is not None and len(edges) > 0 and float(edges[-1]) > 0:
+            return float(edges[-1])
+        return float(getattr(lut, "_dtype_max", 65535.0))
+
+    def take_control_widgets(self) -> list:
+        """Detach this viewer's control widgets (zoom toolbar, frame-strip box,
+        channel-chip box) and return them so a host can place them in a shared
+        bar spanning multiple viewers (Recipe page single control set across raw
+        + processed, V1.44). The widgets stay wired to this viewer's signals, so
+        they keep driving it from their new parent."""
+        widgets = []
+        for w in (getattr(self, "_zoom_toolbar_widget", None),
+                  getattr(self, "_slider_box", None),
+                  getattr(self, "_chip_box", None)):
+            if w is not None:
+                w.setParent(None)
+                widgets.append(w)
+        return widgets
+
+    def set_controls_visible(self, visible: bool) -> None:
+        """Show/hide this viewer's own navigation controls (frame strips, zoom
+        toolbar, channel chips). Used on the Recipe page (V1.44) so the raw and
+        processed viewers share a single visible control set — the hidden
+        viewer is driven externally via :meth:`mirror_from`."""
+        visible = bool(visible)
+        for w in (getattr(self, "_slider_box", None),
+                  getattr(self, "_zoom_toolbar_widget", None),
+                  getattr(self, "_chip_box", None)):
+            if w is not None:
+                w.setVisible(visible)
+
+    def mirror_from(self, master: "MultiAxisViewer") -> None:
+        """Slave this viewer to ``master``: mirror coordinates, channel state,
+        and zoom/pan. The slave's own controls should be hidden first via
+        :meth:`set_controls_visible(False)`."""
+        master.coords_changed.connect(self._apply_external_coords)
+        master.channels_changed.connect(
+            lambda: self.apply_channel_state(master.channel_state()))
+        master.canvas.zoom_changed.connect(
+            lambda _z: self._apply_external_view(master))
+
+    def _apply_external_coords(self, m: int, t: int, z: int) -> None:
+        # Emit-safe: update sliders with signals blocked and refresh directly,
+        # so mirroring does NOT re-fire coords_changed (which would loop with a
+        # host page that also syncs the two viewers, e.g. RecipePage M-sync).
+        changed = False
+        for slider, val, attr in ((self.m_slider, m, "_m"),
+                                  (self.t_slider, t, "_t"),
+                                  (self.z_slider, z, "_z")):
+            if 0 <= val <= slider.maximum() and val != slider.value():
+                slider.blockSignals(True)
+                slider.setValue(val)
+                slider.blockSignals(False)
+                setattr(self, attr, val)
+                strip = self._strip_for(slider)
+                if strip is not None:
+                    strip.set_current(val, emit=False)
+                changed = True
+        if changed:
+            self._update_axis_labels()
+            self._do_refresh()
+
+    def _apply_external_view(self, master: "MultiAxisViewer") -> None:
+        """Match the master canvas's zoom/pan."""
+        mc, sc = master.canvas, self.canvas
+        if hasattr(sc, "set_zoom_level"):
+            pan = (getattr(mc, "_pan_x", 0.0), getattr(mc, "_pan_y", 0.0))
+            sc.set_zoom_level(float(getattr(mc, "_zoom", 1.0)), pan)
 
     def set_frame_timestamps(self, timestamps) -> None:
         """Supply per-frame acquisition timestamps (seconds) for the T-axis
@@ -846,6 +1086,46 @@ class MultiAxisViewer(QWidget):
         # The play/pause icon is driven by bind_toggle_icon on the button's
         # toggled signal (V1.44) — no text to swap here.
 
+    def _on_strip_current(self, axis: str, value: int) -> None:
+        """Direct fast-refresh when the user steps a strip (click/drag/arrows).
+
+        Mirrors :meth:`_axis_tick`: update the backing slider with signals
+        blocked (no debounce), sync coords, refresh immediately — so M/Z
+        stepping is as smooth as FPS playback rather than waiting on the
+        80/50 ms debounce timers.
+        """
+        slider = {"m": self.m_slider, "t": self.t_slider, "z": self.z_slider}[axis]
+        value = max(0, min(int(value), slider.maximum()))
+        slider.blockSignals(True)
+        slider.setValue(value)
+        slider.blockSignals(False)
+        # The slider→strip sync is bypassed when signals are blocked, so move the
+        # strip's highlighted (selected) tile explicitly — this lets programmatic
+        # navigation (e.g. live-run frame streaming) visibly advance the strip.
+        strip = self._strip_for(slider)
+        if strip is not None:
+            strip.set_current(value, emit=False)
+        z_changed = (axis == "z" and value != self._z)
+        if axis == "t":
+            self._t = value
+        elif axis == "m":
+            self._m = value
+            self.lut_sidebar.set_current_m(self._m)
+        else:
+            self._z = value
+        self._last_frame_idx = value
+        if z_changed:
+            # Z caches are keyed by (m, t) without Z — stale for a new Z plane.
+            self._render_cache.clear()
+            self._pixmap_cache.clear()
+            self._pp_cache.clear()
+            self._pp_pixmap_cache.clear()
+            self._cache_m = -1
+            self._cache_ready = False
+        self._update_axis_labels()
+        self.coords_changed.emit(self._m, self._t, self._z)
+        self._do_refresh()
+
     # ── V1.43 tile-strip helpers ──
     def _strip_for(self, slider: QSlider) -> Optional[FrameStrip]:
         if slider is self.m_slider:
@@ -874,6 +1154,26 @@ class MultiAxisViewer(QWidget):
 
     def _on_strip_selection(self, axis: str, sel: frozenset) -> None:
         self._axis_selection[axis] = sel
+        self.selection_changed.emit(axis, sel)
+
+    def axis_selection(self, axis: str) -> frozenset:
+        """Selected tile indices for ``axis`` ("m"/"t"/"z"); empty = none."""
+        return self._axis_selection.get(axis, frozenset())
+
+    def set_axis_selection(self, axis: str, indices) -> None:
+        """Restore a tile selection for ``axis`` (does not emit selection_changed).
+
+        Used to re-apply a selection after :meth:`set_volume` (which clears it as
+        part of reconfiguring the strips), so the Pipelines preview can keep the
+        user's multi-frame selection across a volume swap.
+        """
+        strip = {"m": self._m_strip, "t": self._t_strip,
+                 "z": self._z_strip}.get(axis)
+        if strip is None:
+            return
+        idx = [int(i) for i in indices]
+        strip.set_selection(idx, emit=False)
+        self._axis_selection[axis] = frozenset(idx)
 
     def _on_strip_crop(self, axis: str, sel: frozenset) -> None:
         self.crop_to_selection_requested.emit(axis, sel)
@@ -1234,6 +1534,10 @@ class MultiAxisViewer(QWidget):
             return
 
         # Live compose fallback (GPU off, no cache, or recipe-page path).
+        # ``_compose_current_frame`` already applies the post-process overlay
+        # internally (and fills the pp caches) when a hook is set, so the
+        # returned composite is final — applying it again here would double-draw
+        # the overlay on the first render of each frame.
         composite = self._compose_current_frame()
         if composite is None:
             return

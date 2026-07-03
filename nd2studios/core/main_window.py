@@ -54,7 +54,6 @@ from nd2studios.pipeline import (
     Session,
     workspace_disabled,
 )
-from nd2studios.widgets.common import StatusIndicator
 from nd2studios.widgets.custom_grips import CustomGrip
 from nd2studios.widgets.icon_button import icon_button, scaled, tool_button
 
@@ -277,22 +276,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Top bar: page title + status indicator.
-        top_bar = QWidget()
-        top_bar.setObjectName("topBar")
-        top_bar.setFixedHeight(48)
-        top_layout = QHBoxLayout(top_bar)
-        top_layout.setContentsMargins(16, 0, 16, 0)
-
-        self._title_label = QLabel(Settings.PAGES[0][2])
-        self._title_label.setObjectName("titleLabel")
-        top_layout.addWidget(self._title_label)
-        top_layout.addStretch(1)
-
-        self._status_indicator = StatusIndicator()
-        top_layout.addWidget(self._status_indicator)
-
-        layout.addWidget(top_bar)
+        # V1.44 — the per-page header bar (page title + data-status badge) was
+        # removed: the top tab bar already shows the active page, and the
+        # status badge took space for little value. The page stack fills the
+        # content area directly.
 
         # Page stack — pages are imported lazily here so that core/ does
         # not have a hard cycle with pages/ at import time.
@@ -301,6 +288,7 @@ class MainWindow(QMainWindow):
         from nd2studios.pages.export_page import ExportPage
         from nd2studios.pages.analysis_page import AnalysisPage
         from nd2studios.pages.results_page import ResultsPage
+        from nd2studios.pages.pipelines_page import PipelinesPage
         from nd2studios.pages.batch_page import BatchPage
 
         page_classes = {
@@ -309,6 +297,7 @@ class MainWindow(QMainWindow):
             "export": ExportPage,
             "analysis": AnalysisPage,
             "results": ResultsPage,
+            "pipelines": PipelinesPage,
             "batch": BatchPage,
         }
         self._stack = QStackedWidget()
@@ -394,16 +383,17 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(100, self._toggle_max_restore)
 
     def _toggle_max_restore(self) -> None:
+        from nd2studios.widgets.icon_button import make_icon
         if self._is_maximized:
             self.showNormal()
             self._is_maximized = False
-            self._btn_max.setText("□")
+            self._btn_max.setIcon(make_icon("fa5s.window-maximize"))
             for grip in self._grips:
                 grip.show()
         else:
             self.showMaximized()
             self._is_maximized = True
-            self._btn_max.setText("❐")
+            self._btn_max.setIcon(make_icon("fa5s.window-restore"))
             for grip in self._grips:
                 grip.hide()
 
@@ -502,7 +492,6 @@ class MainWindow(QMainWindow):
         idx = keys.index(page_key)
         self._stack.setCurrentIndex(idx)
         self._current_page_key = page_key
-        self._title_label.setText(Settings.PAGES[idx][2])
         self._nav_buttons[page_key].setChecked(True)
 
         # Record page navigation for macro playback.
@@ -519,14 +508,15 @@ class MainWindow(QMainWindow):
         exp = self.exp_manager.active
         if exp is None:
             return
-        self._status_indicator.set_status(exp.status)
         # Push state into every page that wants it.
         for page in self.pages.values():
             if hasattr(page, "load_from_experiment"):
                 page.load_from_experiment(exp)
 
     def _on_status_changed(self, status: str) -> None:
-        self._status_indicator.set_status(status)
+        # Data-status badge removed in V1.44; status text still lands in the
+        # bottom status bar via the worker callbacks.
+        return
 
     # ── V1.38 Phase 6 — workspace lifecycle ────────────────────────
     def attach_session_for(self, filepath: str) -> Optional[Session]:

@@ -20,6 +20,7 @@ from nd2studios.core.analysis_registry import AnalysisResult
 from nd2studios.pipeline.session import StageRecord
 from nd2studios.pipeline.stage import PipelineStage
 from nd2studios.pipeline.storage import (
+    LabelStackWriter,
     open_label_stack,
     read_label_stack,
     write_label_stack,
@@ -78,14 +79,21 @@ class AnalysisStage(PipelineStage):
         artifacts: Dict[str, str] = {}
         for channel, labels in result.label_masks.items():
             base = m_dir / f"labels_{_safe_for_path(channel)}"
-            written_name = write_label_stack(base, labels)
+            written_name, canon = _persist_labels(base, labels)
+            # Swap the in-memory result to the persistent canonical reader so
+            # the viewer/overlay reads from the workspace (and a temp streaming
+            # sink can be discarded) — V1.46.
+            if canon is not None:
+                result.label_masks[channel] = canon
             rel = self._relative(m_dir / written_name)
             artifacts[f"labels_{channel}_m_{m:0{_MAX_M_DIGITS}d}"] = rel
 
         # Secondary masks (used by tear detection's inverse overlay etc.)
         for channel, labels in (result.secondary_label_masks or {}).items():
             base = m_dir / f"secondary_{_safe_for_path(channel)}"
-            written_name = write_label_stack(base, labels)
+            written_name, canon = _persist_labels(base, labels)
+            if canon is not None:
+                result.secondary_label_masks[channel] = canon
             rel = self._relative(m_dir / written_name)
             artifacts[f"secondary_{channel}_m_{m:0{_MAX_M_DIGITS}d}"] = rel
 
@@ -266,6 +274,26 @@ class AnalysisStage(PipelineStage):
 
 
 # ── module helpers ───────────────────────────────────────────────────
+
+
+def _persist_labels(base: Path, labels):
+    """Persist a label stack to the workspace without materializing it (V1.46).
+
+    ``labels`` may be a small in-RAM ndarray (eager run) OR a disk-backed lazy
+    reader (streamed run — a memmap, which subclasses ndarray, or a zarr Array).
+    Either way we copy frame-by-frame via :class:`LabelStackWriter` so peak RAM
+    stays at one frame, then return ``(written_name, canonical_reader)``. For a
+    tiny 2-D mask we fall back to the simple whole-array writer.
+    """
+    shp = getattr(labels, "shape", None)
+    if shp is None or len(shp) != 3:
+        return write_label_stack(base, np.asarray(labels)), None
+    T = int(shp[0])
+    writer = LabelStackWriter(base, (T, int(shp[1]), int(shp[2])))
+    for t in range(T):
+        writer.write_frame(t, np.asarray(labels[t]))
+    reader = writer.close()
+    return writer.relative_name, reader
 
 
 _M_INDEX_RE = re.compile(r"_m_(\d+)$")

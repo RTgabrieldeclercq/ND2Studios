@@ -139,7 +139,9 @@ class _MeasurementsModel(QAbstractTableModel):
     def headerData(self, section: int, orientation: Qt.Orientation, role=Qt.DisplayRole):  # noqa: N802
         if role == Qt.DisplayRole:
             if orientation == Qt.Horizontal:
-                return self._headers[section]
+                if 0 <= section < len(self._headers):
+                    return self._headers[section]
+                return None
             return str(section + 1)
         return None
 
@@ -735,10 +737,12 @@ class ResultsPage(QWidget):
         if vol is not None:
             z_mode = getattr(exp, "z_view_mode", None) or "max"
             z_index = int(getattr(exp, "z_view_index", None) or 0)
+            # V1.46 — keep channels LAZY; compute_measurements reads one frame
+            # per channel at a time, so the whole dataset never lands in RAM.
             raw_for_m = {
                 ch_name: vol.to_lazy_channel(
                     c_idx, m=m, z_mode=z_mode, z_index=z_index
-                ).materialize()
+                )
                 for c_idx, ch_name in enumerate(vol.channel_names)
             }
             if use_raw:
@@ -759,14 +763,8 @@ class ResultsPage(QWidget):
         source = exp.processed_view() if hasattr(exp, "processed_view") else (
             exp._processed_channels or exp._raw_channels or {}
         )
-        result: Dict[str, Any] = {}
-        for k in source:
-            v = source[k]
-            if hasattr(v, "materialize") and callable(v.materialize):
-                result[k] = v.materialize()
-            else:
-                result[k] = np.asarray(v)
-        return result
+        # Keep these lazy too — compute_measurements indexes per frame.
+        return {k: source[k] for k in source}
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

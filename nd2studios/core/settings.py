@@ -105,6 +105,7 @@ class Settings:
     ACCENT_ORANGE = "#ffb86c"   # warning
     ACCENT_RED = "#ff5555"      # danger
     ACCENT_YELLOW = "#f1fa8c"
+    ACCENT_GOLD = "#ffc83d"     # "previewed" highlight (Pipelines node board)
     BORDER_COLOR = "#44475a"
 
     # ── Page list ──────────────────────────────────────────────────
@@ -114,6 +115,7 @@ class Settings:
         ("recipe", "🧪", "Recipe", "Build a processing pipeline (trial / accept / reject)."),
         ("analysis", "🔬", "Analysis", "Run analysis pipelines on loaded data."),
         ("results", "📊", "Results", "Compute measurements from analysis binaries and export CSV / images."),
+        ("pipelines", "🧩", "Pipelines", "Build a node graph across processing, analysis, and results."),
         ("batch", "⚡", "Batch", "Run a pipeline template over multiple files and aggregate results."),
         ("export", "💾", "Export", "Export TIFF stacks, RGB composites, movies, and tracked objects."),
     ]
@@ -128,5 +130,6 @@ class Settings:
         "export": ("imported", "Import a file first (Page 1)."),
         "analysis": ("imported", "Import a file first (Page 1)."),
         "results": ("imported", "Import a file first (Page 1)."),
+        "pipelines": ("imported", "Import a file first (Page 1)."),
         "batch": None,
     }

@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.plugin_registry import PluginBase
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.collapsible_sidebar import CollapsibleSidebar
 from nd2studios.widgets.common import ParamEditor
 from nd2studios.widgets.image_viewer import CHANNEL_COLORS
 from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
@@ -81,13 +82,88 @@ class _RecipeColumn:
         self.viewer_proc = MultiAxisViewer(proc_w)
         proc_l.addWidget(self.viewer_proc, stretch=1)
 
-        orientation = (Qt.Orientation.Vertical if vertical
-                       else Qt.Orientation.Horizontal)
-        self.widget = QSplitter(orientation)
-        self.widget.addWidget(raw_w)
-        self.widget.addWidget(proc_w)
-        self.widget.setStretchFactor(0, 1)
-        self.widget.setStretchFactor(1, 1)
+        # V1.44 — raw and processed share ONE control set + ONE LUT sidebar.
+        # The processed viewer is the master (frame strips, FPS, play, zoom,
+        # pan, channels). The raw viewer is a bare canvas mirroring the master's
+        # coords / channels / zoom; its LUT follows the processed LUT, scaled by
+        # data range so a different processed bit depth still compares at matched
+        # intensities. The master's controls are detached into a shared bar that
+        # spans *both* canvases (centered below them).
+        self.viewer_raw.set_controls_visible(False)
+        self.viewer_raw.lut_sidebar.hide()
+        self.viewer_raw.mirror_from(self.viewer_proc)
+        self.viewer_proc.lut_sidebar.channel_contrast_changed.connect(
+            self._mirror_proc_lut_to_raw)
+        self.viewer_proc.lut_sidebar.collapse_changed.connect(
+            lambda _v: self.equalize())
+
+        self._orientation = (Qt.Orientation.Vertical if vertical
+                             else Qt.Orientation.Horizontal)
+        self._canvas_splitter = QSplitter(self._orientation)
+        self._canvas_splitter.addWidget(raw_w)
+        self._canvas_splitter.addWidget(proc_w)
+        self._canvas_splitter.setStretchFactor(0, 1)
+        self._canvas_splitter.setStretchFactor(1, 1)
+
+        # Shared control bar (detached from the processed viewer) spanning the
+        # full column width below both canvases.
+        controls_bar = QWidget()
+        cb = QVBoxLayout(controls_bar)
+        cb.setContentsMargins(8, 2, 8, 2)
+        cb.setSpacing(2)
+        taken = self.viewer_proc.take_control_widgets()
+        for i, w in enumerate(taken):
+            if i == 0:
+                # Centre the zoom toolbar (home / +/- / pan) across the bar.
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
+                row.addStretch(1)
+                row.addWidget(w)
+                row.addStretch(1)
+                cb.addLayout(row)
+            else:
+                cb.addWidget(w)
+
+        self.widget = QWidget()
+        col_l = QVBoxLayout(self.widget)
+        col_l.setContentsMargins(0, 0, 0, 0)
+        col_l.setSpacing(2)
+        col_l.addWidget(self._canvas_splitter, stretch=1)
+        col_l.addWidget(controls_bar)
+
+        # Equalize once the widgets have a real size.
+        from PySide6.QtCore import QTimer as _QTimer
+        _QTimer.singleShot(0, self.equalize)
+
+    def equalize(self) -> None:
+        """Size the canvas splitter so the raw and processed *images* are equal.
+
+        For a horizontal split the processed side also holds the shared LUT
+        sidebar, so it needs that many extra pixels for its canvas to match the
+        raw canvas. For a vertical split a plain 50/50 is correct.
+        """
+        total = (self._canvas_splitter.width()
+                 if self._orientation == Qt.Orientation.Horizontal
+                 else self._canvas_splitter.height())
+        if total <= 0:
+            return
+        if self._orientation == Qt.Orientation.Horizontal:
+            sb = self.viewer_proc.lut_sidebar
+            extra = sb.width() if sb.isVisible() else 0
+            half = max(1, (total - extra) // 2)
+            self._canvas_splitter.setSizes([half, total - half])
+        else:
+            half = total // 2
+            self._canvas_splitter.setSizes([half, total - half])
+
+    def _mirror_proc_lut_to_raw(self, name: str, lo: float, hi: float,
+                                gamma: float) -> None:
+        """Mirror a processed-viewer LUT change onto the raw viewer, scaled by
+        data range so different bit depths compare at matched intensities."""
+        proc_max = self.viewer_proc.lut_effective_max(name)
+        raw_max = self.viewer_raw.lut_effective_max(name)
+        scale = (raw_max / proc_max) if proc_max > 0 else 1.0
+        self.viewer_raw.set_channel_contrast(name, lo * scale, hi * scale, gamma)
 
 
 class RecipePage(QWidget):
@@ -239,7 +315,10 @@ class RecipePage(QWidget):
         rl.addWidget(self.btn_apply_recipe)
         ll.addWidget(rec_group)
         ll.addStretch(1)
-        outer.addWidget(left)
+        # V1.44 — collapsible left panel, matching the right LUT sidebar.
+        self._left_sidebar = CollapsibleSidebar(
+            left, side="left", title="Recipe", expanded_width=420)
+        outer.addWidget(self._left_sidebar)
 
         # Dynamic viewer area — rebuilt in _rebuild_columns().
         self._viewer_area = QSplitter(Qt.Orientation.Horizontal)
@@ -1312,7 +1391,7 @@ class RecipePage(QWidget):
             return  # still waiting on other M workers
 
         channel_names = list(next(iter(results.values())).keys())
-        channels_4d: Dict[str, np.ndarray] = {}
+        channels_5d: Dict[str, np.ndarray] = {}
         for ch in channel_names:
             slices = []
             for m_idx in range(n_m):
@@ -1320,12 +1399,17 @@ class RecipePage(QWidget):
                 if arr.ndim == 2:
                     arr = arr[np.newaxis]       # (H, W) → (1, H, W)
                 slices.append(arr)
-            channels_4d[ch] = np.stack(slices, axis=0)  # (M, T, H, W)
+            arr4 = np.stack(slices, axis=0)      # (M, T, H, W)
+            # MaterializedDataset stores (M, T, Z, H, W); the recipe output is
+            # already Z-projected, so insert a singleton Z axis. Without this
+            # the viewer's get_frame mis-indexes (channels[m, t] would be (H, W)
+            # not (Z, H, W)) and the processed image renders blank in Analysis.
+            channels_5d[ch] = arr4[:, :, np.newaxis, :, :]  # (M, T, 1, H, W)
 
-        sample = next(iter(channels_4d.values()))
+        sample = next(iter(channels_5d.values()))
         exp._processed_volume = MaterializedDataset(
             filepath=getattr(volume, "filepath", "") if volume is not None else "",
-            channels=channels_4d,
+            channels=channels_5d,
             channel_names=channel_names,
             dtype=sample.dtype,
             pixel_size_um=getattr(volume, "pixel_size_um", 1.0)
@@ -1335,8 +1419,9 @@ class RecipePage(QWidget):
             n_multipoints=n_m,
             n_timepoints=int(sample.shape[1]),
             n_channels=len(channel_names),
-            height=int(sample.shape[2]),
-            width=int(sample.shape[3]),
+            n_zslices=1,
+            height=int(sample.shape[3]),
+            width=int(sample.shape[4]),
             z_mode=exp.z_view_mode or "max",
         )
 

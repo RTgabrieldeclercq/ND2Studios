@@ -1,6 +1,286 @@
 # ND2Studios Architecture
 
-**Version:** V1.44
+**Version:** V1.46
+
+## V1.46 additions (Streaming, Resource-Aware Analysis)
+
+- **`backend/analysis/plane_runner.py`** — `run_planes_to_labels`, the shared
+  per-frame analysis driver. Routes each label frame to an in-RAM array (eager)
+  or a streaming disk sink (lazy), keeping only measurement rows in RAM.
+  `backend/analysis/source_utils.py` provides lazy-or-eager frame access
+  (`source_shape`, `read_plane`).
+- **`pipeline/storage.py:LabelStackWriter`** — incremental per-frame label sink
+  (zarr `(1,H,W)` chunks, else memmap `.npy`). `AnalysisStage.commit_m` persists
+  frame-by-frame and swaps results to the canonical readers.
+- **`utils/resource_strategy.should_stream_analysis`** — adaptive eager/stream
+  gate (dataset type / `StrategyDecision` / `MemoryMonitor` band) consumed by the
+  Analysis, Results, and Batch compute paths, which now keep channels lazy.
+- The four analysis pipelines and `results_engine.compute_measurements` iterate
+  frames on demand; `AnalysisResult.label_masks` values may be disk-backed lazy
+  readers. New flag `AnalysisPipeline.needs_full_stack`.
+
+## V1.45 additions (Pipelines tab — GA3 node graph)
+
+A new top-level **Pipelines** page fuses Recipe → Analysis → Results into one
+node-graph editor modeled on NIS-Elements General Analysis 3. All three sub-tabs
+are wired: **Processing** (branching DAG → recipe), **Analysis** (pipeline →
+overlay + commit), and **Results** (preview an analysis result as a viewer
+overlay + a sortable measurements table). The chain ends at the **Export** tab,
+which surfaces every committed analysis result as a **"Pipeline Results"**
+export source (measurements CSV / overlay frames / label-mask TIFF via
+`results_engine`). The remaining gaps are multi-M analysis commit and Undo.
+
+- **`pipeline_graph/` (new, Qt-free)** — the graph core, kept pure so it stays
+  headless-testable (backend-purity rule extended to the graph layer):
+  - `model.py` — `PortType` / `Stage` / `NodeRole` enums; `Port` / `Node` /
+    `Edge` / `GraphSlice` / `Bridge` / `PipelineDoc` dataclasses with
+    `to_dict`/`from_dict`; connection rules `can_connect` + `would_create_cycle`
+    (DAG enforcement); `clone_node`.
+  - `registry_adapter.py` — enumerates `PluginBase.get_plugins("enhancement")`
+    **and** `AnalysisPipeline.get_pipelines()` into `NodeSpec`s at runtime
+    (never hardcodes names; `enhancement_specs`/`analysis_specs`); `build_node`,
+    `param_specs_for` (resolves `enhancement:` and `analysis:` op-keys),
+    `default_params_for`, processing + analysis input/output node specs.
+  - `executor.py` — `recipe_for_node` walks any node's single input edge back
+    to the INPUT node, producing a `List[(plugin_name, params)]`; `apply_recipe`
+    mirrors `RecipeWorker` / `EnhancedDataset.materialize_channel` using
+    `PluginBase.get_plugin(...).execute(...)` (reimplemented, not imported, to
+    avoid pulling the session/stage graph into the pure layer).
+  - `io.py` — `save_pipeline` / `load_pipeline` ↔ `<name>.nd2s_pipeline.json`
+    (`kind="nd2studios.pipeline"`, `schema_version=3`), mirroring
+    `backend/recipes.py`. `_migrate_v1_to_v2` folds a v1 doc's separate Results
+    slice into the merged Analysis slice on load; `_migrate_v2_to_v3` retargets
+    the retired `special:validate_tracks` node to `special:track_objects`
+    ("Track Objects").
+  - **V1.45 merge (Phase 1):** `model.py` adds `NodeCategory`
+    (PROCESSING/ANALYSIS/RESULTS/LOGIC/SPECIAL) + `ShapeKind`
+    (RECT/TRIANGLE/HEXAGON) on `Node`; `PipelineDoc.merged` aliases the analysis
+    slice (Analysis + Results now share one slice — results nodes keep
+    `stage=RESULTS` for green coloring). `registry_adapter` adds `if_else_spec`
+    (1 in / true+false out triangle), `special_specs` (track-objects / review /
+    dismiss / export / send-to-results / pause hexagons; Dismiss red rect), and
+    `merged_action_specs`. `executor.py` adds `GraphRunner` (a Qt-free Run
+    state machine: topological walk with branch pruning + ready-when-live-preds-
+    done), `topological_order`, and `evaluate_simple_condition` (the if-else
+    aggregate gate over measurement rows).
+  - **V1.45 merge (Phase 2):** `conditions.py` (Qt-free) is the if-else DSL — a
+    `Condition` (ALL/ANY) of `ConditionBlock`s (each negatable), spanning
+    results-number / object-population / timelapse families via a `BLOCK_KINDS`
+    catalog (family + UI schema + evaluator per block); `evaluate_condition` is
+    the Run gate and `describe_condition` the readout. The if-else node stores its
+    tree in `params["condition"]`. `widgets/node_board/condition_builder_dialog.py`
+    (`ConditionBuilderDialog`) edits it (double-click an If/Else node).
+  - **V1.45 object lens:** the if-else `params["lens"]` chooses **Whole frame**
+    (aggregate gate, prunes a branch — the original behavior) or **Each object**
+    (per-object split). In object lens `partition_rows(cond, rows, group_by)`
+    splits rows into pass/fail (reusing `evaluate_condition` per group — **Per
+    track** groups by `(m_position, track_id)`, **Per row** one row each), both
+    branches run, and the Run walk **scopes each downstream node to its branch's
+    rows**: `_run_finish_node` records per-output-port rows and `_apply_branch_scope`
+    re-points `_run_context["rows"]` to the live incoming branch port (so e.g.
+    Dismiss drops only the failing objects and Spatial Maps see only the kept). The Run's
+    interactive nodes reuse the review dialogs — `widgets/track_validation_dialog.py`
+    (`TrackValidationDialog`, the Review Objects **Single objects** mode, unit
+    model that also reviews untracked objects; V1.45 each cropped panel matches
+    CellTracker's Results (Cells) cell-detail level — a red `(255,80,80)`
+    `find_boundaries` outline on the crop, per-frame detail text (frame · area ·
+    ecc · intensity), and a per-cell metric **trace** (`MplCanvas`) with a
+    current-frame marker, plus a top-bar Metric selector) and
+    `widgets/whole_frame_review_dialog.py` (`WholeFrameReviewDialog`, the **Whole
+    frame** mode: label ids on each object, **plain click selects a cell** into a
+    top-right **corner cell-over-time inset** — a label-outlined crop centred on
+    the cell that follows the T slider/playback (tracked cells animate across all
+    their frames; untracked show one frame) with **Accept/Reject Track** actions —
+    while **Alt/Ctrl-click toggles reject** and per-frame accept/reject + M selector
+    + T slider remain) — `backend/object_tracker.link_objects` (object linking
+    driven by the **Track Objects** node via `link_objects_with_params`; also run
+    implicitly before timelapse conditions / Review). `link_objects` dispatches per
+    (channel, m_position) group on the node's `method`: **Centroid
+    (nearest-neighbor)** (`_link_group`, frame-to-frame Hungarian centroid linking
+    with distance/size/track-length/frame-gap thresholds) or **SerialTrack
+    (topology PTV)** (`_link_group_serialtrack`, scale/rotation-invariant topology
+    matching via the vendored `backend/serialtrack`, fed the object centroids
+    through its `track_coordinates` path; `st_mode` incremental/cumulative,
+    `st_n_neighbors`), or the two **Cell-Tracker** linkers (`_link_group_celltracker`,
+    bridging the row-dicts to/from the vendored `backend/celltracker` pandas
+    trackers): **Topology (Hungarian)** (`track_timeseries`, rotation-invariant
+    neighbor descriptor + distance; `ct_n_neighbors`, `ct_topo_weight`) and
+    **Spatial Fingerprint** (`track_fingerprint`, position + log-area with gap
+    filling; `ct_area_weight`, `ct_max_gap`). The `min_track_length` /
+    `track_validation` post-pass is shared across all linkers.
+    The **Cell-Tracker Metrics** special node (`backend/celltracker_bridge.augment_rows_with_metrics`
+    → `celltracker/metrics.compute_spatial_metrics` + `compute_self_fold_change`)
+    augments tracked rows with neighbor distance, local divergence/curl, and
+    self-fold-change columns; the **Cell-Tracker Spatial Maps** and **Interpolated
+    Spatial Maps** nodes now **open an interactive in-viewer "Spatial Maps" tab**
+    (`widgets/spatial_maps_panel.py:SpatialMapsPanel`) instead of carrying their
+    own parameters / writing files on Run. The panel is a faithful port of
+    Cell-Tracker's spatial page (full control sidebar, background overlay,
+    cell-mask mode, borders, quiver, scale bar, auto/global scaling, frame
+    scrubbing) over `celltracker/fields.compute_spatial_fields` +
+    `celltracker/metrics.compute_self_fold_change`, with the **Field** dropdown
+    also offering any numeric measurement column (binned via
+    `SpatialMapsPanel._bin_value_field`) — subsuming the old Interpolated node.
+    **All fields share one method (built like cell density):** density is a
+    Gaussian-smoothed count of cells per grid bin, and every value-bearing field
+    (`mean_area`, `intensity`, `fold_change`, `self_fold`, `velocity_*`, `speed`,
+    `divergence`, `curl`, arbitrary columns) is the matching Gaussian-weighted
+    *local mean* — `fields._binned_mean_field` bins the per-cell value-sum and the
+    count, smooths both, and divides (density is that ratio's denominator), so a
+    field is never interpolated across gaps. Because a local mean (unlike the
+    count) does not fade away from cells, every value field is masked to the
+    **cell footprint** (`fields.cell_footprint` — occupied bins dilated by one) so
+    it shows only where objects are; velocity is binned filled (`0`) for its
+    divergence/curl gradients, then masked to its own footprint. Density stays
+    unmasked (a count self-masks by fading to 0). The
+    page feeds it via `build_tracked_df` (rows → CellTracker DataFrame) +
+    per-M label/channel stacks (`_populate_spatial_panel`). The viewer is a
+    `QStackedWidget` (image viewer ↔ panel); the **Spatial Maps** overlay tab
+    swaps to the panel, and the viewer's maximize (`PopOutWindow`) toggles the
+    panel between a compact top-dropdown-bar layout (docked) and the full vertical
+    sidebar (maximized) via `set_compact`. An in-tab **Save** button exports
+    PNG/TIFF. A node carries reusable **template names** (hidden `templates`
+    param, edited via `SpatialTemplatePicker`); templates persist to a global JSON
+    library (`backend/spatial_templates.py`) and auto-load when the node runs
+    (importable across machines via `import_file`). Both nodes remain special ops
+    carrying `NodeCategory.RESULTS` — they group under the green Results tab; the
+    per-op category lives on `registry_adapter._SPECIAL_OPS`, and `io.py`'s
+    `_normalize_special_categories` refreshes it for old saved graphs on load.
+    `backend/results_engine` exporters (Export), and push to the
+    top-level `ResultsPage` (Send to Results). Pause retains the `GraphRunner` so
+    Run resumes from the pause point. **Run spans the whole file:** an analysis
+    node loops every multipoint (`_advance_run_m`) — per-M analysis job →
+    measurement job → accumulate rows tagged `m_position` — so the if-else and
+    special nodes evaluate over the full dataset (Export writes every M, Review
+    Objects opens per-M panels or one whole-frame viewer across all M, Track
+    Objects re-links the accumulated rows). **Measurement selection:** a Compute Measurements node carries
+    a metric set in `params["metrics"]`, edited via `MeasurementSelectDialog`
+    (param-popup "Edit…" button); `compute_measurements(metrics=…)` skips the
+    costly shape/intensity work and prunes columns to the selection. **Preview**
+    of a results / logic / special node resolves the upstream analysis result
+    (committed or the current frame's screened result) and shows the overlay +
+    table; double-click previews, editor dialogs open from the popup's Edit
+    button. **Multi-frame preview:** a results / Compute Measurements / if-else /
+    special preview runs `_ResultsScreenMeasureJob` over the selected (M × T)
+    planes — screening + measuring each — so the table aggregates all selected
+    frames (rows tagged `m_position`/`frame`) and the overlay is per-plane;
+    `_on_viewer_coords` re-previews on any plane-set change. **Validate in
+    preview:** a Validate/Review node's popup "Validate tracked objects…" button
+    runs `TrackValidationDialog` on the current M's selected-T stack. **Preview =
+    scoped Run:** double-clicking a node walks the chain feeding it on the selected
+    planes — `_start_preview_walk` shades every reachable node, runs
+    `_ResultsScreenMeasureJob` (`_PV_SCREEN_KEY`, honoring the chain's Compute
+    Measurements metric selection) for the analysis/results portion, then
+    `_preview_walk_downstream` walks the logic/special nodes (gold→done, if-else
+    branch, Validate/Review pop-ups when the trigger was deliberate). Subsequent
+    frame navigation re-walks non-interactively (no pop-ups). **Export
+    organization:** the Export node's *Frame organization* choice (M/T/Z fold vs
+    split) drives `results_engine.export_organized` — TIFF multi-page stack per
+    group, PNG/JPG single file or per-group subfolder; `EXPORT_ORG_MAP` maps the
+    UI labels to fold keys.
+- **`widgets/node_board/` (new, Qt)** — custom `QGraphicsScene` editor (no
+  NodeGraphQt, per dependency conservatism): `NodeItem` (rounded body, **left**
+  stage-accent lip, **top-edge input / bottom-edge output anchors** so flow is
+  vertical, hover/selected Disconnect/Duplicate/Delete corner buttons with
+  tooltips), `PortItem` (typed, colored per spec §6.2), `EdgeItem` (vertical
+  Bézier wire in source-port color; hover-highlight + widened `shape()` +
+  **double-click to disconnect** → `NodeScene.disconnect_edge`), `NodeScene`
+  (one per `Stage`; type-checked drag-to-connect, cycle rejection,
+  one-wire-per-input, fan-out, registry-driven add menu, `disconnect_edge`,
+  `set_highlight`), `AddNodeDialog` (roomy catalog picker: a lengthy curated
+  description + large synthetic raw→processed preview thumbnails), `ParamPopup`
+  (frameless `Qt.Tool` window embedding the existing `widgets/common.py:
+  ParamEditor`). Input (top) ports are mouse-transparent so a node can be dragged
+  by its top anchor; connections start only from output (bottom) ports. A
+  **previewed node** (sticky; set by double-click) and its connected component
+  carry a gold outline (`Settings.ACCENT_GOLD`). **V1.45 merge:** `NodeItem` is
+  shape-aware (rounded rect / upright triangle / hexagon) and colors per node
+  **category** (analysis pink / results green / logic purple / special orange /
+  Dismiss red) with a `set_run_state` (shaded / current-gold / done); `NodeScene`
+  gained `set_run_states` / `clear_run_states`; `AddNodeDialog` groups its
+  catalog into per-category tabs.
+- **`pages/pipelines_page.py` (new)** — 50/50 `QSplitter`: node board (sub-tab
+  selector + control bar with Add / Preview / Apply / Undo and a slim preview
+  `QProgressBar` + one `QGraphicsView` swapping scenes) and a reused
+  `MultiAxisViewer`. Preview via `_ProcessingPreviewJob(AnalysisJob)` →
+  `MainWindow.job_runner` (coalesce key `"pipeline_preview"`, 300 ms debounce,
+  `heavy_ops_blocked()`); the progress bar is driven by `JobRunner.job_progress`.
+  The page is **stage-aware**: per-stage previewed node / highlight / preview
+  target. **Processing** preview applies the linearized recipe and shows the
+  processed image (`set_channels`); Apply commits the primary output's recipe to
+  the record + best-effort `RecipeStage.commit()`. Previews read the displayed
+  M from `record._raw_volume.all_channels_as_lazy(m=…)` and pass the real
+  `n_multipoints`, so the viewer navigates every M (recomputing per-M via
+  `_on_viewer_coords` / `_channels_for_m` / `_preview_m`); param edits recompute
+  only when the edited node is the previewed node or upstream of it; sub-tab
+  switches `fitInView` the whole graph (`_frame_all_nodes`). **Analysis** preview runs the
+  previewed pipeline on the current frame (`PipelinePreviewJob`,
+  `"pipeline_analysis_preview"`) and overlays label masks via
+  `set_frame_post_process` (reusing `analysis_page._overlay_labels`) over a
+  processed base image; Apply runs `PipelineCommitJob`
+  (`"pipeline_analysis_commit"`) on the current M's full stack into
+  `record.analysis_results[name][m]`. **Results** preview overlays a chosen
+  committed `AnalysisResult`'s masks (`_composite_results_overlay`) and computes
+  its measurements off-thread (`_ResultsMeasureJob` →
+  `results_engine.compute_measurements`, `"pipeline_results_preview"`) into a
+  `QTableView` (reusing `results_page._MeasurementsModel`); the right pane is a
+  vertical `QSplitter` of the viewer + table with an **image/table/split** mode
+  bar. (`compute_measurements` is imported at module load on the main thread to
+  avoid a skimage/scipy first-import race in the worker.)
+  **V1.45 merge (Phase 1):** the page now has **two** sub-tabs — Processing and a
+  merged **Analysis** (Stage.ANALYSIS holds analysis + results + logic + special
+  nodes). The active right-pane mode is driven by the previewed node's category
+  (`_merged_mode`: results node → results overlay + table; else analysis overlay),
+  not a separate Results stage. The merged tab swaps **Apply → Run**: `_on_run`
+  drives a `GraphRunner` stepper (`_run_pump` / `_run_finish_node`), executing
+  analysis nodes (`_RUN_ANALYSIS_KEY`) and measurement nodes (`_RUN_RESULTS_KEY`)
+  via the shared `JobRunner`, evaluating if-else conditions over the run-context
+  measurement rows to prune a branch, and painting shaded → gold → done via
+  `NodeScene.set_run_states`. **Pause** clears run states (editor mode); previews
+  are suppressed while a Run is active.
+- **V1.46 viewer overhaul:** the right pane wraps the viewer with an **overlay tab
+  bar** (Image / Segmentation / Tracks / Vectors: cells / Vectors: field) and the
+  bottom split is a **data `QTabWidget`** (Measurements + `MplCanvas` plot tabs:
+  Cells/frame, Area, Tracks/frame, Track length). One dispatcher
+  `_composite_pipeline_overlay(rgb,t,m)` paints the active layer over the cached
+  base; switching a tab only invalidates the post-process cache (base never
+  re-renders). Overlays resolve per `(m,t)` via `_overlay_result_for` (previewed
+  plane → else committed `_run_results_by_m[m]` at frame `t`) — fixing the
+  "overlay only on the Run-start frame" bug. **Live per-frame:** a per-frame
+  channel (`ProgressReporter.frame` → `JobRunner.job_frame` →
+  `plane_runner.run_planes_to_labels(frame_cb=…)` via `make_frame_cb`, injected by
+  `PipelineCommitJob`) drives `_on_run_frame`, which jumps the viewer to each
+  finished frame (`MultiAxisViewer.set_current_frame`), paints a live red outline,
+  and extends the Cells/frame plot. **Tracks:** `_run_track_objects` builds a
+  track colormap + long-track set, switches to the Tracks tab, and plays through
+  the frames (colored cells build up); `backend/track_overlays.py` (Qt-free) does
+  the solid track-color fill (`make_colored_overlay`), HSV colormap
+  (`generate_track_colormap`), and arrowed vectors (`draw_cell_vectors` /
+  `draw_grid_velocity` via `cv2.arrowedLine`).
+- **V1.46.3 maximize/pop-out:** a `fa5s.expand` button on the viewer's overlay-tab
+  row and in the data `QTabWidget` corner pops that panel out into a full window
+  via `widgets/popout_window.py` `PopOutWindow` (a reusable `QDialog` that
+  *reparents* the live widget — so overlay tabs, sliders, LUTs, zoom/pan and plot
+  tabs are preserved — and restores it to its original splitter slot on close).
+  `_toggle_popout` / `_popout_windows` / `_set_panel_visible` keep the
+  image/table/split mode logic from hiding a popped-out panel.
+- **Data flow:** Import `_raw_channels` → Processing INPUT node; each Processing
+  OUTPUT node = a `Bridge(PROCESSING→ANALYSIS)` carrying an `EnhancedDataset`
+  recipe view via `record.processed_view()`. Analysis INPUT reads
+  `processed_view()`; each Analysis OUTPUT node = a `Bridge(ANALYSIS→RESULTS,
+  BINARY)` and the run lands in `record.analysis_results`. Results action nodes
+  pick a committed `AnalysisResult` by name (`analysis_result` param) and emit
+  `Data`; each Results OUTPUT = a `Bridge(RESULTS→Export, DATA)`. (Multi-M
+  analysis commit and Undo are deferred.)
+- **Export integration (`pages/export_page.py`):** a **"Pipeline Results"**
+  source enumerates `record.analysis_results` and exports measurements (CSV via
+  `compute_measurements`), overlay frames (`export_overlay_frames`), and label
+  masks (`export_label_masks_tiff`). Decoupled — reads the record, not the
+  Pipelines page, so it also covers standalone Analysis-page results.
+- **Edits:** `core/settings.py` (`PAGES` + `PAGE_PREREQS`), `core/main_window.py`
+  (`page_classes`), `core/theme.py` (node-board / sub-tab / popup QSS),
+  `pages/export_page.py` (Pipeline Results source),
+  `backend/results_engine.py` (int32 label-mask TIFF fix).
 
 ## V1.44 additions (GUI Overhaul + Button Revamp)
 
@@ -15,6 +295,45 @@
   (`set_metadata_text`, `#metaBox`), updated from
   `MultiAxisViewer._update_axis_labels`.
 - New dependency: **`qtawesome`**.
+
+## V1.46.1 — viewer overlay-style control + pixel-hover readout
+
+- **`ZoomToolbar`** (`widgets/image_viewer.py`) gains, between **Pan** and the
+  Zoom %, an **Overlay** button whose popup sets overlay `color` / `weight` /
+  `multicolor` / `alpha` (state in `_overlay_style`, `overlay_style()` getter,
+  `overlay_style_changed` signal; shown only when an overlay is active). To the
+  right of the Zoom %: a **px/µm** toggle (`coord_mode_changed`) and a
+  `lbl_hover` readout (`set_hover_text`).
+- **Pixel hover:** both `ImageCanvas` (`mouseMoveEvent`/`leaveEvent`) and
+  `GpuImageCanvas` (`_on_scene_moved`) emit a `hover(iy, ix)` signal (`-1,-1` on
+  leave). `MultiAxisViewer._on_pixel_hover` builds the readout — position (image
+  px or stage µm via `_pixel_to_stage`, matching `results_engine`
+  `centroid_*_stage_um`) plus each enabled channel's intensity from
+  `_plane_for_channel` (cached per `(m,t,z)`). Pages pass `stage_xy_um` into
+  `set_volume` so the µm toggle has data.
+- **Overlay style application:** `MultiAxisViewer.overlay_style()` is read by the
+  Pipelines overlay painters; `analysis_page._overlay_labels` gained a
+  `thickness` param (boundary dilation) so the weight control widens outlines.
+
+## V1.46.2 — live-run frame sync, conditional tabs, richer if-else, review overlay
+
+- **Frame-strip sync:** `MultiAxisViewer._on_strip_current` now calls
+  `FrameStrip.set_current(value, emit=False)` after setting the (signal-blocked)
+  slider, so programmatic nav (`set_current_frame`, used by live-run streaming)
+  advances the visible strip selection — not just the slider.
+- **Conditional overlay tabs:** `pipelines_page._update_overlay_tabs_available`
+  (`QTabBar.setTabVisible`) shows Image always, Segmentation once a result exists
+  / a run is live, and Tracks/Vectors only after Track Objects links; called at
+  stage switch, run start, and `_build_track_overlay`. Plot tabs were already
+  per-run (`_clear_plot_tabs` + lazy `_plot_canvas`).
+- **If-else metrics:** `conditions._METRICS` extended with `track_length`,
+  `delta_area_um2/px`, `neighbor_dist_mean/std`, `local_divergence`, `local_curl`,
+  `self_fold` (read via `_metric_value` → `row.get`); the builder auto-discovers
+  them. Cells/frame = `object_count` block; track counts = tracking-family blocks.
+- **Review overlay:** `TrackValidationDialog(overlay_style=…)` renders the cropped
+  cell through `analysis_page._overlay_labels` (segmentation format) with an
+  Overlay control (Outline/Filled + color + weight); pipelines passes
+  `self._overlay_style()`.
 
 ## V1.43 additions (Tile-Strip Frame Navigator)
 
@@ -192,6 +511,7 @@ built, opens `MainWindow`.
 | `lut_sidebar.py` (V1.2, expanded V1.3) | `LutSidebar` — collapsible right-side panel hosting two independently-collapsible sections: (1) a **Tiles** section with a `TileLayoutWidget` in navigate mode, and (2) a **LUTs** section with one `LutHistogramWidget` per channel. Sidebar width 300 / 28 px collapsed; animated on both `minimumWidth` and `maximumWidth` (animating both prevents `QHBoxLayout` from fighting the animation). Section headers (`_SectionHeader`) have ▾/▸ toggles. Tiles section auto-hides when ≤ 1 tile. Signals: `channel_contrast_changed(name, lo, hi, gamma)`, `tile_navigate_requested(m)`, `collapse_changed(bool)`. `update_swatch(name, rgb)` keeps the swatch in sync when the chip strip's color combo changes |
 | `tile_layout.py` (V1.3, auto-sized V1.6) | `TileLayoutWidget` — interactive multipoint layout with two modes (`"navigate"` / `"select"`), `QPainter` rendering, hit-testing in cached widget rects, hover preview, tile-index labels, and an expand-to-modal `⤢` button. V1.6: `_adapt_minimum_size()` runs after every `set_tile_layout()` and sets `setMinimumSize(n_cols × 50 + margins, n_rows × 50 + header + margins)` so the host's `QScrollArea` can scroll when the natural size exceeds the viewport. Three signals: `navigate_requested(m)`, `selection_changed(set[int])`, `expand_requested`. `TileLayoutDialog` (V1.6: wraps the widget in its own `QScrollArea`) is the modal "expand" wrapper — auto-closes after click in navigate mode, stays open in select mode |
 | `scale_bar.py` | Matplotlib scale-bar rendering helpers (used by `MplCanvas` consumers) |
+| `spatial_maps_panel.py` (V1.46) | `SpatialMapsPanel` — the in-viewer **Spatial Maps** tab; a faithful port of Cell-Tracker's spatial page over `backend/celltracker/fields.compute_spatial_fields` + `metrics.compute_self_fold_change` (+ `backend/interp_maps.compute_interp_map` for arbitrary measurement columns). One set of control widgets is reparented between two layouts by `set_compact(bool)`: a compact top dropdown bar (docked viewer) and the full vertical collapsible sidebar (maximized viewer). Frame navigation uses the ND2Studios `FrameStrip` (NIS-style tile strip) + play/pause + FPS controls — same set as `MultiAxisViewer._make_axis_row` — not a plain slider. Scrubbing is debounced (a fast drag renders only the final frame) and a per-frame field cache (keyed by `(t, grid, sigma, channel, source)`, cleared on those param changes) makes revisits / playback instant; the tab opens with a fast single-frame colour-scale fit (`_autofit_scale_from_current`) instead of the all-frames pass, which is reserved for the "Global Scale" button. The canvas supports **zoom / pan** (Home/+/−/Pan buttons, scroll-zoom, drag-pan) via matplotlib data limits (`_zoom_about` / `_apply_view`, persisted in `_view` across redraws), and the colour bar is a **fixed axes pinned to the figure's right edge** so it stays at the viewer border when zoomed. Also: an optional multipoint selector (`m_change_requested`), `get_config`/`apply_config`, a template strip (Save / Load file / preset combo) backed by `backend/spatial_templates`, `set_node_templates(names)` to pre-load a node's templates, and an in-tab **Save** (current frame / all frames, PNG or raw-field TIFF). `SpatialTemplatePicker(QDialog)` edits which library templates a node carries (add/remove/reorder + Import JSON). Fed by `pipelines_page._populate_spatial_panel` via `celltracker_bridge.build_tracked_df` + per-M label/channel stacks |
 | `video_player.py` | Play/Pause/FPS playback controls |
 | `custom_grips.py` | Per-edge frameless-window resize widgets. Lean reimplementation of PyDracula's `CustomGrip` |
 | `export_preview_dialog.py` (V1.32) | `ExportPreviewDialog(channels, colors, enabled, pixel_size_um, frame_timestamps_s, lut_settings, movie_options, title)` — modal preview shown after the user confirms movie or image-sequence export settings. Embeds an `ImageCanvas` + `ZoomToolbar` with a T scrubber, a ▶ Play / ⏸ Pause toggle, and an in-dialog FPS spin box; a second `QTimer` advances T at the chosen FPS so the user sees the movie actually play back with brightness / contrast / saturation / hue / fade applied live. Manually grabbing the T slider pauses playback. Exposes the five adjustment sliders (each a `_LabeledSlider`) and a "Show overlays in preview" toggle. A 30 ms single-shot debounce coalesces slider drags before recompositing; the play-tick path renders directly to keep the frame rate honest. `adjustments()` returns the user-chosen `ImageAdjustments` once the dialog is accepted; the dialog itself never runs the export. `closeEvent`/`done()` stop the playback timer so it can't outlive the dialog |
@@ -206,12 +526,14 @@ built, opens `MainWindow`.
 | `frame_cache.py` (V1.17, V1.34 adaptive budget, V1.35 pin / stats) | `FrameCache`: thread-safe LRU cache keyed by `(c, m, t, z, z_mode)` storing normalized `(H, W)` frames. `get`/`put`/`contains`/`clear` all lock-protected. Default budget 300 MB (in practice sized by `recommended_cache_budget_bytes`). **V1.35 Phase 3** adds: `CacheStats` (hits / misses / evictions / current_bytes / peak_bytes / `hit_rate`) updated under the same lock; `pin(key)` / `unpin(key)` / `is_pinned(key)` that exempt a key from eviction so the on-screen composite's planes can't be evicted by the prefetcher's neighbor writes; `set_max_bytes(n)` to resize on the fly; `current_bytes`/`max_bytes`/`__len__` accessors. Inserted arrays are flagged `writeable=False` so accidental in-place mutation downstream fails with `ValueError`. Eviction skips pinned entries and breaks out when only pins remain (over-budget but never evicting a displayed plane). `clear()` drops both entries and pins; hit/miss/eviction counters persist across `clear()` so a session-long hit rate stays meaningful |
 | `normalization.py` | `normalize_frame_means` (frame-mean intensity normalization) |
 | `recipes.py` | `build_recipe`, `save_recipe`, `load_recipe` for `.nd2s_recipe.json` (kind = `nd2studios.recipe`) |
+| `spatial_templates.py` (V1.46) | Global JSON library of named Spatial Maps configurations under `~/.nd2studios/spatial_map_templates` (one `*.nd2s_spatialmap.json` per template). `list_templates` / `load_template` / `save_template` / `delete_template`; `read_template_file` parses a single-template or bundle file, `import_file` merges it into the library (cross-machine portability), `export_file` writes a bundle. Pure stdlib (no Qt/numpy). Consumed by `widgets/spatial_maps_panel.py` and the Spatial Maps nodes (which store template **names**) |
 | `exporters/tiff_exporter.py` | `export_tiff_stack(stack, filepath, bit_depth, pixel_size_um, progress_cb)` (single-channel `(T,H,W)` or `(T,Z,H,W)`, used by label-mask export); `export_tiff_hyperstack(channels, enabled, filepath, bit_depth, pixel_size_um, progress_cb)` (V1.29 — multi-channel, writes a single `(T,Z,C,H,W)` ImageJ TZCYX hyperstack with `Labels=[<channel names>]`, `unit=um`, `spacing`, resolution; same file construction as `export_stitched_tiff`). BigTIFF auto-switch |
 | `exporters/composite_exporter.py` | `export_rgb_composite_tiff(channels, colors, enabled, filepath, …, image_adjustments)`, `_composite_frame(…, image_adjustments)`, `CHANNEL_COLORS`. V1.32: `ImageAdjustments` dataclass (`brightness`, `contrast`, `saturation`, `hue`, `fade`); vectorised `apply_image_adjustments(rgb, adj)` for contrast / saturation / hue / fade on the final RGB; `_apply_brightness_to_gray(gray, brightness)` applies brightness as **multiplicative gain** (`gain = 1 + brightness/100`) inside the composite loop *before* the channel colour LUT is mixed in. The gain semantic keeps background pixels near zero (only signal scales visibly — additive offset would lift the noise floor as much as the peaks) and the per-channel placement keeps a red-only channel pure red rather than washing toward white. `ImageAdjustments.is_identity_post_composite()` lets the composite pass skip the post-RGB pass when only brightness is set |
 | `exporters/movie_exporter.py` | `MovieOptions` dataclass + `export_movie(channels, colors, enabled, filepath, options, pixel_size_um, frame_timestamps_s, lut_settings, image_adjustments, progress_cb, status_cb)`. Uses `imageio` (libx264 for MP4, pillow for GIF). PIL-rendered overlays for scale bar, timestamp, channel labels |
 | `exporters/image_sequence_exporter.py` (V1.32) | `format_frame_name(basename, t, m, z, n_t, n_m, n_z, extension)` — pure naming helper that only includes axis suffixes (`_T01`, `_M02`, `_Z03`) when the corresponding axis has more than one frame. `ImageSequenceRequest` dataclass; `export_image_sequence(request, progress_cb, status_cb)` writes one PNG per frame via PIL. Two iteration paths: in-memory channels (T-only, recipe-applied) or `LazyND2Volume` (M × T × Z, raw — no recipe). Reuses `_composite_frame` and `_draw_overlays` so the colour pipeline matches movie exports byte-for-byte |
 | `analysis/manual_mask.py` (V1.30, V1.31 per-Z shapes, **V1.40 Custom Mask Creator**) | `ManualMaskPipeline` (registered name `"Mask Analysis"`; renamed from `"Manual Mask"` in V1.40) — rasterizes user-drawn shapes *and* auto-tiled rectangular strips into a `(T, H, W)` int32 label stack. **V1.40**: new `tiled_masks` hidden param (list of `{shape_type, direction, height_px, width_px, x_offset_px, start_offset_px}` dicts); `generate_tiled_label_boxes(tiled_masks, H, W)` returns `(y0,y1,x0,x1)` tuples for every *complete* strip (partial strips at the image boundary are excluded); `generate_tiled_mask(tiled_masks, H, W)` returns a `(H,W)` int32 overlay array for live preview. In `run()` tiled strips receive stable IDs 1..N across all frames so each strip is the same measurement object at every timepoint; hand-drawn shapes are assigned IDs N+1, N+2, … per frame. `rasterize_shapes()` gains a `label_offset` kwarg so the drawing overlay uses the same stable offset. `AnalysisPage` stores `_tiled_masks: List[Dict]` (persisted to `ND2StudiosRecord.tiled_mask_specs`), exposes a **Custom Mask Creator** `QGroupBox` (shape type, direction, strip height, optional custom width+x-offset, start offset, Generate/Clear buttons), and extends `_composite_overlay()` to paint tiled strips below drawn shapes in the live preview |
 | `analysis/nuclei_segmentation.py` (V1.19, GPU flag V1.39) | `NucleiSegmentationPipeline` — Cellpose 3 per-frame 2D segmentation. Optional dep (`pip install cellpose`); raises `ImportError` with install message when absent. Uses `skimage.measure.regionprops` for per-object measurements. Registered via `@AnalysisPipeline.register`. **V1.39 Phase 7**: `models.Cellpose(gpu=is_gpu_enabled())` honours the runtime `compute.gpu` flag — Cellpose owns its own CUDA initialization; we only forward the boolean |
+| `analysis/stardist_segmentation.py` (V1.45) | `StarDistSegmentationPipeline` — per-frame 2D StarDist instance segmentation (ported from CellTracker; its only segmentation method). Optional dep (`pip install stardist tensorflow csbdeep`); raises `ImportError` when absent. Mirrors the Cellpose node: `is_gpu_enabled()` → `disable_gpu`, per-frame via `plane_runner.run_planes_to_labels(n_workers=1)`, area filter + contiguous relabel in one `O(pixels)` pass via `source_utils.filter_and_relabel` (np.bincount + LUT — replaced the old per-object full-frame `mask[mask==label]` / `_relabel_contiguous` loops), `AnalysisResult(..., overlay_outline=params["outline"])`. When `outline` is on the result also sets `overlay_color=(255,50,50)` + `overlay_alpha=1.0` so `_overlay_labels` paints every `find_boundaries(mode="outer")` pixel in that exact colour at full opacity — byte-for-byte CellTracker's boundary rendering. Params: `channel_name`, `model_name` (`2D_versatile_fluo`/`_he`/`_paper_dsb2018`), `prob_thresh`, `nms_thresh`, `scale`, `min_area`/`max_area`, `outline`. Backend is the vendored `backend/celltracker/segmentation.py` (`get_stardist_model`, `segment_frame`, `_ensure_tf_threading` — TF pinned to a single inter/intra-op thread exactly as CellTracker's repo does, which is ~10× faster than multi-threaded for StarDist's tiled inference; Windows csbdeep-symlink patch; GPU flag honored by clearing `CUDA_VISIBLE_DEVICES` before the first TF import) |
 | `analysis/tear_detection.py` (V1.19, GPU dispatch V1.39) | `TearDetectionPipeline` — classical dark/homogeneous region detection. Stage 1: tissue mask via Otsu on log-intensity + morphological cleanup (4× downsample). Stage 2: rank-normalised homogeneity score from local intensity (`uniform_filter`), local variance (`generic_filter`), local entropy (`skimage.filters.rank.entropy`). Stage 3: connected-component extraction with area filters. Stage 4: optional weak-stain disambiguation via counterstain channel. No DL dependencies. Measurements include `class` (`tear`/`weak_stain`/`unknown`), `homogeneity_score`, `solidity`, `eccentricity` in addition to the standard fields. **V1.39 Phase 7**: `gaussian` and `threshold_otsu` imports route through `compute.gpu.ops` instead of `skimage.filters`; same signatures, CPU pass-through when GPU mode is off |
 | `analysis/histogram_threshold_pipeline.py` (V1.20) | `HistogramThresholdPipeline` — adapter that registers `histothresh/` into the `AnalysisPipeline` registry. Iterates T frames, calls `HistogramThresholdSegmenter.run(frame)` per slice, stacks `(T,H,W)` int32 label arrays, and assembles `AnalysisResult`. 16 `ParamSpec` parameters exposed in the Analysis tab UI. Sets `bit_depth_strict=False` so TIFF inputs that overflow the declared range warn rather than crash |
 | `analysis/histothresh/` (V1.20) | Qt-free subpackage implementing the histogram threshold segmenter. `validation.py`: `validate_bit_depth()`, `infer_bit_depth()`, `BitDepthError` — rejects float inputs and values overflowing the declared bit-depth max. `histogram.py`: `Histogram` dataclass with `percentile()` / `cumulative()` helpers; `compute_histogram()` bins the full LUT range (one bin per integer value); four `suggest_threshold_*()` helpers (Otsu, Triangle, Minimum, Multi-Otsu). `thresholds.py`: `threshold_single()` (below/above/between/outside), `threshold_hysteresis()` (inverts image for `below` mode to reuse scikit-image's high-pass hysteresis), `threshold_percentile()`, `threshold_relative()`. `morphology.py`: `apply_spatial_constraints()` (opening → closing → hole-fill → small-object removal), `homogeneity_gate()`. `config.py`: `ThresholdConfig` plain dataclass with `__post_init__` validation of method/direction param combinations. `identifier.py`: `HistogramThresholdSegmenter` orchestrator returning `SegmentationResult` (mask, int32 labels, regions list, histogram, threshold_used dict, provenance dict) |
@@ -454,13 +776,25 @@ Side branch (Analysis page — V1.19):
 | imageio + imageio-ffmpeg | MP4 / GIF export | libx264 codec for MP4 |
 | Pillow | overlay rendering | scale bar / timestamp / labels |
 | certifi | SSL bundle | optional, for plugins that pull online resources |
+| numba | JIT kernels | required by the vendored `backend/serialtrack` matcher (the Track Objects node's SerialTrack method); first call compiles + caches |
 
 | cellpose (optional, V1.19) | Nuclei segmentation | `pip install cellpose`; detected at runtime via `importlib.util.find_spec`. Absent = friendly error dialog, not a crash |
+| stardist + tensorflow + csbdeep (optional, V1.45) | StarDist segmentation node | `pip install stardist tensorflow csbdeep`; detected via `importlib.util.find_spec`. Absent = friendly `ImportError` in the node, not a crash. TF imported lazily on first model load; threading locked single inter/intra-op to avoid worker-thread deadlock |
 
-ND2Studios deliberately does **not** depend on TensorFlow, StarDist,
-csbdeep, or any tracking library — those belong in CellTracker.
-Cellpose is an optional analysis dependency; the rest of the app runs
-without it.
+TensorFlow / StarDist / csbdeep are **optional** dependencies — required only by
+the StarDist segmentation node (V1.45). They are not in `requirements.txt`; the
+node raises a friendly `ImportError` when they are missing. Object linking is
+provided by the in-tree `backend/object_tracker` (centroid linker) plus a vendored,
+headless subset of SerialTrack at `backend/serialtrack/` (topology PTV;
+9 modules, no PySide6/h5py/tifffile-bound code) — see
+`Research/serialtrack.md`. A second vendored subset, **CellTracker** at
+`backend/celltracker/` (`tracking`, `metrics`, `fields`, `segmentation`; pure
+numpy/scipy/pandas + lazy stardist/TF, no Qt), supplies the topology-Hungarian /
+spatial-fingerprint linkers, per-cell spatial metrics + self-fold-change, Eulerian
+field maps, and StarDist segmentation — adapted to/from ND2Studios' row-dicts by
+`backend/celltracker_bridge.py` (analyses) and the StarDist analysis node. Cellpose
+and StarDist are optional analysis dependencies; the rest of the app runs without
+them.
 
 ## Design Decisions
 

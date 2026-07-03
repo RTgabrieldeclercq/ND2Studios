@@ -36,6 +36,9 @@ except Exception:  # noqa: BLE001 — any zarr import failure → NPZ fallback
 # is self-describing.
 _ZARR_SUFFIX = ".zarr"
 _NPZ_SUFFIX = ".npz"
+# V1.46 — incremental (per-frame) streaming sink uses a memmapped .npy when
+# zarr is unavailable, since NPZ (np.savez) can only be written all-at-once.
+_NPY_SUFFIX = ".npy"
 
 
 def _zarr_chunks(shape: Tuple[int, ...]) -> Tuple[int, ...]:
@@ -95,7 +98,7 @@ def write_label_stack(base_path: Path, labels: np.ndarray) -> str:
 def read_label_stack(path: Path) -> np.ndarray:
     """Read a label stack written by :func:`write_label_stack`.
 
-    Returns a regular numpy array regardless of backend. NPZ files are
+    Returns a regular numpy array regardless of backend. NPZ / NPY files are
     materialized; Zarr files are read into RAM here — callers that need
     lazy access should call :func:`open_label_stack` instead.
     """
@@ -110,6 +113,8 @@ def read_label_stack(path: Path) -> np.ndarray:
     if suffix == _NPZ_SUFFIX:
         with np.load(path) as data:
             return np.asarray(data["labels"])
+    if suffix == _NPY_SUFFIX:
+        return np.asarray(np.load(path))
     raise ValueError(f"Unknown label-stack format: {path}")
 
 
@@ -117,10 +122,98 @@ def open_label_stack(path: Path):
     """Open a label stack lazily when possible.
 
     Returns a zarr ``Array`` for Zarr-backed stores (supports ``[t]``
-    indexing without loading the whole stack) and a materialized numpy
+    indexing without loading the whole stack), a memory-mapped numpy array
+    for ``.npy`` (also supports lazy ``[t]`` reads), and a materialized numpy
     array for NPZ.
     """
     suffix = path.suffix.lower()
     if suffix == _ZARR_SUFFIX and HAS_ZARR:
         return zarr.open(str(path), mode="r")  # type: ignore[union-attr]
+    if suffix == _NPY_SUFFIX:
+        return np.load(path, mmap_mode="r")
     return read_label_stack(path)
+
+
+class LabelStackWriter:
+    """Incremental, per-frame label-stack writer (V1.46 streaming sink).
+
+    Unlike :func:`write_label_stack` (which needs the whole ``(T, H, W)`` array
+    in RAM), this opens a fixed-shape store up front and accepts one ``(H, W)``
+    frame at a time via :meth:`write_frame`, so an analysis pipeline can spill
+    masks to disk as it processes without ever holding the full stack. This is
+    the Fiji/NIS-Elements "streaming sink" used on memory-constrained machines.
+
+    Backend: a Zarr array with ``(1, H, W)`` chunks when available (per-frame
+    writes touch a single chunk), else a memory-mapped ``.npy`` (``np.memmap``
+    supports random-access ``mm[t] = frame`` writes without buffering the rest).
+    Writes may arrive out of T-order — both backends are random-access.
+
+    Usage::
+
+        with LabelStackWriter(base, (T, H, W)) as w:
+            for t in ...:
+                w.write_frame(t, label_frame)
+        reader = w.reader          # lazy [t]/.shape/.ndim reader after close
+        rel = w.relative_name      # basename+suffix for the manifest
+    """
+
+    def __init__(self, base_path: Path, shape: Tuple[int, ...],
+                 dtype=np.int32) -> None:
+        self._base = Path(base_path)
+        self._base.parent.mkdir(parents=True, exist_ok=True)
+        self._shape = tuple(int(s) for s in shape)
+        self._dtype = np.dtype(dtype)
+        self._closed = False
+        self.reader = None  # populated on close()
+
+        if HAS_ZARR:
+            self._target = self._base.with_suffix(_ZARR_SUFFIX)
+            self._store = zarr.open(  # type: ignore[union-attr]
+                str(self._target),
+                mode="w",
+                shape=self._shape,
+                chunks=_zarr_chunks(self._shape),
+                dtype=self._dtype,
+            )
+            self._memmap = None
+        else:
+            self._target = self._base.with_suffix(_NPY_SUFFIX)
+            self._memmap = np.lib.format.open_memmap(
+                str(self._target), mode="w+",
+                dtype=self._dtype, shape=self._shape,
+            )
+            self._store = None
+
+    @property
+    def relative_name(self) -> str:
+        return self._target.name
+
+    @property
+    def path(self) -> Path:
+        return self._target
+
+    def write_frame(self, t: int, frame: np.ndarray) -> None:
+        """Write one ``(H, W)`` plane at index ``t`` (random-access)."""
+        f = np.ascontiguousarray(frame, dtype=self._dtype)
+        if self._store is not None:
+            self._store[int(t)] = f
+        else:
+            self._memmap[int(t)] = f
+
+    def close(self):
+        """Flush and return a lazy reader (zarr Array or mmap numpy)."""
+        if self._closed:
+            return self.reader
+        self._closed = True
+        if self._memmap is not None:
+            self._memmap.flush()
+            del self._memmap
+            self._memmap = None
+        self.reader = open_label_stack(self._target)
+        return self.reader
+
+    def __enter__(self) -> "LabelStackWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()

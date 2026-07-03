@@ -134,6 +134,33 @@ def tool_button(
     return btn
 
 
+def arrow_png(name: str, color: str, size_px: int = 12) -> str:
+    """Render a qtawesome icon to a cached PNG and return a QSS-friendly path.
+
+    Qt's QSS ``::down-arrow`` / ``::up-arrow`` only render reliably from an
+    ``image: url(...)`` — the CSS border-triangle trick often shows nothing.
+    We render the icon once to ``%TEMP%/nd2studios_icons`` and hand back a
+    forward-slashed absolute path for ``url()``.
+    """
+    import os
+    import tempfile
+
+    safe = name.replace(".", "_")
+    key = f"{safe}_{color.lstrip('#')}_{int(size_px)}.png"
+    cache_dir = os.path.join(tempfile.gettempdir(), "nd2studios_icons")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, key)
+    if not os.path.exists(path):
+        if not _HAVE_QTA:
+            return ""
+        s = scaled(size_px)
+        try:
+            qta.icon(name, color=color).pixmap(QSize(s, s)).save(path, "PNG")
+        except Exception:  # noqa: BLE001
+            return ""
+    return path.replace(os.sep, "/")
+
+
 def bind_toggle_icon(
     btn: QPushButton,
     icon_unchecked: str,

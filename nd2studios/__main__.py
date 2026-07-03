@@ -43,7 +43,7 @@ def main() -> None:
         QGuiApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     from nd2studios.core.settings import Settings
-    from nd2studios.core.theme import STYLESHEET
+    from nd2studios.core.theme import build_stylesheet
     from nd2studios.core.main_window import MainWindow
 
     # V1.41 — apply the user's saved preferences to ``Settings`` before
@@ -78,6 +78,7 @@ def main() -> None:
     # runs at startup before any page is constructed.
     import nd2studios.plugins.enhancement.builtin  # noqa: F401
     import nd2studios.backend.analysis.nuclei_segmentation  # noqa: F401
+    import nd2studios.backend.analysis.stardist_segmentation  # noqa: F401
     import nd2studios.backend.analysis.tear_detection  # noqa: F401
     import nd2studios.backend.analysis.histogram_threshold_pipeline  # noqa: F401
     import nd2studios.backend.analysis.spots_pipeline  # noqa: F401
@@ -86,7 +87,8 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName(Settings.APP_NAME)
     app.setStyle("Fusion")
-    app.setStyleSheet(STYLESHEET)
+    # build_stylesheet() injects rendered arrow images (needs the QApplication).
+    app.setStyleSheet(build_stylesheet())
 
     # V1.39 Phase 7: log GPU status once and seed the analysis-GPU
     # dispatch flag from Settings. Both calls are safe on CPU-only

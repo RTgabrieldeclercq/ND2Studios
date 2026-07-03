@@ -32,6 +32,23 @@ from nd2studios.utils.resource_strategy import (
 from nd2studios.workers.base_worker import BaseWorker
 
 
+def _forced_strategy_override() -> "Optional[LoadStrategy]":
+    """Read the user's "Load strategy override" preference (Performance dialog).
+
+    Returns the forced :class:`LoadStrategy`, or ``None`` for Auto. This is what
+    makes "Force Lazy (cached)" actually take effect — without it the loader
+    always materialized eagerly regardless of the setting (V1.44 fix).
+    """
+    from nd2studios.core.settings import Settings
+    val = (getattr(Settings, "FORCED_LOAD_STRATEGY", "") or "").strip()
+    if not val:
+        return None
+    try:
+        return LoadStrategy(val)
+    except ValueError:
+        return None
+
+
 def _meta_like_from_dataset_meta(ext_meta: Dict[str, Any]) -> Any:
     """Adapt the dict-shaped extended metadata into a duck-typed object
     that :func:`choose_strategy` can read footprint fields off of.
@@ -149,7 +166,9 @@ class LoadWorker(BaseWorker):
         # budget. Raises StrategyError (→ BaseWorker.error signal) when
         # even the projected footprint can't fit; that surfaces to the
         # user as a modal with actionable wording rather than an OOM.
-        decision = choose_strategy(meta, self.filepath)
+        # V1.44: honor the user's forced "Load strategy override".
+        decision = choose_strategy(meta, self.filepath,
+                                   override=_forced_strategy_override())
         log_decision(decision)
         self.strategy_chosen.emit(decision)
         self.set_status(
@@ -162,21 +181,35 @@ class LoadWorker(BaseWorker):
                                         or meta.channel_names
                                         or [f"Ch{i}" for i in range(n_channels)])
 
-        # V1.41: eager parallel decode into a single in-RAM dict.
-        # After this returns, every (m, t, c) plane is one ndarray
-        # index away — no Dask, no IOWorker, no FrameCache, no
-        # PrefetchManager. The hot viewer path is RAM only.
-        self.set_status("Materializing volume into RAM…")
-
         def _on_pct(pct: int) -> None:
             self.set_progress(25 + int(70 * pct / 100))
 
-        dataset = materialize_nd2(
-            self.filepath,
-            z_mode=self.z_projection,
-            progress_cb=_on_pct,
-            cancel_cb=lambda: bool(self.cancelled),
-        )
+        if decision.strategy == LoadStrategy.LAZY_CACHED:
+            # V1.44: actually load lazily — read frames on demand via the
+            # numpy-protocol proxy instead of materializing every plane into
+            # RAM. Previously the decision was computed but ignored, so
+            # "Force Lazy" still eagerly materialized (and could OOM).
+            from nd2studios.backend.nd2_volume import LazyND2Volume
+            self.set_status("Opening volume (lazy, on-demand reads)…")
+            dataset = LazyND2Volume(self.filepath)
+            dataset.z_mode = self.z_projection
+            budget = getattr(decision, "cache_budget_bytes", 0) or 0
+            if budget and hasattr(dataset, "configure_cache"):
+                try:
+                    dataset.configure_cache(int(budget))
+                except Exception:  # noqa: BLE001
+                    pass
+            self.set_progress(95)
+        else:
+            # Eager parallel decode into a single in-RAM dict. After this
+            # returns, every (m, t, c) plane is one ndarray index away.
+            self.set_status("Materializing volume into RAM…")
+            dataset = materialize_nd2(
+                self.filepath,
+                z_mode=self.z_projection,
+                progress_cb=_on_pct,
+                cancel_cb=lambda: bool(self.cancelled),
+            )
         if self.cancelled:
             return {}
 

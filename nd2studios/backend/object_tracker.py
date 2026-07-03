@@ -1,11 +1,16 @@
 """
-Object tracker for the Results tab.
+Object tracker for the Pipelines / Results tabs.
 
-Implements a frame-to-frame Hungarian linker that assigns stable track IDs
-to objects whose centroids remain within a displacement threshold across
-consecutive T frames.  Pure NumPy / SciPy — no Qt imports.
+Implements a frame-to-frame Hungarian centroid linker that assigns stable
+track IDs to objects across consecutive T frames.  The per-track reference
+centroid (and area) **updates every frame** — it follows the object as it
+moves rather than anchoring to the first detection — and a track can survive a
+short detection gap (occlusion / missed segmentation) before it is retired.
+Pure NumPy / SciPy — no Qt imports.
 
-Called from ResultsPage._on_compute() after compute_measurements().
+Driven by the "Track Objects" pipeline node (see
+``link_objects_with_params``) and called implicitly after
+``compute_measurements`` so downstream Review / if-else steps have track ids.
 """
 from __future__ import annotations
 
@@ -16,12 +21,41 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
+# Tracking methods exposed by the "Track Objects" node.  The linker dispatches on
+# this so methods slot in as new entries without changing call sites.
+#   * METHOD_CENTROID    — Hungarian nearest-neighbor on object centroids.
+#   * METHOD_SERIALTRACK — SerialTrack topology PTV (scale/rotation invariant);
+#     vendored under ``nd2studios.backend.serialtrack`` and driven via its
+#     ``track_coordinates`` path (the object centroids are the pre-detected
+#     particles, so no image re-detection happens).
+#   * METHOD_CT_TOPOLOGY / METHOD_CT_FINGERPRINT — CellTracker's topology-Hungarian
+#     and spatial-fingerprint linkers, vendored under
+#     ``nd2studios.backend.celltracker`` (pandas-DataFrame trackers; the per-group
+#     ``_link_group_celltracker`` bridges the row-dicts to/from that shape).
+METHOD_CENTROID = "Centroid (nearest-neighbor)"
+METHOD_SERIALTRACK = "SerialTrack (topology PTV)"
+METHOD_CT_TOPOLOGY = "Cell-Tracker: Topology (Hungarian)"
+METHOD_CT_FINGERPRINT = "Cell-Tracker: Spatial Fingerprint"
+TRACKING_METHODS: List[str] = [
+    METHOD_CENTROID, METHOD_SERIALTRACK, METHOD_CT_TOPOLOGY, METHOD_CT_FINGERPRINT,
+]
+
+
 def link_objects(
     rows: List[Dict[str, Any]],
     max_displacement_px: float = 100.0,
     min_track_length: int = 2,
     min_circularity: float = 0.0,
     max_eccentricity: float = 1.0,
+    max_size_diff_frac: float = 1.0,
+    max_frame_gap: int = 0,
+    method: str = METHOD_CENTROID,
+    st_mode: str = "Incremental",
+    st_n_neighbors: int = 25,
+    ct_n_neighbors: int = 5,
+    ct_topo_weight: float = 0.3,
+    ct_area_weight: float = 0.3,
+    ct_max_gap: int = 3,
 ) -> List[Dict[str, Any]]:
     """Assign track_id, track_length, and track_validation to every row.
 
@@ -32,23 +66,50 @@ def link_objects(
     rows:
         List of measurement dicts produced by compute_measurements().
         Each dict must have: segmentation_channel, frame,
-        centroid_y_px, centroid_x_px, bbox_min/max_row/col.
+        centroid_y_px, centroid_x_px, area_px.
         m_position is optional (defaults to 0 when absent).
     max_displacement_px:
-        Maximum centroid displacement (Euclidean, pixels) between
-        consecutive frames for two objects to be linked as the same
-        track.  Objects farther apart start new tracks.
+        Maximum centroid displacement (Euclidean, pixels) between linked
+        detections.  Objects farther apart than this are not the same track.
     min_track_length:
-        Minimum number of consecutive frames a track must span to be
-        considered a valid tracked object.  Tracks shorter than this
-        threshold receive track_id = None and track_validation = None.
+        Minimum number of frames a track must span to be kept.  Shorter tracks
+        receive track_id = None and track_validation = None.
     min_circularity:
-        Objects whose circularity (4π·area/perimeter²) is below this
-        value are excluded from tracking.  Range 0–1; default 0.0
-        disables the filter.
+        Objects whose circularity (4π·area/perimeter²) is below this value are
+        excluded from tracking.  Range 0–1; default 0.0 disables the filter.
     max_eccentricity:
         Objects whose eccentricity exceeds this value are excluded from
         tracking.  Range 0–1; default 1.0 disables the filter.
+    max_size_diff_frac:
+        Maximum fractional change in object area between linked detections,
+        measured as ``|area_a - area_b| / max(area_a, area_b)`` (range 0–1).
+        Detections whose size changes by more than this are not linked.
+        1.0 disables the size gate.
+    max_frame_gap:
+        Number of consecutive missed frames a track may bridge before it is
+        retired.  0 = the track must be re-detected in the very next frame;
+        2 = it may skip up to two frames and re-link afterwards.
+    method:
+        Tracking method — ``METHOD_CENTROID`` (default) or ``METHOD_SERIALTRACK``.
+    st_mode:
+        SerialTrack mode, ``"Incremental"`` (link each frame to the previous) or
+        ``"Cumulative"`` (link every frame to the first).  Ignored for the
+        centroid method.
+    st_n_neighbors:
+        SerialTrack topology-descriptor neighbor count (``n_neighbors_max``).
+        Ignored for the centroid method.
+    ct_n_neighbors:
+        CellTracker topology-Hungarian neighbor count for the rotation-invariant
+        descriptor.  Used only by ``METHOD_CT_TOPOLOGY``.
+    ct_topo_weight:
+        CellTracker topology cost weight (0–1) blended with raw distance.  Used
+        only by ``METHOD_CT_TOPOLOGY``.
+    ct_area_weight:
+        CellTracker fingerprint area-similarity weight (0–1) vs. distance.  Used
+        only by ``METHOD_CT_FINGERPRINT``.
+    ct_max_gap:
+        CellTracker fingerprint gap-filling budget — frames a track may vanish
+        and still re-link.  Used only by ``METHOD_CT_FINGERPRINT``.
 
     Returns
     -------
@@ -61,6 +122,7 @@ def link_objects(
                                     else None
     """
     min_track_length = max(1, int(min_track_length))
+    max_frame_gap = max(0, int(max_frame_gap))
 
     # ── Initialise all rows ───────────────────────────────────────────────────
     for r in rows:
@@ -95,7 +157,22 @@ def link_objects(
     _next_track_id = [1]  # mutable counter shared across groups
 
     for group_rows in groups.values():
-        _link_group(group_rows, max_displacement_px, _next_track_id)
+        if method == METHOD_SERIALTRACK:
+            _link_group_serialtrack(
+                group_rows, max_displacement_px, st_mode, st_n_neighbors,
+                _next_track_id,
+            )
+        elif method in (METHOD_CT_TOPOLOGY, METHOD_CT_FINGERPRINT):
+            _link_group_celltracker(
+                group_rows, method, max_displacement_px,
+                ct_n_neighbors, ct_topo_weight, ct_area_weight, ct_max_gap,
+                _next_track_id,
+            )
+        else:
+            _link_group(
+                group_rows, max_displacement_px, max_size_diff_frac,
+                max_frame_gap, _next_track_id,
+            )
 
     # ── Promote track_length and track_validation ─────────────────────────────
     track_frames: Dict[int, int] = defaultdict(int)
@@ -119,14 +196,69 @@ def link_objects(
     return rows
 
 
+def link_objects_with_params(
+    rows: List[Dict[str, Any]],
+    params: Dict[str, Any],
+    pixel_size_um: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Run :func:`link_objects` from a "Track Objects" node param dict.
+
+    Translates the node's user-facing knobs into :func:`link_objects` arguments,
+    converting a µm distance threshold to pixels via *pixel_size_um* when
+    available.  Knobs:
+
+    * shared — ``method``, ``max_distance`` with ``distance_unit`` of pixels/µm
+      (becomes ``max_displacement_px``; SerialTrack and the CellTracker linkers
+      use it as the field of search / max link distance), ``min_track_length``.
+    * centroid only — ``max_size_diff``, ``max_frame_gap``.
+    * SerialTrack only — ``st_mode``, ``st_n_neighbors``.
+    * Cell-Tracker topology only — ``ct_n_neighbors``, ``ct_topo_weight``.
+    * Cell-Tracker fingerprint only — ``ct_area_weight``, ``ct_max_gap``.
+
+    Params that don't apply to the chosen method are passed through to
+    :func:`link_objects` but ignored by the active code path.
+    """
+    params = params or {}
+    max_distance = float(params.get("max_distance", 100.0))
+    unit = str(params.get("distance_unit", "pixels"))
+    if unit == "µm" and pixel_size_um:
+        max_distance = max_distance / float(pixel_size_um)
+    return link_objects(
+        rows,
+        max_displacement_px=max_distance,
+        min_track_length=int(params.get("min_track_length", 2)),
+        max_size_diff_frac=float(params.get("max_size_diff", 1.0)),
+        max_frame_gap=int(params.get("max_frame_gap", 0)),
+        method=str(params.get("method", METHOD_CENTROID)),
+        st_mode=str(params.get("st_mode", "Incremental")),
+        st_n_neighbors=int(params.get("st_n_neighbors", 25)),
+        ct_n_neighbors=int(params.get("ct_n_neighbors", 5)),
+        ct_topo_weight=float(params.get("ct_topo_weight", 0.3)),
+        ct_area_weight=float(params.get("ct_area_weight", 0.3)),
+        ct_max_gap=int(params.get("ct_max_gap", 3)),
+    )
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+# active[track_id] layout: (cy, cx, area, last_frame)
+_Active = Tuple[float, float, float, int]
+
 
 def _link_group(
     group_rows: List[Dict[str, Any]],
     max_displacement_px: float,
+    max_size_diff_frac: float,
+    max_frame_gap: int,
     next_id: List[int],
 ) -> None:
-    """Link objects within a single (channel, m_position) group."""
+    """Link objects within a single (channel, m_position) group.
+
+    Walks the detected frames in order.  Each track keeps its *last matched*
+    centroid + area + frame, so the reference moves with the object.  A track
+    not re-detected this frame is carried forward (up to ``max_frame_gap``
+    missed frames) instead of being dropped, which lets it re-link across a gap.
+    """
     frames: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for r in group_rows:
         frames[int(r.get("frame", 0))].append(r)
@@ -136,72 +268,222 @@ def _link_group(
         return
 
     # Seed first frame with fresh track IDs.
+    active: Dict[int, _Active] = {}
     for r in frames[sorted_frames[0]]:
         r["track_id"] = next_id[0]
+        active[next_id[0]] = (_cy(r), _cx(r), _area(r), sorted_frames[0])
         next_id[0] += 1
 
-    # Track last-known centroid + bbox per active track_id.
-    # Tuple layout: (cy, cx, bbox_min_row, bbox_max_row, bbox_min_col, bbox_max_col)
-    active: Dict[int, Tuple[float, float, float, float, float, float]] = {
-        r["track_id"]: (_cy(r), _cx(r), *_bbox(r))
-        for r in frames[sorted_frames[0]]
-    }
-
-    for i in range(1, len(sorted_frames)):
-        curr_rows = frames[sorted_frames[i]]
+    for fr in sorted_frames[1:]:
+        curr_rows = frames[fr]
         if not curr_rows:
             continue
 
-        prev_track_ids = list(active.keys())
+        # Retire tracks that have now exceeded the allowed gap.
+        active = {
+            tid: v for tid, v in active.items()
+            if (fr - v[3] - 1) <= max_frame_gap
+        }
 
+        prev_track_ids = list(active.keys())
         if not prev_track_ids:
             for r in curr_rows:
                 r["track_id"] = next_id[0]
+                active[next_id[0]] = (_cy(r), _cx(r), _area(r), fr)
                 next_id[0] += 1
-                active[r["track_id"]] = (_cy(r), _cx(r), *_bbox(r))
             continue
 
-        # Build cost matrix (prev_tracks × curr_objects).
+        # Cost = Euclidean centroid distance, gated by distance + size change.
         prev_vals = [active[tid] for tid in prev_track_ids]
         prev_centroids = np.array([[v[0], v[1]] for v in prev_vals], dtype=np.float64)
-        prev_bboxes    = np.array([[v[2], v[3], v[4], v[5]] for v in prev_vals], dtype=np.float64)
+        prev_areas = np.array([v[2] for v in prev_vals], dtype=np.float64)
         curr_centroids = np.array([(_cy(r), _cx(r)) for r in curr_rows], dtype=np.float64)
-        curr_bboxes    = np.array([_bbox(r) for r in curr_rows], dtype=np.float64)
+        curr_areas = np.array([_area(r) for r in curr_rows], dtype=np.float64)
 
-        # Euclidean pairwise distance matrix.
         diff = prev_centroids[:, None, :] - curr_centroids[None, :, :]  # (P, C, 2)
         cost = np.sqrt((diff ** 2).sum(axis=2))                          # (P, C)
 
-        # Two detections whose bounding boxes do not spatially overlap cannot
-        # be the same physical object — block them by exceeding the threshold.
-        no_overlap = ~(
-            (prev_bboxes[:, None, 0] < curr_bboxes[None, :, 1])    # prev r0 < curr r1
-            & (prev_bboxes[:, None, 1] > curr_bboxes[None, :, 0])  # prev r1 > curr r0
-            & (prev_bboxes[:, None, 2] < curr_bboxes[None, :, 3])  # prev c0 < curr c1
-            & (prev_bboxes[:, None, 3] > curr_bboxes[None, :, 2])  # prev c1 > curr c0
-        )
-        cost[no_overlap] = max_displacement_px + 1.0
+        # Size-difference gate: |Δarea| / max(area) must stay within the
+        # threshold, else the pair cannot be the same object.
+        area_diff = np.abs(prev_areas[:, None] - curr_areas[None, :])
+        area_max = np.maximum.outer(prev_areas, curr_areas)
+        area_max[area_max <= 0.0] = 1.0
+        size_diff = area_diff / area_max
+        blocked = size_diff > max_size_diff_frac
+        cost[blocked] = max_displacement_px + 1.0
 
         row_ind, col_ind = linear_sum_assignment(cost)
 
         matched_curr: set = set()
-        new_active: Dict[int, Tuple[float, float, float, float, float, float]] = {}
-
         for ri, ci in zip(row_ind, col_ind):
             if cost[ri, ci] <= max_displacement_px:
                 tid = prev_track_ids[ri]
                 curr_rows[ci]["track_id"] = tid
-                new_active[tid] = (_cy(curr_rows[ci]), _cx(curr_rows[ci]), *_bbox(curr_rows[ci]))
+                active[tid] = (_cy(curr_rows[ci]), _cx(curr_rows[ci]),
+                               _area(curr_rows[ci]), fr)
                 matched_curr.add(ci)
 
-        # Unmatched current objects start new tracks.
+        # Unmatched current objects start new tracks.  Unmatched *previous*
+        # tracks stay in `active` with their old last_frame, so they remain
+        # eligible to re-link until the gap budget runs out.
         for ci, r in enumerate(curr_rows):
             if ci not in matched_curr:
                 r["track_id"] = next_id[0]
+                active[next_id[0]] = (_cy(r), _cx(r), _area(r), fr)
                 next_id[0] += 1
-                new_active[r["track_id"]] = (_cy(r), _cx(r), *_bbox(r))
 
-        active = new_active
+
+def _link_group_serialtrack(
+    group_rows: List[Dict[str, Any]],
+    f_o_s: float,
+    mode_str: str,
+    n_neighbors_max: int,
+    next_id: List[int],
+) -> None:
+    """Link objects within one (channel, m_position) group via SerialTrack.
+
+    The object centroids are fed to SerialTrack's ``track_coordinates`` path as
+    pre-detected particles (no image re-detection).  ``f_o_s`` is the field of
+    search (max neighbor radius, px) — the node's "Max distance" knob.  Each
+    detection's resulting track id is chained from the per-frame ``track_b2a``
+    index maps; ``min_track_length`` filtering happens in the caller's post-pass.
+
+    The SerialTrack library (numba JIT) is imported lazily so a missing optional
+    dependency surfaces only for this method and is caught by the node handlers.
+    """
+    from nd2studios.backend.serialtrack.config import (
+        DetectionConfig, TrackingConfig, TrackingMode,
+    )
+    from nd2studios.backend.serialtrack.tracking import SerialTracker
+
+    # Group by frame, keep only frames that actually have detections, in order.
+    frames: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for r in group_rows:
+        frames[int(r.get("frame", 0))].append(r)
+    sorted_frames = [f for f in sorted(frames.keys()) if frames[f]]
+    if len(sorted_frames) < 2:
+        return  # nothing to link (mirrors _link_group's early-out)
+
+    # coords_list[i] aligns row-for-row with row_refs[i] (same object order).
+    coords_list: List[np.ndarray] = []
+    row_refs: List[List[Dict[str, Any]]] = []
+    for fr in sorted_frames:
+        rows_f = frames[fr]
+        coords_list.append(
+            np.array([[_cy(r), _cx(r)] for r in rows_f], dtype=np.float64)
+        )
+        row_refs.append(rows_f)
+
+    mode = (TrackingMode.CUMULATIVE if mode_str == "Cumulative"
+            else TrackingMode.INCREMENTAL)
+    trk = TrackingConfig(
+        mode=mode,
+        f_o_s=float(f_o_s),
+        n_neighbors_max=max(2, int(n_neighbors_max)),
+        strain_n_neighbors=0,      # skip per-frame strain (not needed for ids)
+        use_prev_results=False,    # avoid the lazy sklearn POD-GPR path
+    )
+    session = SerialTracker(DetectionConfig(), trk).track_coordinates(coords_list)
+
+    # Seed the reference (first) frame with fresh ids, then chain forward.
+    ids_per_frame: List[List[int]] = [[] for _ in row_refs]
+    for r in row_refs[0]:
+        r["track_id"] = next_id[0]
+        ids_per_frame[0].append(next_id[0])
+        next_id[0] += 1
+
+    for k, res in enumerate(session.frame_results):
+        # res is the pair whose B is coords_list[k + 1].
+        prev_ids = ids_per_frame[0] if mode == TrackingMode.CUMULATIVE \
+            else ids_per_frame[k]
+        t_b2a = np.asarray(res.track_b2a)
+        b_rows = row_refs[k + 1]
+        b_ids: List[int] = []
+        for j, rrow in enumerate(b_rows):
+            a = int(t_b2a[j]) if j < len(t_b2a) else -1
+            if 0 <= a < len(prev_ids):
+                tid = prev_ids[a]
+            else:                       # appeared / untracked → new track
+                tid = next_id[0]
+                next_id[0] += 1
+            rrow["track_id"] = tid
+            b_ids.append(tid)
+        ids_per_frame[k + 1] = b_ids
+
+
+def _link_group_celltracker(
+    group_rows: List[Dict[str, Any]],
+    method: str,
+    max_displacement_px: float,
+    ct_n_neighbors: int,
+    ct_topo_weight: float,
+    ct_area_weight: float,
+    ct_max_gap: int,
+    next_id: List[int],
+) -> None:
+    """Link objects within one (channel, m_position) group via CellTracker.
+
+    Bridges ND2Studios' row-dicts to CellTracker's DataFrame convention: each row
+    becomes a (``frame``, ``label``, ``centroid_y``, ``centroid_x``, ``area``)
+    record (``label`` = the per-frame ``label_id``), the chosen vendored linker
+    runs, and the resulting per-call ``track_id`` (1-based) is remapped onto the
+    shared global ``next_id`` counter so ids never collide across groups.  The
+    caller's post-pass handles ``track_length`` / ``min_track_length``.
+
+    pandas / CellTracker are imported lazily so a missing optional dependency
+    surfaces only for these methods and is caught by the node handlers.
+    """
+    import pandas as pd
+
+    from nd2studios.backend.celltracker.tracking import (
+        track_fingerprint, track_timeseries,
+    )
+
+    # Build the DataFrame; keep a parallel handle from (frame, label) back to the
+    # originating row so the assigned id can be written in place.
+    records: List[Dict[str, Any]] = []
+    row_by_key: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for r in group_rows:
+        fr = int(r.get("frame", 0))
+        lbl = int(r.get("label_id", 0))
+        records.append({
+            "frame": fr,
+            "label": lbl,
+            "centroid_y": _cy(r),
+            "centroid_x": _cx(r),
+            "area": _area(r),
+        })
+        row_by_key[(fr, lbl)] = r
+
+    df = pd.DataFrame(records)
+    if df.empty or df["frame"].nunique() < 2:
+        return  # nothing to link (mirrors _link_group's early-out)
+
+    if method == METHOD_CT_FINGERPRINT:
+        tracked = track_fingerprint(
+            df, max_dist=float(max_displacement_px),
+            area_weight=float(ct_area_weight), max_gap=max(0, int(ct_max_gap)),
+        )
+    else:  # METHOD_CT_TOPOLOGY
+        tracked = track_timeseries(
+            df, max_dist=float(max_displacement_px),
+            n_neighbors=max(1, int(ct_n_neighbors)),
+            use_topology=True, topo_weight=float(ct_topo_weight),
+        )
+
+    # Remap local (per-call) track ids to the shared global counter, skipping the
+    # -1 "unassigned" sentinel, then write onto the originating rows.
+    local_to_global: Dict[int, int] = {}
+    for rec in tracked.itertuples(index=False):
+        local = int(getattr(rec, "track_id"))
+        if local < 0:
+            continue
+        if local not in local_to_global:
+            local_to_global[local] = next_id[0]
+            next_id[0] += 1
+        row = row_by_key.get((int(rec.frame), int(rec.label)))
+        if row is not None:
+            row["track_id"] = local_to_global[local]
 
 
 def _cy(row: Dict[str, Any]) -> float:
@@ -212,20 +494,6 @@ def _cx(row: Dict[str, Any]) -> float:
     return float(row.get("centroid_x_px") or 0.0)
 
 
-def _bbox(row: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    """Return (min_row, max_row, min_col, max_col) from a measurement row.
-
-    Degenerate bboxes (height or width ≤ 0) are expanded to a 1-px region
-    centred on the centroid so the overlap check never blocks a valid link.
-    """
-    r0 = float(row.get("bbox_min_row") or 0.0)
-    r1 = float(row.get("bbox_max_row") or 0.0)
-    c0 = float(row.get("bbox_min_col") or 0.0)
-    c1 = float(row.get("bbox_max_col") or 0.0)
-    if r1 <= r0:
-        cy = _cy(row)
-        r0, r1 = cy - 0.5, cy + 0.5
-    if c1 <= c0:
-        cx = _cx(row)
-        c0, c1 = cx - 0.5, cx + 0.5
-    return r0, r1, c0, c1
+def _area(row: Dict[str, Any]) -> float:
+    """Object area in pixels, used by the size-difference gate (0 if absent)."""
+    return float(row.get("area_px") or 0.0)

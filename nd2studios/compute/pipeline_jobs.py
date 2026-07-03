@@ -157,10 +157,17 @@ class PipelineCommitJob(AnalysisJob):
     def run(self, progress: ProgressReporter) -> AnalysisResult:
         pipeline = self._pipeline_cls()
         progress.update(0.0, f"Running {pipeline.name}")
+        # Inject the per-frame streaming callback so plane_runner emits each
+        # finished frame's labels to the GUI for a live overlay (tagged with this
+        # job's multipoint index). Pipelines pick it up via make_frame_cb(params).
+        params = dict(self._params)
+        params["_frame_cb"] = (
+            lambda t, lbl, _m=self.m_index: progress.report_frame(_m, t, lbl)
+        )
         result = pipeline.run(
             self._channels,
             self._metadata,
-            self._params,
+            params,
             progress_cb=progress.as_pipeline_progress_cb(),
             cancelled_cb=self.token.is_cancelled,
         )

@@ -30,6 +30,8 @@ from __future__ import annotations
 import copy
 import csv
 import os
+import shutil
+import tempfile
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
@@ -77,6 +79,7 @@ from nd2studios.compute import (
 from nd2studios.core.analysis_registry import AnalysisPipeline, AnalysisResult
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.collapsible_sidebar import CollapsibleSidebar
 from nd2studios.widgets.common import ParamEditor
 from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
 
@@ -122,6 +125,9 @@ class AnalysisPage(QWidget):
         self._current_run_m: int = 0
         self._run_pipeline_cls = None
         self._run_params: Dict[str, Any] = {}
+        # V1.46 — temp scratch dir for streamed label masks (per run), removed
+        # at finalize once commit_m has copied them into the workspace.
+        self._stream_scratch: Optional[str] = None
 
         # Screening state (single-frame preview). _screen_frame /
         # _screen_m are also embedded in each preview job's ``tag`` so
@@ -551,7 +557,10 @@ class AnalysisPage(QWidget):
 
         left_layout.addWidget(self._results_widget, stretch=1)
 
-        main_splitter.addWidget(left)
+        # V1.44 — collapsible left panel, matching the right LUT sidebar.
+        self._left_sidebar = CollapsibleSidebar(
+            left, side="left", title="Analysis", expanded_width=380)
+        main_splitter.addWidget(self._left_sidebar)
 
         # ── Right panel: live MultiAxisViewer ────────────────────────────────
         right = QWidget()
@@ -637,6 +646,7 @@ class AnalysisPage(QWidget):
                 z_mode=exp.z_view_mode or "max",
                 z_index=exp.z_view_index,
                 m=exp.m_index, t=0, z=exp.z_view_index,
+                stage_xy_um=(getattr(exp, "nd2_metadata", {}) or {}).get("stage_xy_um"),
             )
         elif exp._processed_channels:
             self.viewer.set_channels(
@@ -650,6 +660,7 @@ class AnalysisPage(QWidget):
                 z_mode=exp.z_view_mode or "max",
                 z_index=exp.z_view_index,
                 m=exp.m_index, t=0, z=exp.z_view_index,
+                stage_xy_um=(getattr(exp, "nd2_metadata", {}) or {}).get("stage_xy_um"),
             )
         elif channels:
             self.viewer.set_channels(channels, channel_display=exp.channel_display)
@@ -884,17 +895,20 @@ class AnalysisPage(QWidget):
         if vol is not None:
             z_mode = getattr(exp, "z_view_mode", None) or "max"
             z_index = int(getattr(exp, "z_view_index", None) or 0)
+            # V1.46 — keep channels LAZY (no .materialize()); the pipeline reads
+            # frames on demand. When a recipe is committed, _apply_recipe_to_channels
+            # materializes only the channel(s) it processes.
             for c_idx, ch_name in enumerate(vol.channel_names):
                 if ch_name == selected_ch:
                     channels[ch_name] = vol.to_lazy_channel(
                         c_idx, m=m, z_mode=z_mode, z_index=z_index
-                    ).materialize()
+                    )
                     break
             if not channels:
                 channels = {
                     ch_name: vol.to_lazy_channel(
                         c_idx, m=m, z_mode=z_mode, z_index=z_index
-                    ).materialize()
+                    )
                     for c_idx, ch_name in enumerate(vol.channel_names)
                 }
             # Apply committed recipe so analysis runs on processed data,
@@ -907,6 +921,41 @@ class AnalysisPage(QWidget):
             if not channels:
                 channels = {k: np.asarray(v) for k, v in channels_raw.items()}
         return channels or None
+
+    def _maybe_inject_label_streaming(
+        self, params: Dict[str, Any], exp: "ND2StudiosRecord", m: int,
+    ) -> None:
+        """Inject the reserved streaming params when the run should stream.
+
+        Decided adaptively from the dataset type (lazy → stream) and memory
+        pressure. Masks go to a per-run temp scratch; the commit step copies
+        them into the workspace and the scratch is removed at finalize.
+        """
+        from nd2studios.utils.resource_strategy import should_stream_analysis
+        from nd2studios.pipeline.storage import LabelStackWriter
+        try:
+            from nd2studios.core.memory_monitor import global_monitor
+            monitor = global_monitor()
+        except Exception:  # noqa: BLE001
+            monitor = None
+
+        # Per-pipeline opt-out for whole-stack pipelines.
+        force = False if getattr(self._run_pipeline_cls, "needs_full_stack", False) else None
+        vol = getattr(exp, "_raw_volume", None)
+        if not should_stream_analysis(vol, monitor=monitor, force=force):
+            return
+
+        if self._stream_scratch is None:
+            self._stream_scratch = tempfile.mkdtemp(prefix="nd2s_labels_")
+        scratch = self._stream_scratch
+
+        def _sink_factory(name: str, shape):
+            safe = "".join(c if c.isalnum() else "_" for c in str(name))
+            base = os.path.join(scratch, f"m{m:03d}_{safe}")
+            return LabelStackWriter(base, shape)
+
+        params["_stream_labels"] = True
+        params["_label_sink_factory"] = _sink_factory
 
     def _start_next_m_run(self) -> None:
         """Pop the next M position from the queue and submit a commit job."""
@@ -944,6 +993,12 @@ class AnalysisPage(QWidget):
             )
             params_for_job["tiled_masks"] = list(self._tiled_masks)
 
+        # V1.46 — adaptive streaming: when the dataset is lazy (or memory
+        # pressure is high), stream the pipeline's label masks to a disk scratch
+        # so a memory-constrained machine doesn't hold the whole stack. The
+        # commit step then copies them into the workspace frame-by-frame.
+        self._maybe_inject_label_streaming(params_for_job, exp, m)
+
         # V1.37 Phase 5 — replaces the legacy AnalysisWorker QThread.
         # The runner coalesces by key, so submitting a new commit while
         # one is in flight cancels the predecessor (used by the Cancel
@@ -968,6 +1023,7 @@ class AnalysisPage(QWidget):
         self._run_queue.clear()
         if self._runner is not None:
             self._runner.cancel(_COMMIT_KEY)
+        self._clear_stream_scratch()
         self._set_idle("Cancelled.")
 
     def _on_status(self, msg: str) -> None:
@@ -1030,11 +1086,19 @@ class AnalysisPage(QWidget):
         pipeline_name = self.combo_pipeline.currentText()
         stage = self.main_window.analysis_stage(pipeline_name)
         if stage is None:
+            self._clear_stream_scratch()
             return
         try:
             stage.commit()
         except OSError:
             pass
+        # Masks have been copied into the workspace by commit_m — drop scratch.
+        self._clear_stream_scratch()
+
+    def _clear_stream_scratch(self) -> None:
+        if self._stream_scratch:
+            shutil.rmtree(self._stream_scratch, ignore_errors=True)
+            self._stream_scratch = None
 
     def _on_error(self, msg: str) -> None:
         self._set_idle("Error.")
@@ -1715,6 +1779,7 @@ class AnalysisPage(QWidget):
                     result.label_masks[ch][frame_idx],
                     alpha=result.overlay_alpha,
                     color=result.overlay_color,
+                    outline=result.overlay_outline,
                 )
                 for sec_mask in result.secondary_label_masks.values():
                     if sec_mask.shape[0] > frame_idx:
@@ -1736,6 +1801,7 @@ class AnalysisPage(QWidget):
                     result.label_masks[ch][t],
                     alpha=result.overlay_alpha,
                     color=result.overlay_color,
+                    outline=result.overlay_outline,
                 )
                 for sec_mask in result.secondary_label_masks.values():
                     if t < sec_mask.shape[0]:
@@ -1924,6 +1990,7 @@ class AnalysisPage(QWidget):
                 z_mode=exp.z_view_mode or "max",
                 z_index=exp.z_view_index,
                 m=exp.m_index, t=0, z=exp.z_view_index,
+                stage_xy_um=(getattr(exp, "nd2_metadata", {}) or {}).get("stage_xy_um"),
             )
         elif exp._processed_channels:
             self.viewer.set_channels(
@@ -1937,6 +2004,7 @@ class AnalysisPage(QWidget):
                 z_mode=exp.z_view_mode or "max",
                 z_index=exp.z_view_index,
                 m=exp.m_index, t=0, z=exp.z_view_index,
+                stage_xy_um=(getattr(exp, "nd2_metadata", {}) or {}).get("stage_xy_um"),
             )
         elif channels:
             self.viewer.set_channels(channels, channel_display=exp.channel_display)
@@ -2033,28 +2101,62 @@ def _apply_recipe_to_channels(
     return {name: enhanced.materialize_channel(name) for name in channels}
 
 
+def _thicken(boundaries: np.ndarray, thickness: int) -> np.ndarray:
+    """Dilate a boolean boundary mask so outlines render ``thickness`` px wide."""
+    if thickness is None or int(thickness) <= 1 or not boundaries.any():
+        return boundaries
+    from scipy.ndimage import binary_dilation
+    return binary_dilation(boundaries, iterations=int(thickness) - 1)
+
+
 def _overlay_labels(
     rgb: np.ndarray,
     mask: np.ndarray,
     alpha: float = 0.45,
     color: Optional[tuple] = None,
+    outline: bool = False,
+    thickness: int = 1,
 ) -> np.ndarray:
     """Blend integer label mask onto an RGB image.
 
     When *color* is given, every non-zero label is painted that single (R,G,B)
     color (binary-mask style).  Otherwise each label cycles through the palette.
     Label 0 is background and is always left transparent.
+
+    When *outline* is True, only each object's boundary pixels are painted (via
+    ``skimage.segmentation.find_boundaries``), so cells render as outlines rather
+    than filled regions; *thickness* (≥1) widens the outline.
     """
     h, w = rgb.shape[:2]
     if mask.shape != (h, w):
         mask = sk_resize(mask, (h, w), order=0, preserve_range=True, anti_aliasing=False).astype(np.int32)
     result = rgb.astype(np.float32)
+
+    # Single-colour outline (e.g. StarDist's red): paint ALL boundary pixels in
+    # the one colour, exactly like CellTracker (find_boundaries mode="outer",
+    # drawn directly — no per-label attribution).
+    if outline and color is not None:
+        from skimage.segmentation import find_boundaries
+        bmask = _thicken(find_boundaries(mask, mode="outer"), thickness)
+        if bmask.any():
+            for c_idx, c_val in enumerate(color):
+                result[bmask, c_idx] = (1 - alpha) * result[bmask, c_idx] + alpha * c_val
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    # Per-label fill, or per-label palette outline. For outlines use mode="inner"
+    # so the boundary pixels are object-side and can be attributed per label.
+    boundaries = None
+    if outline:
+        from skimage.segmentation import find_boundaries
+        boundaries = _thicken(find_boundaries(mask, mode="inner"), thickness)
     unique_labels = np.unique(mask)
     for label_id in unique_labels:
         if label_id == 0:
             continue
         c = color if color is not None else _LABEL_PALETTE[(int(label_id) - 1) % len(_LABEL_PALETTE)]
-        region = mask == label_id
+        region = (mask == label_id)
+        if boundaries is not None:
+            region = region & boundaries
         for c_idx, c_val in enumerate(c):
             result[region, c_idx] = (1 - alpha) * result[region, c_idx] + alpha * c_val
     return np.clip(result, 0, 255).astype(np.uint8)

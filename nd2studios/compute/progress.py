@@ -33,6 +33,9 @@ class ProgressReporter(QObject):
 
     # job_key, fraction in [0.0, 1.0], optional status message
     progress = Signal(str, float, str)
+    # job_key, m_index, t (frame), labels (2-D int array) — per-frame streaming so
+    # the GUI can paint the overlay live as each frame finishes.
+    frame = Signal(str, int, int, object)
 
     def __init__(self, key: str) -> None:
         super().__init__()
@@ -41,6 +44,10 @@ class ProgressReporter(QObject):
     @property
     def key(self) -> str:
         return self._key
+
+    def report_frame(self, m: int, t: int, labels) -> None:
+        """Emit one finished frame's labels (``(m, t, labels)``) for live overlay."""
+        self.frame.emit(self._key, int(m), int(t), labels)
 
     def update(self, fraction: float, message: str = "") -> None:
         """Report progress in ``[0.0, 1.0]`` plus an optional message.

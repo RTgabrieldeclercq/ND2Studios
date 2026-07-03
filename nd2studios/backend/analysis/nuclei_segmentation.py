@@ -15,6 +15,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
+from nd2studios.backend.analysis.plane_runner import (
+    make_frame_cb, make_label_writers, run_planes_to_labels,
+)
+from nd2studios.backend.analysis.source_utils import (
+    filter_and_relabel, read_plane, source_shape,
+)
 from nd2studios.core.analysis_registry import AnalysisPipeline, AnalysisResult
 from nd2studios.core.plugin_registry import ParamSpec
 
@@ -101,10 +107,9 @@ class NucleiSegmentationPipeline(AnalysisPipeline):
         if channel_name not in channels:
             channel_name = next(iter(channels))
 
-        volume: np.ndarray = channels[channel_name]
-        if volume.ndim == 2:
-            volume = volume[np.newaxis]          # treat single frame as T=1
-        T, H, W = volume.shape
+        # V1.46 — keep the source lazy; read one frame at a time.
+        source = channels[channel_name]
+        T, H, W = source_shape(source)
 
         pixel_size_um: float = float(metadata.get("pixel_size_um", 1.0))
 
@@ -120,14 +125,8 @@ class NucleiSegmentationPipeline(AnalysisPipeline):
 
         model = models.Cellpose(model_type=model_type, gpu=use_gpu)
 
-        label_stack = np.zeros((T, H, W), dtype=np.int32)
-        measurements: List[Dict[str, Any]] = []
-
-        for t in range(T):
-            if cancelled_cb and cancelled_cb():
-                break
-
-            frame = volume[t].astype(np.float32)
+        def _per_frame(t: int):
+            frame = read_plane(source, t).astype(np.float32)
 
             # Percentile normalization to [0, 1] — standard for fluorescence
             lo = float(np.percentile(frame, 1.0))
@@ -145,18 +144,13 @@ class NucleiSegmentationPipeline(AnalysisPipeline):
             )
             mask: np.ndarray = masks_list[0].astype(np.int32)
 
-            # Area filtering
-            intensity_img = volume[t].astype(np.float32)
-            for region in regionprops(mask, intensity_image=intensity_img):
-                if region.area < min_area or region.area > max_area:
-                    mask[mask == region.label] = 0
-            mask = _relabel_contiguous(mask)
-            label_stack[t] = mask
+            # Area filter + contiguous relabel in one O(pixels) pass.
+            mask = filter_and_relabel(mask, min_area, max_area)
 
-            # Per-object measurements
-            for region in regionprops(mask, intensity_image=intensity_img):
+            rows: List[Dict[str, Any]] = []
+            for region in regionprops(mask, intensity_image=frame):
                 cy, cx = region.centroid
-                measurements.append({
+                rows.append({
                     "frame": t,
                     "label_id": int(region.label),
                     "area_px": float(region.area),
@@ -165,9 +159,18 @@ class NucleiSegmentationPipeline(AnalysisPipeline):
                     "centroid_x": float(cx),
                     "mean_intensity": float(region.mean_intensity),
                 })
+            return mask, rows, None
 
-            if progress_cb:
-                progress_cb(int((t + 1) / T * 100))
+        primary_writer, _ = make_label_writers(params, channel_name, (T, H, W))
+        # Cellpose's model is not thread-safe → sequential (n_workers=1);
+        # streaming still bounds RAM to one frame + the mask sink.
+        out = run_planes_to_labels(
+            n_frames=T, height=H, width=W, per_frame_fn=_per_frame,
+            primary_writer=primary_writer, n_workers=1,
+            progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+            frame_cb=make_frame_cb(params),
+        )
+        measurements = out.measurements
 
         areas = [m["area_px"] for m in measurements]
         summary: Dict[str, Any] = {
@@ -180,19 +183,7 @@ class NucleiSegmentationPipeline(AnalysisPipeline):
         }
 
         return AnalysisResult(
-            label_masks={channel_name: label_stack},
+            label_masks={channel_name: out.primary},
             measurements=measurements,
             summary=summary,
         )
-
-
-def _relabel_contiguous(mask: np.ndarray) -> np.ndarray:
-    """Re-index integer mask so label IDs are contiguous from 1."""
-    out = np.zeros_like(mask)
-    new_id = 1
-    for old_id in np.unique(mask):
-        if old_id == 0:
-            continue
-        out[mask == old_id] = new_id
-        new_id += 1
-    return out

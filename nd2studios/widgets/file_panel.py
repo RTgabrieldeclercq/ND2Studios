@@ -118,6 +118,7 @@ class FilePanel(QWidget):
         on_status: Optional[Callable[[str], None]] = None,
         on_confirm: Optional[Callable[["FilePanel"], None]] = None,
         on_stitch: Optional[Callable[["FilePanel"], None]] = None,
+        on_add_file: Optional[Callable[[], None]] = None,
         show_close_button: bool = True,
     ):
         super().__init__(parent)
@@ -132,6 +133,7 @@ class FilePanel(QWidget):
         self._cb_status = on_status
         self._cb_confirm = on_confirm
         self._cb_stitch = on_stitch
+        self._cb_add_file = on_add_file
         self._show_close = show_close_button
 
         self._build_ui()
@@ -230,6 +232,14 @@ class FilePanel(QWidget):
         )
         self.btn_reconstruct.clicked.connect(self._on_reconstruct)
         fl.addWidget(self.btn_reconstruct)
+        # V1.44 — "+ Add File" lives here (in the left controls) instead of a
+        # page-level toolbar. Opens another file in a side-by-side panel.
+        if self._cb_add_file is not None:
+            self.btn_add_file = QPushButton("+ Add File")
+            self.btn_add_file.setToolTip(
+                "Open another ND2 / TIFF file in a new side-by-side panel.")
+            self.btn_add_file.clicked.connect(lambda: self._cb_add_file())
+            fl.addWidget(self.btn_add_file)
         self.lbl_filepath = QLabel("No file loaded.")
         self.lbl_filepath.setWordWrap(True)
         self.lbl_filepath.setStyleSheet(

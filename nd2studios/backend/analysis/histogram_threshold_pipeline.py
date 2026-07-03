@@ -11,7 +11,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
-from nd2studios.compute.parallel.thread_map import thread_map_planes
+from nd2studios.backend.analysis.plane_runner import (
+    make_frame_cb, make_label_writers, run_planes_to_labels,
+)
+from nd2studios.backend.analysis.source_utils import read_plane, source_shape
 from nd2studios.core.analysis_registry import AnalysisPipeline, AnalysisResult
 from nd2studios.core.plugin_registry import ParamSpec
 
@@ -157,9 +160,10 @@ class HistogramThresholdPipeline(AnalysisPipeline):
         if not ch:
             raise ValueError("No channel available to analyse.")
 
-        stack: np.ndarray = np.asarray(channels[ch])  # (T, H, W)
-        if stack.ndim == 2:
-            stack = stack[np.newaxis]  # treat as single frame
+        # V1.46 — keep the source lazy; read one frame at a time so a
+        # streamed dataset never materializes the whole stack.
+        source = channels[ch]  # (T, H, W) ndarray OR lazy reader
+        T, H, W = source_shape(source)
 
         pixel_size_um: float = float(metadata.get("pixel_size_um", 0.0))
         voxel_size = (pixel_size_um, pixel_size_um) if pixel_size_um > 0 else None
@@ -167,42 +171,34 @@ class HistogramThresholdPipeline(AnalysisPipeline):
         cfg = self._build_config(params)
         seg = HistogramThresholdSegmenter(cfg)
 
-        def _run_frame(frame: np.ndarray):
+        def _per_frame(t: int):
+            frame = read_plane(source, t)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                return seg.run(frame, voxel_size=voxel_size)
+                result = seg.run(frame, voxel_size=voxel_size)
+            rows = [{
+                "frame": t,
+                "label_id": row["label_id"],
+                "area_px": row["area_px"],
+                "area_um2": row.get("area_um2", 0.0),
+                "centroid_y": row["centroid_y"],
+                "centroid_x": row["centroid_x"],
+                "mean_intensity": row["mean_intensity"],
+            } for row in result.regions]
+            return np.asarray(result.labels, dtype=np.int32), rows, None
 
-        _progress = (
-            (lambda done, total: progress_cb(int(done / total * 100)))
-            if progress_cb is not None else None
+        primary_writer, _ = make_label_writers(params, ch, (T, H, W))
+        out = run_planes_to_labels(
+            n_frames=T, height=H, width=W, per_frame_fn=_per_frame,
+            primary_writer=primary_writer,
+            progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+            frame_cb=make_frame_cb(params),
         )
 
-        label_stack = np.zeros(stack.shape, dtype=np.int32)
-        measurements: list[dict[str, Any]] = []
-
-        raw = thread_map_planes(
-            stack, _run_frame,
-            progress_cb=_progress,
-            cancelled_cb=cancelled_cb,
-        )
-        for t in sorted(raw):
-            result = raw[t]
-            label_stack[t] = result.labels
-            for row in result.regions:
-                measurements.append({
-                    "frame": t,
-                    "label_id": row["label_id"],
-                    "area_px": row["area_px"],
-                    "area_um2": row.get("area_um2", 0.0),
-                    "centroid_y": row["centroid_y"],
-                    "centroid_x": row["centroid_x"],
-                    "mean_intensity": row["mean_intensity"],
-                })
-
-        summary = _build_summary(measurements)
+        summary = _build_summary(out.measurements)
         return AnalysisResult(
-            label_masks={ch: label_stack},
-            measurements=measurements,
+            label_masks={ch: out.primary},
+            measurements=out.measurements,
             summary=summary,
         )
 

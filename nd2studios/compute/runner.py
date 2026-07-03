@@ -46,6 +46,7 @@ class _RunnerSignals(QObject):
     done = Signal(object)            # JobResult
     cancelled = Signal(str)          # key
     progress = Signal(str, float, str)
+    frame = Signal(str, int, int, object)  # key, m, t, labels
 
 
 class _Runnable(QRunnable):
@@ -105,6 +106,10 @@ class _Runnable(QRunnable):
                 self._progress.progress.disconnect()
             except (RuntimeError, TypeError):
                 pass
+            try:
+                self._progress.frame.disconnect()
+            except (RuntimeError, TypeError):
+                pass
 
 
 class JobRunner(QObject):
@@ -130,6 +135,7 @@ class JobRunner(QObject):
     job_done = Signal(object)             # JobResult
     job_cancelled = Signal(str)           # key
     job_progress = Signal(str, float, str)  # key, fraction, message
+    job_frame = Signal(str, int, int, object)  # key, m, t, labels (per-frame stream)
 
     def __init__(
         self,
@@ -148,6 +154,7 @@ class JobRunner(QObject):
         self._signals.done.connect(self.job_done)
         self._signals.cancelled.connect(self.job_cancelled)
         self._signals.progress.connect(self.job_progress)
+        self._signals.frame.connect(self.job_frame)
         self._active: Dict[str, AnalysisJob] = {}
         self._lock = RLock()
 
@@ -170,6 +177,7 @@ class JobRunner(QObject):
 
         progress = ProgressReporter(job.key)
         progress.progress.connect(self._signals.progress)
+        progress.frame.connect(self._signals.frame)
         runnable = _Runnable(job, self._signals, progress, self._finalize)
         self._pool.start(runnable)
 

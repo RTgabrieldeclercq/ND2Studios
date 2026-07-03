@@ -16,8 +16,9 @@ Export page — four tabs covering V1.0 outputs:
 """
 from __future__ import annotations
 
+import csv
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import Qt
@@ -30,6 +31,10 @@ from PySide6.QtWidgets import (
 
 from nd2studios.backend.exporters.composite_exporter import ImageAdjustments
 from nd2studios.backend.exporters.movie_exporter import MovieOptions
+from nd2studios.backend.results_engine import (
+    compute_measurements, export_label_masks_tiff, export_overlay_frames,
+)
+from nd2studios.core.analysis_registry import AnalysisResult
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.export_preview_dialog import ExportPreviewDialog
@@ -55,11 +60,15 @@ class ExportPage(QWidget):
         top_bar = QHBoxLayout()
         top_bar.addWidget(QLabel("Export type:"))
         self.combo_export_type = QComboBox()
-        self.combo_export_type.addItems(["Raw Image", "Processed Image", "Tracked Objects"])
+        self.combo_export_type.addItems(
+            ["Raw Image", "Processed Image", "Tracked Objects", "Pipeline Results"]
+        )
         self.combo_export_type.setToolTip(
             "Raw Image: export from the original ND2 data.\n"
             "Processed Image: export after the recipe pipeline is applied.\n"
-            "Tracked Objects: export per-object crops from the Results tracking workflow."
+            "Tracked Objects: export per-object crops from the Results tracking workflow.\n"
+            "Pipeline Results: export measurements / overlays / label masks from a\n"
+            "committed analysis result (Analysis or Pipelines tab)."
         )
         self.combo_export_type.currentIndexChanged.connect(self._on_export_type_changed)
         top_bar.addWidget(self.combo_export_type)
@@ -80,6 +89,7 @@ class ExportPage(QWidget):
         self._stacked.addWidget(self.tabs)
 
         self._stacked.addWidget(self._build_tracked_objects_panel())
+        self._stacked.addWidget(self._build_pipeline_results_panel())
         outer.addWidget(self._stacked, stretch=1)
 
     # ── Tab 1: TIFF stack ──
@@ -335,8 +345,15 @@ class ExportPage(QWidget):
         return w
 
     def _on_export_type_changed(self, index: int) -> None:
-        # 0 = Raw Image, 1 = Processed Image → image tabs; 2 = Tracked Objects → tracked panel.
-        self._stacked.setCurrentIndex(0 if index < 2 else 1)
+        # 0/1 = Raw/Processed Image → image tabs (0); 2 = Tracked Objects → tracked
+        # panel (1); 3 = Pipeline Results → results panel (2).
+        if index < 2:
+            self._stacked.setCurrentIndex(0)
+        elif index == 2:
+            self._stacked.setCurrentIndex(1)
+        else:
+            self._stacked.setCurrentIndex(2)
+            self._refresh_pipeline_results()
 
     def _refresh_tracked_pipelines(self) -> None:
         self.combo_tracked_pipeline.blockSignals(True)
@@ -432,6 +449,268 @@ class ExportPage(QWidget):
                 self.main_window.set_progress(0)
             QMessageBox.warning(self, "Export failed", str(e))
 
+    # ── Pipeline Results panel ──
+    def _build_pipeline_results_panel(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        info = QLabel(
+            "Export deliverables from a committed analysis result — the output of "
+            "an Analysis pipeline (Analysis tab) or the Pipelines tab's Analysis "
+            "sub-tab (Apply). Run & Apply a pipeline first to populate this list."
+        )
+        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        options = QGroupBox("Result")
+        form = QFormLayout(options)
+        self.combo_pipe_result = QComboBox()
+        self.combo_pipe_result.addItem("(no results)")
+        self.combo_pipe_result.currentIndexChanged.connect(self._refresh_pipe_summary)
+        form.addRow("Pipeline result", self.combo_pipe_result)
+
+        self.lbl_pipe_summary = QLabel("")
+        self.lbl_pipe_summary.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;"
+        )
+        form.addRow(self.lbl_pipe_summary)
+
+        self.combo_pipe_overlay_fmt = QComboBox()
+        self.combo_pipe_overlay_fmt.addItems(["tiff", "jpg"])
+        form.addRow("Overlay format", self.combo_pipe_overlay_fmt)
+        self.cb_pipe_scalebar = QCheckBox("Scale bar on overlay frames")
+        self.cb_pipe_scalebar.setChecked(True)
+        form.addRow(self.cb_pipe_scalebar)
+        layout.addWidget(options)
+
+        self.btn_pipe_csv = QPushButton("Export Measurements (CSV)…")
+        self.btn_pipe_csv.setObjectName("primaryBtn")
+        self.btn_pipe_csv.clicked.connect(self._on_export_pipe_measurements)
+        layout.addWidget(self.btn_pipe_csv)
+
+        self.btn_pipe_overlay = QPushButton("Export Overlay Frames…")
+        self.btn_pipe_overlay.clicked.connect(self._on_export_pipe_overlay)
+        layout.addWidget(self.btn_pipe_overlay)
+
+        self.btn_pipe_masks = QPushButton("Export Label Masks (TIFF)…")
+        self.btn_pipe_masks.clicked.connect(self._on_export_pipe_masks)
+        layout.addWidget(self.btn_pipe_masks)
+
+        layout.addStretch(1)
+        return w
+
+    def _committed_result_names(self, exp: ND2StudiosRecord) -> List[str]:
+        """Pipeline names in ``analysis_results`` with at least one result."""
+        out: List[str] = []
+        for name, store in (getattr(exp, "analysis_results", {}) or {}).items():
+            if isinstance(store, AnalysisResult):
+                out.append(name)
+            elif isinstance(store, dict) and any(
+                isinstance(r, AnalysisResult) for r in store.values()
+            ):
+                out.append(name)
+        return out
+
+    def _results_by_m(self, exp: ND2StudiosRecord, name: str) -> Dict[int, AnalysisResult]:
+        store = (getattr(exp, "analysis_results", {}) or {}).get(name)
+        if isinstance(store, AnalysisResult):
+            return {0: store}
+        if isinstance(store, dict):
+            return {m: r for m, r in store.items() if isinstance(r, AnalysisResult)}
+        return {}
+
+    def _pipe_channels(self, exp: ND2StudiosRecord) -> Dict[str, np.ndarray]:
+        """Materialized processed (or raw) channels for measurements / overlays."""
+        if hasattr(exp, "processed_view"):
+            src = exp.processed_view()
+        else:
+            src = exp._processed_channels or exp._raw_channels or {}
+        out: Dict[str, np.ndarray] = {}
+        for name in src.keys():
+            try:
+                out[name] = np.asarray(src[name])
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _refresh_pipeline_results(self) -> None:
+        """Repopulate the pipeline-result combo from the active record."""
+        if self.main_window is None or self.main_window.exp_manager.active is None:
+            return
+        exp = self.main_window.exp_manager.active
+        names = self._committed_result_names(exp)
+        self.combo_pipe_result.blockSignals(True)
+        current = self.combo_pipe_result.currentText()
+        self.combo_pipe_result.clear()
+        self.combo_pipe_result.addItems(names or ["(no results)"])
+        if current in names:
+            self.combo_pipe_result.setCurrentText(current)
+        self.combo_pipe_result.blockSignals(False)
+        enabled = bool(names)
+        for b in (self.btn_pipe_csv, self.btn_pipe_overlay, self.btn_pipe_masks):
+            b.setEnabled(enabled)
+        self._refresh_pipe_summary()
+
+    def _refresh_pipe_summary(self) -> None:
+        exp = self.main_window.exp_manager.active if self.main_window else None
+        name = self.combo_pipe_result.currentText()
+        if exp is None or name in ("", "(no results)"):
+            self.lbl_pipe_summary.setText("")
+            return
+        rbm = self._results_by_m(exp, name)
+        if not rbm:
+            self.lbl_pipe_summary.setText("")
+            return
+        n_labels = 0
+        for res in rbm.values():
+            for masks in res.label_masks.values():
+                try:
+                    n_labels += int(np.max(np.asarray(masks[0]))) if masks.shape[0] else 0
+                except Exception:  # noqa: BLE001
+                    pass
+        self.lbl_pipe_summary.setText(
+            f"{len(rbm)} M position(s) committed · ~{n_labels} labels (frame 1)"
+        )
+
+    def _selected_pipe(self) -> Tuple[Optional[ND2StudiosRecord], str, Dict[int, AnalysisResult]]:
+        if self.main_window is None or self.main_window.exp_manager.active is None:
+            QMessageBox.information(self, "Nothing to export", "Import a file first.")
+            return None, "", {}
+        exp = self.main_window.exp_manager.active
+        name = self.combo_pipe_result.currentText()
+        rbm = self._results_by_m(exp, name)
+        if not rbm:
+            QMessageBox.information(
+                self, "No analysis result",
+                "Run an analysis pipeline and click Apply (Analysis or Pipelines "
+                "tab) before exporting results."
+            )
+            return None, "", {}
+        return exp, name, rbm
+
+    def _on_export_pipe_measurements(self) -> None:
+        exp, name, rbm = self._selected_pipe()
+        if exp is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save measurements CSV", f"{self._export_basename()}_measurements.csv",
+            "CSV (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        metadata = dict(exp.nd2_metadata or {})
+        metadata.setdefault("pixel_size_um", exp.pixel_size_um)
+        channels = self._pipe_channels(exp)
+        multi_m = len(rbm) > 1
+        all_rows: List[Dict[str, Any]] = []
+        try:
+            if self.main_window:
+                self.main_window.set_status_text("Computing measurements…")
+            for m, res in sorted(rbm.items()):
+                rows = compute_measurements(
+                    res.label_masks, channels, metadata, m_index=m,
+                    volumetric_voxel_counts=res.volumetric_voxel_counts,
+                )
+                if multi_m:
+                    for r in rows:
+                        r["m_position"] = m
+                all_rows.extend(rows)
+            n = self._write_measurements_csv(path, all_rows)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        finally:
+            if self.main_window:
+                self.main_window.set_progress(0)
+        if self.main_window:
+            self.main_window.set_status_text(f"Wrote {n} measurement row(s) → {path}")
+        QMessageBox.information(self, "Export complete", f"Wrote {n} row(s) to:\n{path}")
+
+    def _on_export_pipe_overlay(self) -> None:
+        exp, name, rbm = self._selected_pipe()
+        if exp is None:
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "Choose output folder", "")
+        if not out_dir:
+            return
+        metadata = dict(exp.nd2_metadata or {})
+        metadata.setdefault("pixel_size_um", exp.pixel_size_um)
+        channels = self._pipe_channels(exp)
+        channel_display = dict(getattr(exp, "channel_display", None) or {})
+        fmt = self.combo_pipe_overlay_fmt.currentText()
+        safe = name.replace(" ", "_").replace("/", "_")
+        multi_m = len(rbm) > 1
+        paths: List[str] = []
+        try:
+            for m, res in sorted(rbm.items()):
+                base = f"{self._export_basename()}_{safe}"
+                if multi_m:
+                    base += f"_M{m + 1:02d}"
+                paths += export_overlay_frames(
+                    channels=channels, label_masks=res.label_masks, metadata=metadata,
+                    output_dir=out_dir, fmt=fmt, channel_display=channel_display,
+                    pixel_size_um=exp.pixel_size_um,
+                    show_scale_bar=self.cb_pipe_scalebar.isChecked(),
+                    scale_bar_um=50.0, show_channel_labels=True, mask_alpha=0.5,
+                    frame_timestamps=getattr(exp, "_frame_timestamps", None),
+                    progress_cb=lambda p: self.main_window.set_progress(p) if self.main_window else None,
+                    basename=base,
+                )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        finally:
+            if self.main_window:
+                self.main_window.set_progress(0)
+        if self.main_window:
+            self.main_window.set_status_text(f"Exported {len(paths)} overlay frame(s)")
+        QMessageBox.information(self, "Export complete",
+                                f"Wrote {len(paths)} file(s) to:\n{out_dir}")
+
+    def _on_export_pipe_masks(self) -> None:
+        exp, name, rbm = self._selected_pipe()
+        if exp is None:
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "Choose output folder", "")
+        if not out_dir:
+            return
+        safe = name.replace(" ", "_").replace("/", "_")
+        multi_m = len(rbm) > 1
+        paths: List[str] = []
+        try:
+            for m, res in sorted(rbm.items()):
+                base = f"{self._export_basename()}_{safe}"
+                if multi_m:
+                    base += f"_M{m + 1:02d}"
+                paths += export_label_masks_tiff(res.label_masks, out_dir, basename=base)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        if self.main_window:
+            self.main_window.set_status_text(f"Exported {len(paths)} label-mask TIFF(s)")
+        QMessageBox.information(self, "Export complete",
+                                f"Wrote {len(paths)} file(s) to:\n{out_dir}")
+
+    def _write_measurements_csv(self, path: str, rows: List[Dict[str, Any]]) -> int:
+        """Write rows to CSV with an ordered union of all keys."""
+        headers: List[str] = []
+        seen = set()
+        for r in rows:
+            for k in r.keys():
+                if k not in seen:
+                    seen.add(k)
+                    headers.append(k)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+        return len(rows)
+
     # ── Helpers ──
     def _export_basename(self) -> str:
         """Return the stem of the imported filename for auto-naming exports."""
@@ -460,6 +739,16 @@ class ExportPage(QWidget):
 
         # Refresh tracked objects pipeline selector.
         self._refresh_tracked_pipelines()
+
+        # Refresh the Pipeline-Results selector; enable that source only when at
+        # least one analysis result is committed (Analysis or Pipelines tab).
+        self._refresh_pipeline_results()
+        pipe_names = self._committed_result_names(exp)
+        pipe_item = self.combo_export_type.model().item(3)
+        if pipe_item is not None:
+            pipe_item.setEnabled(bool(pipe_names))
+        if not pipe_names and self.combo_export_type.currentIndex() == 3:
+            self.combo_export_type.setCurrentIndex(0)
 
         # Z stack mode: z_mode="none" with a multi-Z volume.
         is_zstack = (

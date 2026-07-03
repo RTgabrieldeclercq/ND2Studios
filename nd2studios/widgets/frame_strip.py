@@ -52,6 +52,7 @@ class FrameStrip(QWidget):
         self._selection: Set[int] = set()
         self._meta_fn: Optional[Callable[[int], str]] = None
         self._hover_idx = -1
+        self._scrubbing = False
 
         # DPI-aware sizing. A tile must be at least ~half a mouse cursor wide;
         # a default cursor is ~16 px logical, so ~9 px scaled is the floor.
@@ -246,13 +247,25 @@ class FrameStrip(QWidget):
                 self._selection.add(idx)
             self.selection_changed.emit(self.selection())
         else:
+            # Plain left press starts a slider-style scrub.
+            self._scrubbing = True
             self._selection = {idx}
             self.selection_changed.emit(self.selection())
         self.set_current(idx, emit=True)
         self.update()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        idx = self._idx_at(event.position().toPoint())
+        pt = event.position().toPoint()
+        # Slider-style scrub: while the left button is held, dragging across
+        # the tiles moves the current frame (and tracks the selection).
+        if self._scrubbing and (event.buttons() & Qt.MouseButton.LeftButton):
+            idx = self._idx_at(pt)
+            if idx >= 0 and idx != self._current:
+                self._selection = {idx}
+                self.selection_changed.emit(self.selection())
+                self.set_current(idx, emit=True)
+            return
+        idx = self._idx_at(pt)
         if idx != self._hover_idx:
             self._hover_idx = idx
             if idx >= 0 and self._meta_fn is not None:
@@ -261,6 +274,11 @@ class FrameStrip(QWidget):
                 except Exception:
                     pass
             self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._scrubbing = False
+        super().mouseReleaseEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         if self._hover_idx != -1:

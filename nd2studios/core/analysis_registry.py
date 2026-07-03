@@ -27,8 +27,12 @@ from nd2studios.core.plugin_registry import ParamSpec  # reuse, do not duplicate
 @dataclass
 class AnalysisResult:
     """Structured output from an AnalysisPipeline.run() call."""
-    label_masks: Dict[str, np.ndarray] = field(default_factory=dict)
-    # {channel_name: (T, H, W) int32 array — 0 = background}
+    label_masks: Dict[str, Any] = field(default_factory=dict)
+    # {channel_name: (T, H, W) int32 label store — 0 = background}.
+    # V1.46: a value may be an in-RAM ndarray (eager) OR a disk-backed lazy
+    # reader (zarr Array / memmapped .npy from a streamed run). Both support
+    # ``[t]`` per-frame indexing and ``.shape``, so all consumers must index
+    # per frame rather than treating it as a fully-resident ndarray.
 
     measurements: List[Dict[str, Any]] = field(default_factory=list)
     # One dict per detected object:
@@ -45,6 +49,12 @@ class AnalysisResult:
 
     overlay_alpha: float = 0.45
     # Blend weight for the label overlay (0.0 = transparent, 1.0 = opaque).
+
+    overlay_outline: bool = False
+    # When True, label masks are rendered as boundary OUTLINES (via
+    # skimage.segmentation.find_boundaries) instead of filled regions — used by
+    # cell-boundary-drawing pipelines (e.g. StarDist Segmentation). Honored by the
+    # analysis-page / pipeline-preview overlays and the results_engine exporters.
 
     secondary_label_masks: Dict[str, np.ndarray] = field(default_factory=dict)
     # Optional secondary overlays keyed by a display name.  Rendered on top of
@@ -74,6 +84,11 @@ class AnalysisPipeline(ABC):
     """
     name: str = "Unnamed"
     description: str = ""
+
+    # V1.46: when True, the adaptive streaming gate keeps this pipeline on the
+    # in-RAM path (it needs whole-stack / multi-frame context, e.g. temporal
+    # ops). All current pipelines are strictly per-frame, so this is False.
+    needs_full_stack: bool = False
 
     _registry: Dict[str, Type["AnalysisPipeline"]] = {}
 

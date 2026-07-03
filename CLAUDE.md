@@ -5,7 +5,7 @@
 ## Project Overview
 
 **Project Name:** ND2Studios
-**Current version:** V1.0
+**Current version:** V1.45
 **Repository:** https://github.com/DeclercqCortex/ND2Studios.git
 **Description:** GUI-based PySide6 application for the McGhee Lab to load Nikon
 ND2 microscopy files (with full metadata), apply a user-defined linear recipe
@@ -159,5 +159,12 @@ PYTHONPATH=. python3 -m nd2studios
 - **imageio + imageio-ffmpeg** — MP4 / GIF movie export
 - **certifi** — SSL certificate handling
 
-ND2Studios deliberately does **not** depend on TensorFlow, StarDist, csbdeep,
-or any segmentation library. Those belong in CellTracker.
+ND2Studios does not depend on any segmentation library in its **core** install.
+Segmentation backends are **optional, lazily-imported** extras, each gated by
+`importlib.util.find_spec` with a friendly `ImportError` when missing (never in
+`requirements.txt`):
+- **cellpose** — the Nuclei Segmentation node (`pip install cellpose`).
+- **stardist + tensorflow + csbdeep** — the StarDist Segmentation node, ported
+  from CellTracker (`pip install stardist tensorflow csbdeep`). TensorFlow is
+  imported lazily on first model load and locked to single inter/intra-op threads
+  to avoid worker-thread deadlocks.

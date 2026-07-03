@@ -11,6 +11,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
+from nd2studios.backend.analysis.plane_runner import (
+    make_frame_cb, make_label_writers, run_planes_to_labels,
+)
+from nd2studios.backend.analysis.source_utils import read_plane, source_shape
 from nd2studios.core.analysis_registry import AnalysisPipeline, AnalysisResult
 from nd2studios.core.plugin_registry import ParamSpec
 
@@ -132,11 +136,9 @@ class BrightDarkSpotsPipeline(AnalysisPipeline):
         if not ch:
             raise ValueError("No channel available to analyse.")
 
-        stack: np.ndarray = np.asarray(channels[ch])
-        if stack.ndim == 2:
-            stack = stack[np.newaxis]
-
-        n_frames = stack.shape[0]
+        # V1.46 — keep the source lazy; read one frame at a time.
+        source = channels[ch]
+        n_frames, H, W = source_shape(source)
         pixel_size_um: float = float(metadata.get("pixel_size_um", 0.0))
 
         # intensity_percentile=0.0 means "gate disabled"
@@ -161,63 +163,62 @@ class BrightDarkSpotsPipeline(AnalysisPipeline):
         )
 
         seg = BrightDarkSpotsSegmenter(cfg)
-        label_stack = np.zeros(stack.shape, dtype=np.int32)
-        bg_stack: np.ndarray | None = (
-            np.zeros(stack.shape, dtype=np.int32) if use_bg_mask else None
-        )
-        measurements: list[dict[str, Any]] = []
+        sec_name = f"{ch}__background" if use_bg_mask else None
 
-        for t in range(n_frames):
-            if cancelled_cb is not None and cancelled_cb():
-                break
-
-            frame = stack[t]
+        def _per_frame(t: int):
+            frame = read_plane(source, t)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                result = seg.run(frame, pixel_size_um=pixel_size_um if pixel_size_um > 0 else None)
+                result = seg.run(
+                    frame, pixel_size_um=pixel_size_um if pixel_size_um > 0 else None)
 
-            label_stack[t] = result.labels
-            if bg_stack is not None and result.background_labels is not None:
-                bg_stack[t] = result.background_labels
-
-            # Per-frame background intensity (mean ± std over non-spot pixels)
+            sec = None
             bg_mean: float = 0.0
             bg_std: float = 0.0
             if use_bg_mask and result.background_labels is not None:
+                sec = np.asarray(result.background_labels, dtype=np.int32)
                 bg_pixels = frame[result.background_labels > 0].astype(np.float64)
                 if bg_pixels.size > 0:
                     bg_mean = float(np.mean(bg_pixels))
                     bg_std = float(np.std(bg_pixels))
 
-            for row in result.regions:
-                entry: dict[str, Any] = {
-                    "frame": t,
-                    "label_id": row["label_id"],
-                    "area_px": row["area_px"],
-                    "area_um2": row["area_um2"],
-                    "centroid_y": row["centroid_y"],
-                    "centroid_x": row["centroid_x"],
-                    "mean_intensity": row["mean_intensity"],
-                    "diameter_px": row["diameter_px"],
-                    "contrast_score": row["contrast_score"],
-                    "circularity": row["circularity"],
-                    "polarity": cfg.polarity,
-                    "background_mean_intensity": bg_mean,
-                    "background_std_intensity": bg_std,
-                }
-                measurements.append(entry)
+            rows = [{
+                "frame": t,
+                "label_id": row["label_id"],
+                "area_px": row["area_px"],
+                "area_um2": row["area_um2"],
+                "centroid_y": row["centroid_y"],
+                "centroid_x": row["centroid_x"],
+                "mean_intensity": row["mean_intensity"],
+                "diameter_px": row["diameter_px"],
+                "contrast_score": row["contrast_score"],
+                "circularity": row["circularity"],
+                "polarity": cfg.polarity,
+                "background_mean_intensity": bg_mean,
+                "background_std_intensity": bg_std,
+            } for row in result.regions]
+            return np.asarray(result.labels, dtype=np.int32), rows, sec
 
-            if progress_cb is not None:
-                progress_cb(int((t + 1) / n_frames * 100))
+        primary_writer, secondary_writer = make_label_writers(
+            params, ch, (n_frames, H, W), secondary_name=sec_name)
+        # Sequential (n_workers=1) preserves the original spots behavior — the
+        # shared segmenter is not parallelised; streaming still bounds RAM.
+        out = run_planes_to_labels(
+            n_frames=n_frames, height=H, width=W, per_frame_fn=_per_frame,
+            primary_writer=primary_writer, secondary_writer=secondary_writer,
+            has_secondary=use_bg_mask, n_workers=1,
+            progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+            frame_cb=make_frame_cb(params),
+        )
 
-        secondary_masks: dict[str, np.ndarray] = {}
-        if bg_stack is not None:
-            secondary_masks[f"{ch}__background"] = bg_stack
+        secondary_masks: dict[str, Any] = {}
+        if use_bg_mask and out.secondary is not None:
+            secondary_masks[sec_name] = out.secondary
 
-        summary = _build_summary(measurements)
+        summary = _build_summary(out.measurements)
         return AnalysisResult(
-            label_masks={ch: label_stack},
-            measurements=measurements,
+            label_masks={ch: out.primary},
+            measurements=out.measurements,
             summary=summary,
             overlay_color=(0, 100, 255),
             overlay_alpha=0.80,
