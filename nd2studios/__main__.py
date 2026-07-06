@@ -82,6 +82,7 @@ def main() -> None:
     import nd2studios.backend.analysis.histogram_threshold_pipeline  # noqa: F401
     import nd2studios.backend.analysis.spots_pipeline  # noqa: F401
     import nd2studios.backend.analysis.manual_mask  # noqa: F401
+    import nd2studios.backend.dvc.method  # noqa: F401  — registers ALDVCMethod
 
     app = QApplication(sys.argv)
     app.setApplicationName(Settings.APP_NAME)

@@ -4,6 +4,41 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-06-18 (V1.45 Digital Volume Correlation — Phase 0)
+
+Adds the ability to measure 3D deformation (displacement + strain) by Digital
+Volume Correlation — a clean-room Python port of FranckLab's Augmented
+Lagrangian DVC (ALDVC). This commit is **Phase 0** (docs + scaffolding); the
+numerical stages land in Phases 1-5. Plan:
+[CodeLog/ClaudesPlan/V1.45_DVC.md](../ClaudesPlan/V1.45_DVC.md). Literature
+review: [Research/aldvc_literature_review.md](../../Research/aldvc_literature_review.md).
+
+### Added
+
+- **`core/dvc_registry.py`** (new) — third registry `DVCMethod(ABC)` (modeled
+  on `AnalysisPipeline`, reusing `ParamSpec`), plus `DVCResult` (dense
+  displacement/strain field container with `magnitude` / `displacement_um()`
+  accessors) and a typed `DVCParams` view. DVC is neither an `EnhancementPlugin`
+  (`(T,H,W)→(T,H,W)`, Z-collapsed) nor an `AnalysisPipeline` (label
+  masks/measurements) — it consumes `(Z,H,W)` volumes / `(H,W)` images and
+  produces a vector field, so it gets its own registry + result type. No Qt
+  dependency (callable headless).
+- **`backend/dvc/`** (new pure package, no PySide6) — `engine.py`
+  (`run_aldvc`, `normalize_volume`, `make_grid`; Phase-0 honest **global-shift
+  stub** via FFT phase correlation), `method.py` (`ALDVCMethod` registered with
+  its `ParamSpec` list). Module map for Phases 1-5 documented in
+  `backend/dvc/__init__.py`.
+- **`workers/dvc_worker.py`** (new) — `DVCWorker(BaseWorker)` thin Qt wrapper;
+  emits `finished(DVCResult)` / `error`; cancellation via `cancelled_cb`.
+- **`pages/dvc_page.py`** (new) — `DVCPage`: method combo, `ParamEditor`,
+  channel / M / reference-T / deformed-T selectors, Run/Cancel, progress +
+  text result summary. Pulls full `(Z,H,W)` volumes straight from the record's
+  `LazyND2Volume` (`get_frame(z_mode="none")`); falls back to the `(H,W)` frame
+  for **2D DIC** when there is no Z. (Dense field viewer: Phase 5.)
+- **DVC sidebar page** — new `("dvc", "🧬", "DVC", …)` entry in
+  `Settings.PAGES` + `PAGE_PREREQS["dvc"] = ("imported", …)`; registered in
+  `main_window.py` `page_classes`; `ALDVCMethod` force-imported in `__main__.py`.
+
 ## [Unreleased] - 2026-06-09 (V1.44 GUI Overhaul + Button Revamp)
 
 Navigation moves from a left sidebar to a top tab bar; buttons become modern,

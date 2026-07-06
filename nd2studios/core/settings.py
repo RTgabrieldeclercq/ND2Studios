@@ -113,6 +113,7 @@ class Settings:
         ("import", "📂", "Import", "Load an ND2 or TIFF file and inspect metadata."),
         ("recipe", "🧪", "Recipe", "Build a processing pipeline (trial / accept / reject)."),
         ("analysis", "🔬", "Analysis", "Run analysis pipelines on loaded data."),
+        ("dvc", "🧬", "DVC", "Measure deformation (displacement + strain) by digital volume correlation."),
         ("results", "📊", "Results", "Compute measurements from analysis binaries and export CSV / images."),
         ("batch", "⚡", "Batch", "Run a pipeline template over multiple files and aggregate results."),
         ("export", "💾", "Export", "Export TIFF stacks, RGB composites, movies, and tracked objects."),
@@ -127,6 +128,7 @@ class Settings:
         "recipe": ("imported", "Import a file first (Page 1)."),
         "export": ("imported", "Import a file first (Page 1)."),
         "analysis": ("imported", "Import a file first (Page 1)."),
+        "dvc": ("imported", "Import a file first (Page 1)."),
         "results": ("imported", "Import a file first (Page 1)."),
         "batch": None,
     }

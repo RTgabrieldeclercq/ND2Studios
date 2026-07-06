@@ -1,6 +1,36 @@
 # ND2Studios Architecture
 
-**Version:** V1.44
+**Version:** V1.45
+
+## V1.45 additions (Digital Volume Correlation — Phase 0)
+
+A new measurement capability: Digital Volume/Image Correlation (DVC/DIC), a
+clean-room Python port of FranckLab's Augmented Lagrangian DVC (ALDVC). It
+introduces a **third registry** alongside enhancement plugins and analysis
+pipelines, because DVC's I/O fits neither: it consumes full `(Z,H,W)` volumes
+(or `(H,W)` images for 2D DIC) and produces a dense displacement/strain vector
+field.
+
+- **`core/dvc_registry.py`** — `DVCMethod(ABC)` (`register`/`get_methods`/
+  `get_params`/`run`, reusing `plugin_registry.ParamSpec`), `DVCResult`
+  (grid coords + displacement/strain fields + diagnostics), `DVCParams`. Qt-free.
+- **`backend/dvc/`** — pure (no-Qt) engine package. Phase 0: `engine.run_aldvc`
+  (Stage 0 volume prep + a global-shift stub) and `method.ALDVCMethod`. Phases
+  1-5 add `mesh`, `outliers`, `integer_search`, `icgn`, `global_step`, `admm`,
+  `strain`, and `parallel` (shared-memory process-pool dispatch). See
+  `backend/dvc/__init__.py` for the module map.
+- **`workers/dvc_worker.py`** — `DVCWorker(BaseWorker)`; thin Qt boundary, owns
+  no parallelism (core saturation lives inside the engine via
+  `compute/parallel`).
+- **`pages/dvc_page.py`** + `Settings.PAGES`/`PAGE_PREREQS` `"dvc"` entry —
+  the GUI surface. Reads `record._raw_volume` (the `LazyND2Volume`) directly via
+  `get_frame(z_mode="none")`, deliberately bypassing the Z-collapsing
+  recipe/export path, so DVC is **purely additive** — existing features are
+  untouched.
+
+**Data-flow note:** DVC is the first consumer of the *un-collapsed* Z axis.
+Recipes/exports continue to operate on the `(T,H,W)` projection; DVC branches
+off at the record and pulls `(Z,H,W)` per timepoint.
 
 ## V1.44 additions (GUI Overhaul + Button Revamp)
 

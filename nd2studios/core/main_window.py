@@ -300,6 +300,7 @@ class MainWindow(QMainWindow):
         from nd2studios.pages.recipe_page import RecipePage
         from nd2studios.pages.export_page import ExportPage
         from nd2studios.pages.analysis_page import AnalysisPage
+        from nd2studios.pages.dvc_page import DVCPage
         from nd2studios.pages.results_page import ResultsPage
         from nd2studios.pages.batch_page import BatchPage
 
@@ -308,6 +309,7 @@ class MainWindow(QMainWindow):
             "recipe": RecipePage,
             "export": ExportPage,
             "analysis": AnalysisPage,
+            "dvc": DVCPage,
             "results": ResultsPage,
             "batch": BatchPage,
         }
