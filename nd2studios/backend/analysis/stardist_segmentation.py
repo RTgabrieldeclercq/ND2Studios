@@ -98,6 +98,14 @@ class StarDistSegmentationPipeline(AnalysisPipeline):
                 tooltip="Render the detected cells as boundary outlines instead of "
                         "filled regions in the overlay / export.",
             ),
+            ParamSpec(
+                "n_processes", "Parallel processes (0 = auto)", "int", 0,
+                min_val=0, max_val=64, step=1,
+                tooltip="CPU only: segment this many frames at once across separate "
+                        "worker processes (each loads its own model). 0 = auto "
+                        "(bounded by cores and free RAM). 1 = sequential. Ignored "
+                        "when the GPU is enabled.",
+            ),
         ]
 
     def run(
@@ -183,14 +191,50 @@ class StarDistSegmentationPipeline(AnalysisPipeline):
             return mask, rows, None
 
         primary_writer, _ = make_label_writers(params, channel_name, (T, H, W))
-        # StarDist / TensorFlow are not thread-safe → sequential (n_workers=1);
-        # streaming still bounds RAM to one frame + the mask sink.
-        out = run_planes_to_labels(
-            n_frames=T, height=H, width=W, per_frame_fn=_per_frame,
-            primary_writer=primary_writer, n_workers=1,
-            progress_cb=progress_cb, cancelled_cb=cancelled_cb,
-            frame_cb=make_frame_cb(params),
-        )
+
+        # ── Sequential vs. multiprocess ───────────────────────────────────────
+        # StarDist/TF share a non-thread-safe model, so THREAD parallelism can't
+        # help. On a many-core CPU we instead fan frames across separate PROCESSES
+        # (each with its own model + TF). On GPU we stay sequential — MP just makes
+        # processes fight over one card. See V1.46_stardist_multiprocessing.md.
+        req_workers = int(params.get("n_processes", 0))
+        if use_gpu:
+            n_workers = 1
+        elif req_workers > 0:
+            n_workers = min(req_workers, T)
+        else:
+            from nd2studios.utils.resources import recommended_process_count
+            n_workers = min(recommended_process_count(), T)
+
+        if n_workers > 1:
+            from nd2studios.backend.analysis.mp_stardist import (
+                run_stardist_multiprocess,
+            )
+            seg_params = {
+                "prob_thresh": prob_thresh,
+                "nms_thresh": nms_thresh,
+                "scale": scale,
+                "min_area": min_area,
+                "max_area": max_area,
+                "pixel_size_um": pixel_size_um,
+            }
+            out = run_stardist_multiprocess(
+                source=source, n_frames=T, height=H, width=W,
+                model_name=model_name, disable_gpu=disable_gpu,
+                seg_params=seg_params, n_workers=n_workers,
+                primary_writer=primary_writer,
+                progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+                frame_cb=make_frame_cb(params),
+            )
+        else:
+            # 1 worker (GPU, tiny stack, or user pin): the sequential thread path,
+            # unchanged. Streaming still bounds RAM to one frame + the mask sink.
+            out = run_planes_to_labels(
+                n_frames=T, height=H, width=W, per_frame_fn=_per_frame,
+                primary_writer=primary_writer, n_workers=1,
+                progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+                frame_cb=make_frame_cb(params),
+            )
         measurements = out.measurements
 
         areas = [m["area_px"] for m in measurements]

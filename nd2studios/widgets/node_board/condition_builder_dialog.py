@@ -20,8 +20,9 @@ from PySide6.QtWidgets import (
 
 from nd2studios.core.settings import Settings
 from nd2studios.pipeline_graph.conditions import (
-    FAMILY_ORDER, BLOCK_KINDS, Condition, ConditionBlock, block_label,
-    block_param_schema, describe_condition, families, make_block, metric_choices,
+    FAMILY_ORDER, BLOCK_KINDS, Condition, ConditionBlock, LENS_OBJECT,
+    block_label, block_param_schema, describe_condition, families,
+    is_object_lens_only, make_block, metric_choices,
 )
 from nd2studios.widgets.icon_button import scaled
 
@@ -141,6 +142,7 @@ class ConditionBuilderDialog(QDialog):
     def __init__(self, condition: Optional[Dict[str, Any]],
                  channels: Optional[List[str]] = None,
                  metrics: Optional[List[str]] = None,
+                 lens: Optional[str] = None,
                  parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit branch condition")
@@ -151,6 +153,10 @@ class ConditionBuilderDialog(QDialog):
         # Live metric columns discovered upstream (unioned into the metric
         # dropdown on top of the static catalog).
         self._metrics = list(metrics or [])
+        # The if-else lens (whole-frame vs object). Object-lens-only blocks (e.g.
+        # per-track persistence) are hidden from the add menu for a whole-frame
+        # if-else, where they cannot work.
+        self._object_lens = str(lens or "") == LENS_OBJECT
         self._cond = Condition.from_dict(condition)
         self._rows: List[_BlockRow] = []
         self._build_ui()
@@ -215,8 +221,12 @@ class ConditionBuilderDialog(QDialog):
             kinds = fam.get(family) or []
             if not kinds:
                 continue
+            visible = [k for k in kinds
+                       if self._object_lens or not is_object_lens_only(k)]
+            if not visible:
+                continue
             sub = self._add_menu.addMenu(family)
-            for kind in kinds:
+            for kind in visible:
                 act = sub.addAction(BLOCK_KINDS[kind]["label"])
                 act.triggered.connect(lambda _c=False, k=kind: self._add_kind(k))
 

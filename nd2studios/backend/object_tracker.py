@@ -14,11 +14,20 @@ Driven by the "Track Objects" pipeline node (see
 """
 from __future__ import annotations
 
+import logging
+import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+
+log = logging.getLogger(__name__)
+
+# Progress callback: fraction in [0, 1] plus a short status message. Kept
+# Qt-free so the backend stays importable without PySide6; the GUI's
+# ``_TrackJob`` adapts it onto its ``ProgressReporter``.
+ProgressCB = Callable[[float, str], None]
 
 
 # Tracking methods exposed by the "Track Objects" node.  The linker dispatches on
@@ -56,6 +65,7 @@ def link_objects(
     ct_topo_weight: float = 0.3,
     ct_area_weight: float = 0.3,
     ct_max_gap: int = 3,
+    progress_cb: Optional[ProgressCB] = None,
 ) -> List[Dict[str, Any]]:
     """Assign track_id, track_length, and track_validation to every row.
 
@@ -156,23 +166,42 @@ def link_objects(
 
     _next_track_id = [1]  # mutable counter shared across groups
 
-    for group_rows in groups.values():
+    n_groups = max(1, len(groups))
+    log.info(
+        "link_objects: method=%r, %d eligible detections in %d (channel, m) "
+        "group(s)", method, sum(len(g) for g in groups.values()), n_groups,
+    )
+    _t_start = time.perf_counter()
+
+    for gi, group_rows in enumerate(groups.values()):
+        # Map each linker's own 0..1 progress into this group's slice of the
+        # overall bar, so multi-group runs still advance smoothly and a
+        # single-group run (the common case) passes progress straight through.
+        def _group_cb(frac: float, msg: str, _gi: int = gi) -> None:
+            if progress_cb is not None:
+                progress_cb((_gi + max(0.0, min(1.0, frac))) / n_groups, msg)
+
         if method == METHOD_SERIALTRACK:
             _link_group_serialtrack(
                 group_rows, max_displacement_px, st_mode, st_n_neighbors,
-                _next_track_id,
+                _next_track_id, progress_cb=_group_cb,
             )
         elif method in (METHOD_CT_TOPOLOGY, METHOD_CT_FINGERPRINT):
             _link_group_celltracker(
                 group_rows, method, max_displacement_px,
                 ct_n_neighbors, ct_topo_weight, ct_area_weight, ct_max_gap,
-                _next_track_id,
+                _next_track_id, progress_cb=_group_cb,
             )
         else:
             _link_group(
                 group_rows, max_displacement_px, max_size_diff_frac,
-                max_frame_gap, _next_track_id,
+                max_frame_gap, _next_track_id, progress_cb=_group_cb,
             )
+
+    log.info("link_objects: linking finished in %.2fs (%d tracks assigned)",
+             time.perf_counter() - _t_start, _next_track_id[0] - 1)
+    if progress_cb is not None:
+        progress_cb(1.0, "Tracking done")
 
     # ── Promote track_length and track_validation ─────────────────────────────
     track_frames: Dict[int, int] = defaultdict(int)
@@ -200,6 +229,7 @@ def link_objects_with_params(
     rows: List[Dict[str, Any]],
     params: Dict[str, Any],
     pixel_size_um: Optional[float] = None,
+    progress_cb: Optional[ProgressCB] = None,
 ) -> List[Dict[str, Any]]:
     """Run :func:`link_objects` from a "Track Objects" node param dict.
 
@@ -236,6 +266,7 @@ def link_objects_with_params(
         ct_topo_weight=float(params.get("ct_topo_weight", 0.3)),
         ct_area_weight=float(params.get("ct_area_weight", 0.3)),
         ct_max_gap=int(params.get("ct_max_gap", 3)),
+        progress_cb=progress_cb,
     )
 
 
@@ -251,6 +282,7 @@ def _link_group(
     max_size_diff_frac: float,
     max_frame_gap: int,
     next_id: List[int],
+    progress_cb: Optional[ProgressCB] = None,
 ) -> None:
     """Link objects within a single (channel, m_position) group.
 
@@ -264,7 +296,8 @@ def _link_group(
         frames[int(r.get("frame", 0))].append(r)
 
     sorted_frames = sorted(frames.keys())
-    if len(sorted_frames) < 2:
+    T = len(sorted_frames)
+    if T < 2:
         return
 
     # Seed first frame with fresh track IDs.
@@ -274,7 +307,9 @@ def _link_group(
         active[next_id[0]] = (_cy(r), _cx(r), _area(r), sorted_frames[0])
         next_id[0] += 1
 
-    for fr in sorted_frames[1:]:
+    for i, fr in enumerate(sorted_frames[1:], start=1):
+        if progress_cb is not None:
+            progress_cb((i + 1) / T, f"Linking frame {i + 1}/{T}")
         curr_rows = frames[fr]
         if not curr_rows:
             continue
@@ -339,6 +374,7 @@ def _link_group_serialtrack(
     mode_str: str,
     n_neighbors_max: int,
     next_id: List[int],
+    progress_cb: Optional[ProgressCB] = None,
 ) -> None:
     """Link objects within one (channel, m_position) group via SerialTrack.
 
@@ -383,6 +419,10 @@ def _link_group_serialtrack(
         strain_n_neighbors=0,      # skip per-frame strain (not needed for ids)
         use_prev_results=False,    # avoid the lazy sklearn POD-GPR path
     )
+    # SerialTrack runs as one opaque (numba-JIT) call — no intra-call progress
+    # hook — so we mark the start; per-frame updates follow in the chaining loop.
+    if progress_cb is not None:
+        progress_cb(0.0, f"SerialTrack linking {len(sorted_frames)} frames…")
     session = SerialTracker(DetectionConfig(), trk).track_coordinates(coords_list)
 
     # Seed the reference (first) frame with fresh ids, then chain forward.
@@ -392,7 +432,10 @@ def _link_group_serialtrack(
         ids_per_frame[0].append(next_id[0])
         next_id[0] += 1
 
+    n_pairs = max(1, len(session.frame_results))
     for k, res in enumerate(session.frame_results):
+        if progress_cb is not None:
+            progress_cb((k + 1) / n_pairs, f"Chaining frame {k + 2}/{len(row_refs)}")
         # res is the pair whose B is coords_list[k + 1].
         prev_ids = ids_per_frame[0] if mode == TrackingMode.CUMULATIVE \
             else ids_per_frame[k]
@@ -420,6 +463,7 @@ def _link_group_celltracker(
     ct_area_weight: float,
     ct_max_gap: int,
     next_id: List[int],
+    progress_cb: Optional[ProgressCB] = None,
 ) -> None:
     """Link objects within one (channel, m_position) group via CellTracker.
 
@@ -463,12 +507,14 @@ def _link_group_celltracker(
         tracked = track_fingerprint(
             df, max_dist=float(max_displacement_px),
             area_weight=float(ct_area_weight), max_gap=max(0, int(ct_max_gap)),
+            progress_cb=progress_cb,
         )
     else:  # METHOD_CT_TOPOLOGY
         tracked = track_timeseries(
             df, max_dist=float(max_displacement_px),
             n_neighbors=max(1, int(ct_n_neighbors)),
             use_topology=True, topo_weight=float(ct_topo_weight),
+            progress_cb=progress_cb,
         )
 
     # Remap local (per-call) track ids to the shared global counter, skipping the

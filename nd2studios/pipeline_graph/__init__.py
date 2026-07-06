@@ -24,6 +24,7 @@ from nd2studios.pipeline_graph.conditions import (
     partition_rows,
 )
 from nd2studios.pipeline_graph.executor import (
+    CroppedVolume,
     GraphRunner,
     PinnedProcessedVolume,
     ProcessedFrameVolume,
@@ -119,7 +120,7 @@ __all__ = [
     "evaluate_condition", "families", "make_block", "partition_rows",
     "LENS_FRAME", "LENS_OBJECT", "GROUP_TRACK", "GROUP_ROW",
     # executor
-    "GraphRunner", "PinnedProcessedVolume", "ProcessedFrameVolume",
+    "CroppedVolume", "GraphRunner", "PinnedProcessedVolume", "ProcessedFrameVolume",
     "apply_recipe", "evaluate_simple_condition", "input_node", "output_nodes",
     "predecessor", "recipe_for_node", "recipe_hash", "topological_order",
     # io

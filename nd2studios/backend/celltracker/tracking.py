@@ -13,13 +13,26 @@ Operates on pandas DataFrames with columns ``frame``, ``label``, ``centroid_y``,
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+import logging
+import time
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
+
+log = logging.getLogger(__name__)
+
+# A progress callback reports a fraction in [0, 1] and a short status message.
+# Kept Qt-free so the backend stays importable without PySide6.
+ProgressCB = Callable[[float, str], None]
+
+# A per-frame cost matrix larger than this (N × M entries) makes the O(n³)
+# Hungarian assignment the dominant cost; we log a one-time warning so a
+# dense-field slowdown is explained rather than mysterious.
+_BIG_COST_MATRIX = 4_000_000
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -58,21 +71,24 @@ def compute_topology_features(
 
     features = np.zeros((N, 2 * n_neighbors))
 
-    for i in range(N):
-        k = min(K, dists.shape[1])
-        # Sorted distances (already sorted by cKDTree)
-        features[i, :k] = dists[i, :k]
+    # Vectorized equivalent of the original per-cell loop. cKDTree returns a
+    # uniform K neighbors for every cell (k == K here), so the whole thing is
+    # array ops. The ``k > 1`` guard preserves the original behavior of leaving
+    # the angular-gap block as zeros when there is only a single neighbor.
+    k = K
+    # Sorted neighbor distances (cKDTree already returns them ascending).
+    features[:, :k] = dists[:, :k]
 
-        # Angular gaps between neighbors
-        neighbors = centroids[indices[i, :k]] - centroids[i]
-        angles = np.arctan2(neighbors[:, 0], neighbors[:, 1])
-        angles_sorted = np.sort(angles)
-
-        if k > 1:
-            gaps = np.diff(angles_sorted)
-            gaps = np.append(gaps, 2 * np.pi + angles_sorted[0] - angles_sorted[-1])
-            gaps_sorted = np.sort(gaps)
-            features[i, n_neighbors:n_neighbors + len(gaps_sorted)] = gaps_sorted
+    if k > 1:
+        # Neighbor offset vectors, (N, k, 2) as [y, x].
+        neighbors = centroids[indices[:, :k]] - centroids[:, None, :]
+        angles = np.arctan2(neighbors[:, :, 0], neighbors[:, :, 1])  # (N, k)
+        angles_sorted = np.sort(angles, axis=1)
+        gaps = np.diff(angles_sorted, axis=1)                        # (N, k-1)
+        wrap = (2 * np.pi + angles_sorted[:, 0] - angles_sorted[:, -1])[:, None]
+        gaps = np.concatenate([gaps, wrap], axis=1)                  # (N, k)
+        gaps_sorted = np.sort(gaps, axis=1)
+        features[:, n_neighbors:n_neighbors + k] = gaps_sorted
 
     return features
 
@@ -156,7 +172,7 @@ def track_timeseries(
     n_neighbors: int = 5,
     use_topology: bool = True,
     topo_weight: float = 0.3,
-    progress_cb=None,
+    progress_cb: Optional[ProgressCB] = None,
 ) -> pd.DataFrame:
     """
     Track cells across all frames using nearest-neighbor linking.
@@ -168,43 +184,63 @@ def track_timeseries(
     n_neighbors : int, neighbors for topology features
     use_topology : bool, whether to use topology-augmented cost
     topo_weight : float, weight of topology in cost matrix
-    progress_cb : callable(int), progress 0-100
+    progress_cb : callable(fraction_0_1, message), reports linking progress
 
     Returns
     -------
     df : same DataFrame with added 'track_id' column
     """
-    frames = sorted(df["frame"].unique())
+    # Group by frame ONCE (dict of per-frame sub-frames) instead of re-scanning
+    # the whole DataFrame with a boolean mask on every iteration — that repeated
+    # mask was O(T² · cells) and a major slice of the wall-clock on dense fields.
+    by_frame = {int(f): sub for f, sub in df.groupby("frame", sort=True)}
+    frames = sorted(by_frame)
     T = len(frames)
-    next_id = 1
-    track_ids = {}
+    n_det = len(df)
+    log.info(
+        "CT topology tracking: %d detections across %d frames (~%.0f/frame), "
+        "topology=%s, max_dist=%.1f",
+        n_det, T, (n_det / T if T else 0), use_topology, max_dist,
+    )
 
-    # First frame: every cell gets a new track
-    first = df[df["frame"] == frames[0]]
-    for _, row in first.iterrows():
-        track_ids[(frames[0], row["label"])] = next_id
+    next_id = 1
+    track_ids: dict = {}
+    t_link = 0.0
+    t_topo = 0.0
+    max_cost_cells = 0
+
+    # First frame: every cell gets a new track.
+    first = by_frame[frames[0]]
+    for lbl in first["label"].to_numpy():
+        track_ids[(frames[0], lbl)] = next_id
         next_id += 1
 
     for i in range(1, T):
         pf, cf = frames[i - 1], frames[i]
-        prev = df[df["frame"] == pf]
-        curr = df[df["frame"] == cf]
+        prev = by_frame[pf]
+        curr = by_frame[cf]
 
         c_prev = prev[["centroid_y", "centroid_x"]].values
         c_curr = curr[["centroid_y", "centroid_x"]].values
         l_prev = prev["label"].values
         l_curr = curr["label"].values
 
+        max_cost_cells = max(max_cost_cells, len(c_prev) * len(c_curr))
+
         # Topology features
         topo_prev = topo_curr = None
         if use_topology and len(c_prev) > n_neighbors and len(c_curr) > n_neighbors:
+            _t0 = time.perf_counter()
             topo_prev = compute_topology_features(c_prev, n_neighbors)
             topo_curr = compute_topology_features(c_curr, n_neighbors)
+            t_topo += time.perf_counter() - _t0
 
+        _t0 = time.perf_counter()
         matches, _, unmatched_curr = link_frames(
             c_prev, c_curr, max_dist,
             topo_prev, topo_curr, topo_weight,
         )
+        t_link += time.perf_counter() - _t0
 
         for prev_idx, curr_idx in matches:
             prev_key = (pf, l_prev[prev_idx])
@@ -216,14 +252,35 @@ def track_timeseries(
             next_id += 1
 
         if progress_cb:
-            progress_cb(int((i + 1) / T * 100))
+            progress_cb((i + 1) / T, f"Linking frame {i + 1}/{T}")
 
-    # Assign track_id column
+    if max_cost_cells > _BIG_COST_MATRIX:
+        log.warning(
+            "CT topology: largest per-frame cost matrix is %d entries — the "
+            "Hungarian assignment is O(n³), so this dense field is inherently "
+            "slow. Consider a smaller max_dist or fewer detections.",
+            max_cost_cells,
+        )
+
+    # Assign track_id column. A vectorized dict lookup over zipped numpy arrays
+    # replaces the old ``df.apply(..., axis=1)`` (a Python call + Series build
+    # per row, which alone cost tens of seconds at 100k+ detections).
+    _t0 = time.perf_counter()
     df = df.copy()
-    df["track_id"] = df.apply(
-        lambda row: track_ids.get((int(row["frame"]), int(row["label"])), -1),
-        axis=1,
+    frame_arr = df["frame"].to_numpy()
+    label_arr = df["label"].to_numpy()
+    df["track_id"] = [
+        track_ids.get((int(f), int(lbl)), -1)
+        for f, lbl in zip(frame_arr, label_arr)
+    ]
+    t_assign = time.perf_counter() - _t0
+
+    log.info(
+        "CT topology done: %d tracks; link %.2fs, topology %.2fs, assign %.2fs",
+        next_id - 1, t_link, t_topo, t_assign,
     )
+    if progress_cb:
+        progress_cb(1.0, "Tracking done")
 
     return df
 
@@ -273,7 +330,7 @@ def track_fingerprint(
     max_dist: float = 30.0,
     area_weight: float = 0.3,
     max_gap: int = 3,
-    progress_cb=None,
+    progress_cb: Optional[ProgressCB] = None,
 ) -> pd.DataFrame:
     """
     Track cells using spatial position + size fingerprinting with gap filling.
@@ -289,14 +346,24 @@ def track_fingerprint(
     max_dist : float, max linking distance in pixels
     area_weight : float 0-1, weight of area similarity vs distance
     max_gap : int, max frames a cell can disappear and still be re-linked
-    progress_cb : callable(int), progress 0-100
+    progress_cb : callable(fraction_0_1, message), reports linking progress
 
     Returns
     -------
     df with 'track_id' column
     """
-    frames = sorted(df["frame"].unique())
+    # Group by frame once (see track_timeseries — avoids the O(T² · cells)
+    # repeated boolean mask).
+    by_frame = {int(f): sub for f, sub in df.groupby("frame", sort=True)}
+    frames = sorted(by_frame)
     T = len(frames)
+    n_det = len(df)
+    log.info(
+        "CT fingerprint tracking: %d detections across %d frames (~%.0f/frame), "
+        "max_dist=%.1f, area_weight=%.2f, max_gap=%d",
+        n_det, T, (n_det / T if T else 0), max_dist, area_weight, max_gap,
+    )
+    _t_start = time.perf_counter()
     next_id = 1
     track_ids = {}  # (frame, label) -> track_id
 
@@ -304,25 +371,23 @@ def track_fingerprint(
     active_tracks = {}
 
     # First frame
-    first = df[df["frame"] == frames[0]]
-    for _, row in first.iterrows():
+    first = by_frame[frames[0]]
+    for lbl, cy, cx, ar in zip(
+        first["label"].to_numpy(), first["centroid_y"].to_numpy(),
+        first["centroid_x"].to_numpy(), first["area"].to_numpy(),
+    ):
         tid = next_id
         next_id += 1
-        track_ids[(frames[0], row["label"])] = tid
-        active_tracks[tid] = {
-            "last_frame": frames[0],
-            "y": row["centroid_y"],
-            "x": row["centroid_x"],
-            "area": row["area"],
-        }
+        track_ids[(frames[0], lbl)] = tid
+        active_tracks[tid] = {"last_frame": frames[0], "y": cy, "x": cx, "area": ar}
 
     for i in range(1, T):
         cf = frames[i]
-        curr = df[df["frame"] == cf]
+        curr = by_frame[cf]
 
         if curr.empty:
             if progress_cb:
-                progress_cb(int((i + 1) / T * 100))
+                progress_cb((i + 1) / T, f"Linking frame {i + 1}/{T}")
             continue
 
         c_curr = curr[["centroid_y", "centroid_x"]].values
@@ -354,7 +419,7 @@ def track_fingerprint(
                     "area": a_curr[ci],
                 }
             if progress_cb:
-                progress_cb(int((i + 1) / T * 100))
+                progress_cb((i + 1) / T, f"Linking frame {i + 1}/{T}")
             continue
 
         prev_centroids = np.array(alive_centroids)
@@ -402,13 +467,20 @@ def track_fingerprint(
             del active_tracks[tid]
 
         if progress_cb:
-            progress_cb(int((i + 1) / T * 100))
+            progress_cb((i + 1) / T, f"Linking frame {i + 1}/{T}")
 
-    # Assign track_id column
+    # Assign track_id column (vectorized dict lookup — see track_timeseries).
     df = df.copy()
-    df["track_id"] = df.apply(
-        lambda row: track_ids.get((int(row["frame"]), int(row["label"])), -1),
-        axis=1,
-    )
+    frame_arr = df["frame"].to_numpy()
+    label_arr = df["label"].to_numpy()
+    df["track_id"] = [
+        track_ids.get((int(f), int(lbl)), -1)
+        for f, lbl in zip(frame_arr, label_arr)
+    ]
+
+    log.info("CT fingerprint done: %d tracks in %.2fs",
+             next_id - 1, time.perf_counter() - _t_start)
+    if progress_cb:
+        progress_cb(1.0, "Tracking done")
 
     return df

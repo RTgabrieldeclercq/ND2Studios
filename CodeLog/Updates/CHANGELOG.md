@@ -4,6 +4,259 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-07-03 (Pipeline Run: diagnose "runs but no results")
+
+### Added
+
+- **Preview Crop — restrict the pipeline preview to an XY sub-region.** A new
+  checkable **Preview Crop** button in the Pipelines-page image-viewer overlay-tab
+  row (`_btn_preview_crop`). Toggle it on, then either drag a rectangle on the
+  image or click a point to enter the top-left corner + width/height in a dialog
+  (`_show_preview_crop_dialog`, mirroring the Recipe-page crop dialog). Preview
+  mode — Processing, Analysis and the Results walk — then runs on the *selected
+  frames × the crop* instead of the whole frame, and the preview viewer shows the
+  cropped region so segmentation masks, tracks, vectors, measurements and plots
+  all live in one consistent crop-space coordinate system. Toggling the button
+  off clears the crop; a full **Run** always processes the whole frame (crop is
+  ignored while running) and the crop is not persisted to `.nd2s` (it resets when
+  the active file changes). Implemented as a single choke-point crop applied in
+  the preview frame readers (`_read_planes_frames`, `_extract_processed_frame` via
+  `_read_processed_planes`, `_materialize_channels_for_m`) plus a new
+  `CroppedVolume` (`nd2studios/pipeline_graph/executor.py`) wrapping the lazy base
+  volume for display; `_field_shape_for` and preview job metadata report the crop
+  dims, and `_overlay_result_for` / `_label_stack_for_m` skip the full-frame Run
+  masks while a crop is active. New page helpers: `_crop_rect`, `_crop_frame`,
+  `_maybe_crop_volume`, `_preview_metadata`, `_raw_frame_shape`, `_on_crop_changed`.
+  (`nd2studios/pages/pipelines_page.py`, `nd2studios/pipeline_graph/executor.py`)
+
+- **Preview mode now builds the bottom-panel plots.** Cells/frame, Area,
+  Tracks/frame and Track length were previously generated only by a full Run.
+  A new `_update_preview_plots()` rebuilds them from the previewed measurement
+  rows (scoped to the selected frames + crop) after each Results preview walk, so
+  the plots track the preview like the overlays and measurements table already
+  did. (`nd2studios/pages/pipelines_page.py`)
+
+### Changed
+
+- **Track-persistence condition block is now a single per-track min/max test.**
+  The `track_persistence` if-else block previously exposed *two* thresholds
+  (`min_frames` **and** a `comparator`+`value` count of tracks) — a whole-frame
+  population test that was meaningless in the per-track lens. It now has just
+  **`mode`** (`At least` / `At most`) + **`frames`**: keep a track when it spans
+  ≥ / ≤ N frames. Evaluated per track via a new `_track_frame_counts` (frame
+  appearances per `track_id`, independent of the `track_length` column), so it
+  works even when Cell-Tracker metrics never ran. The block is flagged
+  `object_lens_only` and is offered only for an **Each object / Per track**
+  if-else — the `ConditionBuilderDialog` now takes a `lens` kwarg and hides
+  object-lens-only blocks from a whole-frame if-else's Add menu
+  (`is_object_lens_only`). Old saved blocks migrate silently to "at least 2
+  frames". Dead `_track_lengths` helper removed.
+  (`nd2studios/pipeline_graph/conditions.py`,
+  `nd2studios/widgets/node_board/condition_builder_dialog.py`,
+  `nd2studios/pages/pipelines_page.py`)
+
+- **Spatial maps: restore the original Cell-Tracker construction (griddata).**
+  The spatial-field construction was reverted from the V1.46 binned
+  Gaussian-weighted local-mean + cell-footprint method back to the original
+  Cell-Tracker repository's method: density is a Gaussian-smoothed count of cells
+  per grid bin, and every value-bearing field (`mean_area`, `intensity`,
+  `fold_change`, `self_fold`, `velocity_*`, `speed`, `divergence`, `curl`, and
+  arbitrary `col:` measurement columns) is a `scipy.interpolate.griddata` **linear
+  interpolation** of the per-cell values over the grid — gaps filled with the
+  frame mean (`nan_to_num`; `nan=1.0` for `self_fold`, `0` for velocity), then
+  `gaussian_filter`-smoothed. Scalar fields need ≥4 cells; velocity needs >3 cells
+  tracked into the previous frame; `divergence`/`curl` are `np.gradient` of the
+  velocity grid. Data collection (Cell-Tracker tracking + StarDist segmentation)
+  and every spatial-map functionality (grid step / σ, colour scale, all field
+  types, cell-mask source, overlay, borders, quiver, scale bar, templates,
+  zoom/pan, playback, in-tab Save) are unchanged. `fields.compute_spatial_fields`
+  rewritten (binned helpers `_bin_sum_count` / `cell_footprint` /
+  `_binned_mean_field` removed); `SpatialMapsPanel._bin_value_field` replaced by
+  `_interp_value_field` (griddata, nearest fallback <4 cells) driving
+  `_compute_self_fold_field` / `_interp_column`. The export bridge
+  (`celltracker_bridge`) inherits the change via `compute_spatial_fields`.
+  (`nd2studios/backend/celltracker/fields.py`,
+  `nd2studios/widgets/spatial_maps_panel.py`)
+
+- **The Run button is a full/cropped dropdown when a preview crop is active.**
+  With no crop, Run behaves as before (one click → full-file Run). When a
+  preview crop is set, the Run button shows a ▾ affordance and clicking it drops
+  a menu with **Run full (uncropped) file** and **Run cropped region (w×h @ x,y)**.
+  A cropped Run scopes the whole pipeline — analysis, measurement, overlays,
+  plots and the run viewer — to the crop: `_crop_rect()` now also returns the
+  crop while `_run_active` when the Run was launched cropped (`_run_cropped`),
+  `_run_analysis_node` slices each channel via `_crop_channel_for_run` (lazy
+  slice when the source supports it, else materialize-then-crop) and uses
+  `_preview_metadata` for crop-sized dims. Overlay / Spatial-Maps mask reuse is
+  now gated on a geometry match (`_run_results_crop` — the crop the committed
+  masks were computed at — vs the current display crop) so crop-sized Run masks
+  paint on a cropped display and full-frame masks paint on the full display, but
+  never the mismatched combination. New: `_on_run_button`, `_show_run_menu`,
+  `_start_run`, `_update_run_button`, `_crop_channel_for_run`.
+  (`nd2studios/pages/pipelines_page.py`)
+
+- **Double-clicking a node in the Analysis tab restarts the preview cleanly.**
+  Double-click still promotes a node to the previewed (golden) node, but it now
+  first cancels any preview analysis still computing and resets its scratch —
+  per-plane overlay results (`_analysis_screen_results`), measurement rows,
+  walk shading, plots and the progress bar — via the new
+  `_reset_analysis_preview()`. So a slow analysis (e.g. StarDist) started for one
+  node can't land stale on, or mix with, the node you just double-clicked. A full
+  Run is untouched (it owns the runner + viewer), as are committed Apply/Run
+  results. (`nd2studios/pages/pipelines_page.py`)
+
+- **StarDist Segmentation runs multiple frames at once on multi-core CPUs.**
+  StarDist/TensorFlow share a single, non-thread-safe model (TF pinned to one
+  op-thread), so the node ran strictly one frame at a time — leaving a many-core
+  workstation mostly idle. It now fans frames across separate **worker
+  processes**, each with its own model + TF, via the new
+  `run_stardist_multiprocess` (`nd2studios/backend/analysis/mp_stardist.py`,
+  `spawn` start method). The parent reads frames from the lazy source one at a
+  time and ships them to workers as ndarrays (the lazy reader is never opened in
+  a child; the parent stays the single writer of the streaming/in-RAM label
+  sink), and a bounded ~2×workers in-flight window keeps parent RAM bounded even
+  for huge stacks. A new `n_processes` param (0 = auto) controls the count;
+  auto is gated by `recommended_process_count()` (new in
+  `nd2studios/utils/resources.py`) = min(physical cores, free-RAM ÷ ~2 GB/worker,
+  8). The GPU flag forces sequential (MP just contends over one card), and
+  `n_workers <= 1` / tiny stacks keep the existing thread path unchanged. Output
+  (label masks + measurements) is identical to the sequential path — only where
+  the per-frame work runs changes. Note: on native Windows, TF ≥ 2.11 has no GPU
+  support, so StarDist is CPU-bound there and this is the primary throughput
+  lever. (`nd2studios/backend/analysis/stardist_segmentation.py`)
+
+- **Launcher auto-selects a capable Python interpreter (`run.py`).** On this
+  machine the `py` launcher defaults to Python 3.14, which has no TensorFlow
+  wheel — so `py run.py` launched the GUI on an interpreter where the StarDist
+  Segmentation node can't work (raises "StarDist is not installed"), while a
+  fully-provisioned Python 3.12 sat unused. `run.py` now probes the launching
+  interpreter for the required stack (`PySide6`, `numpy`, `nd2`, `cv2`) and the
+  preferred optional stack (`tensorflow`, `stardist`, `csbdeep`) via `find_spec`;
+  if another installed interpreter (discovered from `$ND2STUDIOS_PYTHON`, the
+  `py -0p` registry, or `PATH`) scores strictly higher, it re-launches itself
+  there via `subprocess`, guarded against re-exec loops by an `ND2STUDIOS_REEXEC`
+  env flag. When the current interpreter already has the full stack it runs in
+  place with no probing (fast path). Set `ND2STUDIOS_PYTHON=<python.exe>` to force
+  a specific interpreter. (`run.py`)
+
+- **Tracking diagnostics.** `object_tracker.link_objects` and the vendored
+  `celltracker.tracking` linkers now log (via `logging`) the detection count,
+  frame count, mean detections/frame, and method on entry, and per-stage timing
+  on exit — for the topology tracker, **link vs. topology-feature vs.
+  final-assignment** seconds are reported separately so a slow run is
+  attributable rather than mysterious. When the largest per-frame cost matrix
+  exceeds 4 M entries, a one-time warning names the O(n³) Hungarian assignment as
+  the inherent cost of a dense field. (`nd2studios/backend/celltracker/tracking.py`,
+  `nd2studios/backend/object_tracker.py`)
+
+### Changed
+
+- **Faster Cell-Tracker topology / fingerprint tracking (result-identical).**
+  The final `track_id` assignment is now a vectorized dict lookup over zipped
+  numpy arrays instead of `df.apply(..., axis=1)` (which built a Series per row —
+  tens of seconds at 100k+ detections); per-frame sub-frames are taken from a
+  single `df.groupby("frame")` instead of a repeated boolean mask (was
+  O(T² · cells)); and `compute_topology_features` is fully vectorized (the
+  per-cell Python loop became array ops, guarded so the single-neighbor case
+  stays bit-for-bit identical to the old loop — covered by
+  `tests/test_tracking_topology.py`). Tracking output is unchanged; only the
+  wall-clock improves. (`nd2studios/backend/celltracker/tracking.py`)
+
+### Bug Fixes
+
+- **Dismiss node never worked as a discard — now a true terminal discard.** The
+  Dismiss node keyed off `track_validation == "rejected"`, a tag no row ever
+  carries (Review/Validate *drops* rejected rows and only tags *accepted* ones).
+  As a result a Run always fell to the else-branch and silently deleted the whole
+  branch, while the preview path did nothing — so preview and Run disagreed and
+  per-object if-else → Dismiss flows behaved unpredictably. Dismiss is now defined
+  as a **terminal discard**: a new `_discard_objects(drop_rows)` erases every
+  object routed to the node — its `label_id` pixels are zeroed out of the
+  committed `label_masks[seg_channel][frame]`, and its rows are dropped from
+  `_run_context["rows"]`, `_results_rows`, and the frozen `_track_overlay_rows` —
+  then the track colormap is rebuilt and the table + viewer refreshed. The object,
+  its track id and all its frames therefore vanish from every viewer tab and
+  never reach a downstream node. Both `_run_dismiss` and the preview
+  (`_preview_execute_walk_node`) call the same helper so the two paths agree.
+  (`nd2studios/pages/pipelines_page.py`)
+
+- **Preview plots and overlay tabs didn't appear after a preview (Analysis tab,
+  results mode).** A preview computed fine but the bottom-panel plots and the
+  Segmentation / Tracks / Vectors overlay tabs stayed hidden — silently, with no
+  crop needed. The async preview-completion path (`_PV_SCREEN_KEY` handler) set
+  `_analysis_screen_results` / `_results_rows` but never re-ran
+  `_update_overlay_tabs_available()`, so tab visibility — computed at
+  node-promotion time, *before* the async result exists — was never refreshed
+  once results landed (the Run path calls it in `_advance_run_m`). Separately, the
+  preview Track Objects walk (`_preview_execute_walk_node`) linked `track_id`s but
+  never built `_track_colormap` / `_track_overlay_rows`, so `has_tracks` stayed
+  False and the Tracks / Vectors tabs never revealed in preview (the Run built
+  this in `_build_track_overlay`). **Fix:** the Run's track-overlay setup is
+  factored into a shared `_set_track_overlay_state(rows)` now called by the
+  preview walk too; the `_PV_SCREEN_KEY` handler resets stale track scratch when
+  fresh results arrive and calls `_update_overlay_tabs_available()` after the walk
+  + preview plots; `_reset_analysis_preview` clears the track scratch as well.
+  Diagnostic logging was added (result/row counts in the handler, no-op reason in
+  `_update_preview_plots`). (`nd2studios/pages/pipelines_page.py`)
+
+- **The Track Objects node showed no progress and ran slowly (Cell-Tracker
+  methods).** The tracking bar sat at 0 % until it jumped to done, and dense
+  fields (thousands of StarDist nuclei) took a long time with no feedback. Two
+  causes: (1) `_TrackJob.run` (`pages/pipelines_page.py`) reported only `0.0`
+  then `1.0` around one opaque blocking call — the `progress_cb` that
+  `track_timeseries` already accepted was never threaded through
+  `link_objects_with_params → link_objects → _link_group_*`; and (2) the
+  vendored trackers used a per-row `df.apply(..., axis=1)` for the final
+  `track_id` column and a re-scanned `df[df["frame"] == f]` boolean mask on every
+  iteration (O(T² · cells)). **Fix (works across all four methods — centroid,
+  SerialTrack, Cell-Tracker topology, Cell-Tracker fingerprint):** a backend-pure
+  `progress_cb(fraction_0_1, message)` is now threaded from `_TrackJob` down
+  through `object_tracker.link_objects` (which splits the 0–1 range across
+  `(channel, m_position)` groups) into each linker, which reports **per frame**
+  (e.g. "Linking frame 42/120"). The GUI callback also polls the cancel token, so
+  a long track is now cancellable mid-run instead of freezing the Stop button.
+  (`nd2studios/backend/object_tracker.py`, `nd2studios/backend/celltracker/tracking.py`,
+  `nd2studios/pages/pipelines_page.py`)
+
+- **Analysis tab showed a stale committed recipe (e.g. a Background Subtract)
+  even when the Processing node graph was empty.** On the Pipelines page the
+  Processing node graph and the committed `record.recipe` were independent
+  sources of truth: the Processing preview linearizes the *graph* (empty graph →
+  raw), but the Analysis base image and every per-frame processed read use
+  `record.recipe` / `record.recipe_normalized` directly (`_show_base_image` →
+  `ProcessedFrameVolume`; `_extract_processed_frame` → `apply_recipe`).
+  `record.recipe` is written only by an explicit Apply, the legacy Recipe page,
+  config load/save, or session load — never by editing the node graph, and an
+  empty graph never cleared it. So a recipe committed through any of those routes
+  stayed live on the Analysis tab (and in exports) with nothing shown in the
+  graph — the symptom being a background subtract "applied" with no node wired to
+  the Output. The node graph is now **authoritative**: leaving the Processing
+  sub-tab re-derives the committed recipe from the graph's primary output chain
+  via new `_graph_recipe()` / `_sync_committed_recipe_from_graph()` (called from
+  `_select_stage`), so an empty / disconnected graph clears the stale recipe and
+  resets `record._processed_view`. Explicit Apply is unchanged (it still performs
+  the durable session-workspace commit); the sync is a cheap in-memory
+  reconciliation guarded to no-op when the effective recipe is unchanged.
+  (`nd2studios/pages/pipelines_page.py`)
+
+- **A pipeline Run could silently produce nothing.** When an analysis node's
+  preconditions weren't met, `_run_analysis_node` (`nd2studios/pages/pipelines_page.py`)
+  bailed out through one of four guard clauses — no active record, unresolvable
+  action, unregistered pipeline, or unreadable/empty processed channels — each
+  calling `_run_finish_node(node.id)` with **no status message and no log line**.
+  The node animated shaded→gold→done, downstream nodes reported "no measured
+  objects — skipped", and the run finished blank with zero clue as to why (the
+  tell-tale `Run: '<pipeline>' done … → N objects.` line never appeared, since the
+  per-M loop was never entered). Likewise, a **failed** analysis compute job for a
+  multipoint was swallowed in the `_RUN_ANALYSIS_KEY` handler with a bare
+  `_advance_run_m()`. Both paths now emit a specific reason to the status bar and
+  the log via a new `_skip_analysis_node(node, reason)` helper (reasons: no file
+  imported / node has no analysis action / no channels available / pipeline
+  `<name>` not registered / could not read processed channels `<exc>` / processed
+  view has no channels) and, for a job failure, `Run: '<pipeline>' failed on M<n>:
+  <error>`. Diagnostics only — a working run is unchanged.
+  (`nd2studios/pages/pipelines_page.py`)
+
 ## [Unreleased] - 2026-06-29 (Spatial maps: every field built like cell density)
 
 ### Bug Fixes

@@ -9,6 +9,18 @@
   or a streaming disk sink (lazy), keeping only measurement rows in RAM.
   `backend/analysis/source_utils.py` provides lazy-or-eager frame access
   (`source_shape`, `read_plane`).
+- **`backend/analysis/mp_stardist.py`** — `run_stardist_multiprocess`, a
+  process-parallel StarDist runner for many-core CPUs. StarDist/TF share a
+  non-thread-safe model (so thread parallelism can't help); instead N worker
+  processes (`spawn`) each load their own model and segment frames concurrently.
+  The parent reads the lazy source one frame at a time, ships ndarrays to workers,
+  and remains the sole writer of the `plane_runner` label sink; a bounded
+  ~2×workers in-flight window preserves the streaming RAM bound. The StarDist
+  node picks sequential vs. MP: GPU → 1 (MP would only contend over one card),
+  else `n_processes` param or `resources.recommended_process_count()`
+  (min(cores, free-RAM ÷ ~2 GB, 8)); `n_workers <= 1`/tiny stacks keep the
+  thread path. Returns the same `PlaneRunOutput`, so output is identical to
+  sequential — only where per-frame work runs changes.
 - **`pipeline/storage.py:LabelStackWriter`** — incremental per-frame label sink
   (zarr `(1,H,W)` chunks, else memmap `.npy`). `AnalysisStage.commit_m` persists
   frame-by-frame and swaps results to the canonical readers.
@@ -78,7 +90,15 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
     branches run, and the Run walk **scopes each downstream node to its branch's
     rows**: `_run_finish_node` records per-output-port rows and `_apply_branch_scope`
     re-points `_run_context["rows"]` to the live incoming branch port (so e.g.
-    Dismiss drops only the failing objects and Spatial Maps see only the kept). The Run's
+    Dismiss discards only the branch's objects and Spatial Maps see only the kept).
+    **Dismiss is a terminal discard:** `_discard_objects(drop_rows)` erases each
+    object's `label_id` from the committed `label_masks`, drops its rows from the
+    results table + frozen `_track_overlay_rows`, and rebuilds the overlay state —
+    so the object, its track id and all its frames vanish from every viewer tab and
+    never reach a downstream node (Run and preview share the helper). **Per-track
+    persistence** (`track_persistence`, `object_lens_only`) is a single min/max
+    frame-count test evaluated per track (`_track_frame_counts`) and is offered by
+    `ConditionBuilderDialog` only when its `lens` kwarg is Each object. The Run's
     interactive nodes reuse the review dialogs — `widgets/track_validation_dialog.py`
     (`TrackValidationDialog`, the Review Objects **Single objects** mode, unit
     model that also reviews untracked objects; V1.45 each cropped panel matches
@@ -108,6 +128,17 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
     **Spatial Fingerprint** (`track_fingerprint`, position + log-area with gap
     filling; `ct_area_weight`, `ct_max_gap`). The `min_track_length` /
     `track_validation` post-pass is shared across all linkers.
+    **Progress + diagnostics (V1.46):** `link_objects` accepts a backend-pure
+    `progress_cb(fraction_0_1, message)`, splits the 0–1 range across its
+    `(channel, m_position)` groups, and every `_link_group_*` reports per frame;
+    `_TrackJob` (`pipelines_page`) adapts it onto its `ProgressReporter` and
+    polls the cancel token in the callback, so a long track shows per-frame
+    movement and is cancellable. The linkers log detection/frame counts and
+    per-stage timing (topology tracker: link vs. features vs. assignment) and
+    warn when the per-frame Hungarian cost matrix is huge (O(n³)). The vendored
+    `celltracker.tracking` trackers group by frame once and assign `track_id`
+    via a vectorized dict lookup (no per-row `df.apply`); `compute_topology_features`
+    is vectorized (output unchanged).
     The **Cell-Tracker Metrics** special node (`backend/celltracker_bridge.augment_rows_with_metrics`
     → `celltracker/metrics.compute_spatial_metrics` + `compute_self_fold_change`)
     augments tracked rows with neighbor distance, local divergence/curl, and
@@ -119,20 +150,18 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
     cell-mask mode, borders, quiver, scale bar, auto/global scaling, frame
     scrubbing) over `celltracker/fields.compute_spatial_fields` +
     `celltracker/metrics.compute_self_fold_change`, with the **Field** dropdown
-    also offering any numeric measurement column (binned via
-    `SpatialMapsPanel._bin_value_field`) — subsuming the old Interpolated node.
-    **All fields share one method (built like cell density):** density is a
+    also offering any numeric measurement column (interpolated via
+    `SpatialMapsPanel._interp_value_field`) — subsuming the old Interpolated node.
+    **The construction matches the original Cell-Tracker repository:** density is a
     Gaussian-smoothed count of cells per grid bin, and every value-bearing field
     (`mean_area`, `intensity`, `fold_change`, `self_fold`, `velocity_*`, `speed`,
-    `divergence`, `curl`, arbitrary columns) is the matching Gaussian-weighted
-    *local mean* — `fields._binned_mean_field` bins the per-cell value-sum and the
-    count, smooths both, and divides (density is that ratio's denominator), so a
-    field is never interpolated across gaps. Because a local mean (unlike the
-    count) does not fade away from cells, every value field is masked to the
-    **cell footprint** (`fields.cell_footprint` — occupied bins dilated by one) so
-    it shows only where objects are; velocity is binned filled (`0`) for its
-    divergence/curl gradients, then masked to its own footprint. Density stays
-    unmasked (a count self-masks by fading to 0). The
+    `divergence`, `curl`, arbitrary columns) is a `scipy.interpolate.griddata`
+    **linear interpolation** of the per-cell values across the grid — gaps outside
+    the convex hull filled with the frame mean (`nan_to_num`, `nan=1.0` for
+    `self_fold`, `0` for velocity), then Gaussian-smoothed. Scalar fields need ≥4
+    cells (else all-NaN); velocity needs >3 cells tracked into the previous frame,
+    and `divergence`/`curl` are `np.gradient` of that velocity grid. Arbitrary
+    columns / `self_fold` fall back to `nearest` with fewer than four cells. The
     page feeds it via `build_tracked_df` (rows → CellTracker DataFrame) +
     per-M label/channel stacks (`_populate_spatial_panel`). The viewer is a
     `QStackedWidget` (image viewer ↔ panel); the **Spatial Maps** overlay tab
@@ -208,7 +237,18 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
   The page is **stage-aware**: per-stage previewed node / highlight / preview
   target. **Processing** preview applies the linearized recipe and shows the
   processed image (`set_channels`); Apply commits the primary output's recipe to
-  the record + best-effort `RecipeStage.commit()`. Previews read the displayed
+  the record + best-effort `RecipeStage.commit()`. **V1.46 — node graph is
+  authoritative:** the Processing graph, not a lingering `record.recipe`, defines
+  what "processed" means. Leaving the Processing sub-tab (`_select_stage`)
+  re-derives the committed recipe from the graph's primary output chain
+  (`_graph_recipe` → `recipe_for_node`, `[]` when the Output is unwired / a direct
+  Input→Output) and syncs the record (`_sync_committed_recipe_from_graph`:
+  `record.recipe` / `recipe_normalized` / `_processed_channels` / rebuilt
+  `_processed_view`), so an empty graph clears a stale recipe (e.g. a Background
+  Subtract committed via config/session/legacy Recipe page) that the Analysis base
+  image (`_show_base_image`) and `_extract_processed_frame` would otherwise still
+  apply. The sync is in-memory only (no session-workspace persist — that stays the
+  explicit Apply) and no-ops when the recipe is unchanged. Previews read the displayed
   M from `record._raw_volume.all_channels_as_lazy(m=…)` and pass the real
   `n_multipoints`, so the viewer navigates every M (recomputing per-M via
   `_on_viewer_coords` / `_channels_for_m` / `_preview_m`); param edits recompute
@@ -264,6 +304,46 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
   tabs are preserved — and restores it to its original splitter slot on close).
   `_toggle_popout` / `_popout_windows` / `_set_panel_visible` keep the
   image/table/split mode logic from hiding a popped-out panel.
+- **V1.46 preview crop:** a checkable **Preview Crop** button (`_btn_preview_crop`)
+  on the overlay-tab row arms the viewer's rubber-band crop tool
+  (`MultiAxisViewer.set_crop_mode`); a drag (`crop_rect_selected`) or click
+  (`canvas.clicked`) opens `_show_preview_crop_dialog` to confirm an
+  `(x, y, w, h)` region stored in `self._preview_crop`. It scopes **preview only**
+  (returned by `_crop_rect`, which yields `None` while `_run_active`) and is
+  applied at the preview frame readers — `_read_planes_frames`,
+  `_read_processed_planes`/`_extract_processed_frame`, `_materialize_channels_for_m`
+  — via `_crop_frame` (slices the last two axes), so segmentation / tracking /
+  measurement all run on the crop. The navigable base image is wrapped in
+  `CroppedVolume` (`pipeline_graph/executor.py`, a `get_frame` proxy reporting
+  crop-size `height`/`width`) by `_maybe_crop_volume` — including under
+  `PinnedProcessedVolume` for the Processing preview — so the viewer shows the
+  cropped region and overlays/masks/rows share one crop-space coordinate system.
+  `_field_shape_for` and `_preview_metadata` report crop dims (Vectors: field,
+  Spatial Maps). Toggling the button off (or a file change, in
+  `load_from_experiment`) clears the crop; it is never serialized.
+- **V1.46 cropped Run:** the Run button (`_on_run_button`) is a plain full-file
+  Run with no crop, but with a preview crop set it drops a menu
+  (`_show_run_menu`) — **Run full** vs **Run cropped region** — and shows a ▾
+  (`_update_run_button`). `_start_run(cropped)` sets `_run_cropped`, so
+  `_crop_rect()` returns the crop even while `_run_active`, and
+  `_run_analysis_node` slices channels (`_crop_channel_for_run`) + crop metadata.
+  Committed Run masks carry their geometry in `_run_results_crop`;
+  `_overlay_result_for` / `_label_stack_for_m` reuse them only when
+  `_run_results_crop == _crop_rect()`, so crop-sized and full-frame masks each
+  paint only on a matching display.
+- **V1.46 preview plots:** `_update_preview_plots()` builds the bottom-panel
+  Cells/frame, Area, Tracks/frame and Track-length plots from the previewed
+  measurement rows after each Results preview walk (`_PV_SCREEN_KEY` →
+  `_preview_walk_downstream` → plots), so they follow the preview (selected
+  frames + crop); previously these were Run-only.
+- **V1.46 double-click resets the preview:** an Analysis-tab double-click
+  (`_on_node_double_clicked`) calls `_reset_analysis_preview()` before promoting
+  the node — it cancels the in-flight preview jobs (`_ANALYSIS_PREVIEW_KEY`,
+  `_RESULTS_PREVIEW_KEY`, `_PV_SCREEN_KEY`, `_ANALYSIS_COMMIT_KEY`) via
+  `JobRunner.cancel`, stops the debounce, and drops preview scratch
+  (`_analysis_screen_results`, `_results_rows`, walk shading, plots, progress) so
+  a new preview never mixes with or lands stale from a prior one. No-op during a
+  Run; committed Apply/Run results survive.
 - **Data flow:** Import `_raw_channels` → Processing INPUT node; each Processing
   OUTPUT node = a `Bridge(PROCESSING→ANALYSIS)` carrying an `EnhancedDataset`
   recipe view via `record.processed_view()`. Analysis INPUT reads
@@ -326,6 +406,14 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
   / a run is live, and Tracks/Vectors only after Track Objects links; called at
   stage switch, run start, and `_build_track_overlay`. Plot tabs were already
   per-run (`_clear_plot_tabs` + lazy `_plot_canvas`).
+  **Preview parity (V1.46):** the async preview-completion handler
+  (`_PV_SCREEN_KEY`) also calls `_update_overlay_tabs_available()` after the
+  downstream walk (so Segmentation/Spatial reveal once the async result lands,
+  not just on node promotion), and the Run's track-overlay setup is factored into
+  a shared `_set_track_overlay_state(rows)` that the preview Track Objects walk
+  calls too — so Tracks/Vectors tabs + `_update_preview_plots` light up in preview
+  exactly as in a Run. The handler resets `_track_colormap` / `_track_overlay_rows`
+  when fresh results arrive so a graph without tracking clears stale track tabs.
 - **If-else metrics:** `conditions._METRICS` extended with `track_length`,
   `delta_area_um2/px`, `neighbor_dist_mean/std`, `local_divergence`, `local_curl`,
   `self_fold` (read via `_metric_value` → `row.get`); the builder auto-discovers

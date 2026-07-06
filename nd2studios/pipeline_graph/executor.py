@@ -483,3 +483,43 @@ class ProcessedFrameVolume:
         if len(self._cache_order) > self._CACHE_MAX:
             self._cache.pop(self._cache_order.pop(0), None)
         return res
+
+
+class CroppedVolume:
+    """Lazy volume that serves a fixed XY sub-rectangle of a wrapped volume.
+
+    Wraps any volume exposing the ``get_frame`` read protocol the
+    ``MultiAxisViewer`` uses (a raw ``LazyND2Volume`` / ``MaterializedDataset``,
+    or one of the processed wrappers above). Every read is sliced to
+    ``[y:y+h, x:x+w]`` and ``height`` / ``width`` report the crop size, so
+    display, segmentation and measurement all operate on the crop region only.
+
+    Used by the Pipelines-page **preview crop** — a preview-only scoping tool. A
+    full Run never wraps in this (crop is ignored while running).
+
+    No ``channels`` attribute → the viewer uses its ``get_frame`` path.
+    """
+
+    def __init__(self, raw_volume: Any, rect: Tuple[int, int, int, int]):
+        self._raw = raw_volume
+        x, y, w, h = (int(v) for v in rect)
+        self._x, self._y, self._w, self._h = x, y, w, h
+        self.channel_names = list(getattr(raw_volume, "channel_names", []))
+        self.n_multipoints = int(getattr(raw_volume, "n_multipoints", 1))
+        self.n_timepoints = int(getattr(raw_volume, "n_timepoints", 1))
+        self.n_zslices = int(getattr(raw_volume, "n_zslices", 1))
+        self.height = h
+        self.width = w
+        self.dtype = getattr(raw_volume, "dtype", np.dtype("uint16"))
+        self.pixel_size_um = float(getattr(raw_volume, "pixel_size_um", 1.0) or 1.0)
+        self.z_step_um = float(getattr(raw_volume, "z_step_um", 1.0) or 1.0)
+
+    @property
+    def rect(self) -> Tuple[int, int, int, int]:
+        return (self._x, self._y, self._w, self._h)
+
+    def get_frame(self, c: int = 0, m: int = 0, t: int = 0, z: int = 0,
+                  z_mode: str = "max", **kwargs) -> np.ndarray:
+        frame = np.asarray(
+            self._raw.get_frame(c=c, m=m, t=t, z=z, z_mode=z_mode, **kwargs))
+        return frame[self._y:self._y + self._h, self._x:self._x + self._w]

@@ -33,10 +33,11 @@ Preview / Apply run through ``MainWindow.job_runner`` (coalesced, debounced
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
@@ -47,14 +48,18 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGraphicsView,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QTabBar,
     QStackedWidget,
@@ -96,6 +101,7 @@ from nd2studios.pipeline_graph import (
     Condition,
     GROUP_ROW,
     LENS_OBJECT,
+    CroppedVolume,
     GraphRunner,
     PinnedProcessedVolume,
     PipelineDoc,
@@ -132,6 +138,8 @@ from nd2studios.widgets.node_board import (
 from nd2studios.pipeline_graph.registry_adapter import (
     RESULTS_PREFIX, results_op_name_for_op_key,
 )
+
+_log = logging.getLogger(__name__)
 
 # Coalescing keys for the shared JobRunner (a fresh submit cancels the previous).
 _PREVIEW_KEY = "pipeline_preview"            # processing image / analysis+results base
@@ -327,11 +335,20 @@ class _TrackJob(AnalysisJob):
 
     def run(self, progress: ProgressReporter) -> List[Dict[str, Any]]:
         progress.update(0.0, "Tracking objects")
+
+        # Per-frame progress from the linker so a long track (dense field →
+        # O(n³) Hungarian) shows movement instead of a frozen bar, and can be
+        # cancelled mid-run: token.check() raises on Stop between frames.
+        def _cb(fraction: float, message: str = "") -> None:
+            self.token.check()
+            progress.update(fraction, message or "Tracking objects")
+
         if self._params is None:
-            link_objects(self._rows)
+            link_objects(self._rows, progress_cb=_cb)
         else:
             link_objects_with_params(
-                self._rows, self._params, pixel_size_um=self._pixel_size_um)
+                self._rows, self._params, pixel_size_um=self._pixel_size_um,
+                progress_cb=_cb)
         self.token.check()
         progress.update(1.0, "Done")
         return self._rows
@@ -465,6 +482,21 @@ class PipelinesPage(QWidget):
         self._processing_planes: List[tuple] = []
         self._proc_volume = None  # live PinnedProcessedVolume (updated in place)
 
+        # Preview crop (V1.46) — a preview-only XY sub-region. When set, preview
+        # (Processing / Analysis / Results, plus overlays + plots) runs on
+        # ``(x, y, w, h)`` in raw-image pixels instead of the whole frame; a full
+        # Run always processes the whole frame. Not persisted to .nd2s; reset when
+        # the active file changes.
+        self._preview_crop: Optional[Tuple[int, int, int, int]] = None
+        self._crop_selecting: bool = False  # crop tool armed (drawing a rect)
+        # Whether the active Run is scoped to the preview crop (chosen via the
+        # Run button's dropdown when a crop is set). Only meaningful while
+        # ``_run_active``. ``_run_results_crop`` records the crop geometry the
+        # committed Run masks were computed at (None = full frame) so overlays
+        # only paint them when the current display geometry matches.
+        self._run_cropped: bool = False
+        self._run_results_crop: Optional[Tuple[int, int, int, int]] = None
+
         # Run state machine (merged Analysis tab): a GraphRunner walks the graph
         # while the page paints shaded/current/done and parks on async compute.
         self._run_active = False
@@ -589,6 +621,10 @@ class PipelinesPage(QWidget):
         self.viewer = MultiAxisViewer(self, show_tile_preview=False)
         self.viewer.coords_changed.connect(self._on_viewer_coords)
         self.viewer.selection_changed.connect(self._on_viewer_selection)
+        # Preview crop (V1.46): a drag emits the rect; a single click enters the
+        # corner into the dialog. Both only act while the crop tool is armed.
+        self.viewer.crop_rect_selected.connect(self._on_preview_crop_drag)
+        self.viewer.canvas.clicked.connect(self._on_preview_crop_click)
 
         self._viewer_container = QWidget()
         vc = QVBoxLayout(self._viewer_container)
@@ -612,6 +648,25 @@ class PipelinesPage(QWidget):
         tab_row.setSpacing(4)
         tab_row.addWidget(self._overlay_tabbar)
         tab_row.addStretch(1)
+        # Preview Crop — restrict preview compute + display to an XY sub-region.
+        self._btn_preview_crop = icon_button(
+            "fa5s.crop-alt",
+            "Preview Crop — restrict the preview to a sub-region.\n"
+            "Toggle on, then drag a rectangle on the image, or click a point to "
+            "enter the top-left corner + width/height manually.\n"
+            "Preview (segmentation, tracking, measurements, overlays and plots) "
+            "then runs on the crop only. Toggle off to clear. A full Run always "
+            "uses the whole frame.",
+            text="Preview Crop", checkable=True,
+            object_name="pipelineToolBtn", icon_px=14,
+        )
+        self._btn_preview_crop.toggled.connect(self._on_preview_crop_toggled)
+        tab_row.addWidget(self._btn_preview_crop)
+        self._lbl_preview_crop = QLabel("")
+        self._lbl_preview_crop.setObjectName("previewCropLabel")
+        self._lbl_preview_crop.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        tab_row.addWidget(self._lbl_preview_crop)
         self._btn_viewer_popout = icon_button(
             "fa5s.expand", "Maximize the image viewer in a separate window",
             object_name="pipelineToolBtn", icon_px=14,
@@ -818,7 +873,7 @@ class PipelinesPage(QWidget):
             "fa5s.play", "Run the pipeline (executes the graph)", text=" Run",
             object_name="pipelineToolBtn",
         )
-        self._btn_run.clicked.connect(self._on_run)
+        self._btn_run.clicked.connect(self._on_run_button)
         self._btn_run.setVisible(False)
         layout.addWidget(self._btn_run)
 
@@ -889,6 +944,11 @@ class PipelinesPage(QWidget):
 
     # ── sub-tab switching ──────────────────────────────────────────────────
     def _select_stage(self, stage: Stage) -> None:
+        # Graph is authoritative (V1.46): leaving Processing re-derives the
+        # committed recipe from the node graph, so an empty / disconnected graph
+        # clears any stale recipe before the Analysis base image reads it.
+        if self._stage is Stage.PROCESSING and stage is not Stage.PROCESSING:
+            self._sync_committed_recipe_from_graph()
         self._stage = stage
         # The processing preview volume is per-visit; rebuild it (via set_volume)
         # on the next preview rather than updating a stale instance in place.
@@ -1051,6 +1111,11 @@ class PipelinesPage(QWidget):
         node = self._current_slice().nodes.get(node_id)
         if node is None:
             return
+        # In the Analysis tab a double-click is a fresh start: cancel any preview
+        # analysis still computing and reset its scratch before previewing the
+        # newly-chosen node, so results never mix or land stale.
+        if self._stage is Stage.ANALYSIS:
+            self._reset_analysis_preview()
         self._preview_node_ids[self._stage] = node_id
         self._update_preview_highlight()
         # Promoting a results/logic/special node switches the merged tab into its
@@ -1197,7 +1262,8 @@ class PipelinesPage(QWidget):
         """Open the condition builder for an if-else node and store the result."""
         dlg = ConditionBuilderDialog(
             node.params.get("condition"), self._current_channel_names(),
-            metrics=self._available_metric_columns(node), parent=self)
+            metrics=self._available_metric_columns(node),
+            lens=node.params.get("lens"), parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         cond = dlg.result_condition()
@@ -1297,6 +1363,38 @@ class PipelinesPage(QWidget):
         scene = self._scenes.get(Stage.ANALYSIS)
         if scene is not None:
             scene.clear_run_states()
+
+    def _reset_analysis_preview(self) -> None:
+        """Cancel any in-flight preview analysis and drop its scratch state so a
+        freshly-previewed node starts from a clean slate.
+
+        Called on a double-click in the Analysis tab: a new preview should not
+        land on top of, or mix with, an analysis that was already computing. A
+        full Run owns the runner + viewer, so this is a no-op while running."""
+        if self._run_active:
+            return
+        # Cancel the preview-analysis jobs this page owns (leave other pages'
+        # jobs and a full Run untouched).
+        if self._runner is not None:
+            for key in (_ANALYSIS_PREVIEW_KEY, _RESULTS_PREVIEW_KEY,
+                        _PV_SCREEN_KEY, _ANALYSIS_COMMIT_KEY):
+                self._runner.cancel(key)
+        # Stop a queued (debounced) preview for the previous target from firing.
+        self._preview_debounce.stop()
+        self._pv_walking = False
+        # Drop preview scratch: per-plane overlay results, measurement rows,
+        # walk shading, plots, progress. (Committed Apply / Run results survive.)
+        self._analysis_screen_results = {}
+        self._results_rows = []
+        # Drop track-overlay scratch too, so the Tracks / Vectors tabs don't
+        # linger with stale data from the previously-previewed node.
+        self._track_colormap = None
+        self._track_overlay_rows = []
+        self._populate_results_table([])
+        self._clear_preview_shading()
+        self._update_preview_plots()
+        self._set_preview_progress(visible=False)
+        self.viewer.invalidate_post_process_cache()
 
     def _on_output_node_created(self, node) -> None:
         self._bridge_counter += 1
@@ -1561,9 +1659,210 @@ class PipelinesPage(QWidget):
         ts = tsel or [int(t)]
         return [(mm, tt) for mm in ms for tt in ts]
 
+    # ── Preview crop (V1.46) ────────────────────────────────────────────────
+    def _crop_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        """The active crop ``(x, y, w, h)`` in raw-image pixels, or None.
+
+        Outside a Run this is the preview crop. During a Run it applies only when
+        the user launched a **cropped** Run (Run button → "Run cropped region");
+        a full Run always processes the whole frame."""
+        if self._run_active and not self._run_cropped:
+            return None
+        return self._preview_crop
+
+    def _crop_frame(self, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Slice a frame's XY to the preview crop if one is active.
+
+        Accepts ``(H, W)``, ``(1, H, W)`` or ``(T, H, W)`` and crops the last two
+        axes, returning the same rank. Pass-through when no crop is active."""
+        rect = self._crop_rect()
+        if rect is None or arr is None:
+            return arr
+        x, y, w, h = rect
+        return np.asarray(arr)[..., y:y + h, x:x + w]
+
+    def _maybe_crop_volume(self, vol):
+        """Wrap ``vol`` in a :class:`CroppedVolume` when a preview crop is active,
+        so the displayed base image is the cropped region."""
+        rect = self._crop_rect()
+        if rect is None or vol is None:
+            return vol
+        return CroppedVolume(vol, rect)
+
+    def _crop_channel_for_run(self, arr) -> np.ndarray:
+        """Crop a whole-stack channel to the active crop for a cropped Run.
+
+        Slices the last two axes. Tries the source's own slicing first (a numpy
+        view, or a lazy proxy that materializes only the crop) and falls back to
+        materialize-then-crop, so a huge lazy source doesn't have to fully
+        materialize when it supports slicing."""
+        rect = self._crop_rect()
+        if rect is None:
+            return np.asarray(arr)
+        x, y, w, h = rect
+        try:
+            return np.asarray(arr[..., y:y + h, x:x + w])
+        except Exception:  # noqa: BLE001 — source doesn't support fancy slicing
+            return np.asarray(arr)[..., y:y + h, x:x + w]
+
+    def _preview_metadata(self, record) -> Dict[str, Any]:
+        """Metadata for a preview job — pixel size plus, when a crop is active,
+        ``height`` / ``width`` overridden to the crop dims so field-based analysis
+        (Vectors: field, Spatial Maps) sizes to the cropped frame."""
+        md = dict(record.nd2_metadata)
+        md["pixel_size_um"] = record.pixel_size_um
+        rect = self._crop_rect()
+        if rect is not None:
+            _, _, w, h = rect
+            md["height"] = int(h)
+            md["width"] = int(w)
+        return md
+
+    def _on_preview_crop_toggled(self, on: bool) -> None:
+        """Toggle the crop tool. On → arm the rubber-band selection; off → clear
+        any active crop and restore the full-frame preview."""
+        if on:
+            self._crop_selecting = True
+            self.viewer.set_crop_mode(True)
+            self._set_status(
+                "Preview crop: drag a rectangle on the image, or click a point to "
+                "enter the region manually.")
+        else:
+            self._crop_selecting = False
+            self.viewer.set_crop_mode(False)
+            had_crop = self._preview_crop is not None
+            self._preview_crop = None
+            self._lbl_preview_crop.setText("")
+            if had_crop:
+                self._on_crop_changed()
+
+    def _on_preview_crop_drag(self, x: int, y: int, w: int, h: int) -> None:
+        if not self._crop_selecting:
+            return
+        self._prompt_and_apply_crop(int(x), int(y), int(w), int(h))
+
+    def _on_preview_crop_click(self, iy: float, ix: float) -> None:
+        # Only a click made while the crop tool is armed enters a crop corner;
+        # after a crop is applied the tool disarms so clicks navigate normally.
+        if not self._crop_selecting:
+            return
+        self._prompt_and_apply_crop(int(ix), int(iy), 0, 0)
+
+    def _prompt_and_apply_crop(self, x: int, y: int, w: int, h: int) -> None:
+        """Confirm/edit the rectangle in a dialog and apply it as the preview
+        crop. Disarms the tool afterwards so the image stays navigable."""
+        rect = self._show_preview_crop_dialog(x, y, w, h)
+        self._crop_selecting = False
+        self.viewer.set_crop_mode(False)
+        if rect is None:
+            # Cancelled — keep any existing crop; if there is none, disarm the
+            # button so its checked state reflects reality.
+            if self._preview_crop is None:
+                self._btn_preview_crop.blockSignals(True)
+                self._btn_preview_crop.setChecked(False)
+                self._btn_preview_crop.blockSignals(False)
+            return
+        self._preview_crop = rect
+        cx, cy, cw, ch = rect
+        self._lbl_preview_crop.setText(f"Crop {cw}×{ch} @({cx},{cy})")
+        # Keep the button checked to signal an active crop.
+        if not self._btn_preview_crop.isChecked():
+            self._btn_preview_crop.blockSignals(True)
+            self._btn_preview_crop.setChecked(True)
+            self._btn_preview_crop.blockSignals(False)
+        self._on_crop_changed()
+
+    def _show_preview_crop_dialog(
+        self, x: int, y: int, w: int, h: int
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Dialog to confirm/edit the crop rectangle. Returns ``(x, y, w, h)`` in
+        raw-image pixels, or None if cancelled."""
+        record = self._active_record()
+        if record is None:
+            return None
+        shape = self._raw_frame_shape(record)
+        if shape is None:
+            return None
+        img_h, img_w = shape
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Preview Crop")
+        layout = QVBoxLayout(dlg)
+        info = QLabel(f"Image: {img_w} × {img_h} px  "
+                      f"(X = columns from left, Y = rows from top)")
+        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        sp_x = QSpinBox()
+        sp_x.setRange(0, max(0, img_w - 1))
+        sp_x.setValue(max(0, min(x, img_w - 1)))
+        sp_x.setToolTip("Left edge of crop (pixels from image left)")
+        sp_y = QSpinBox()
+        sp_y.setRange(0, max(0, img_h - 1))
+        sp_y.setValue(max(0, min(y, img_h - 1)))
+        sp_y.setToolTip("Top edge of crop (pixels from image top)")
+        sp_w = QSpinBox()
+        sp_w.setRange(1, img_w)
+        sp_w.setValue(w if w > 0 else max(1, img_w - int(sp_x.value())))
+        sp_w.setToolTip("Width of crop in pixels")
+        sp_h = QSpinBox()
+        sp_h.setRange(1, img_h)
+        sp_h.setValue(h if h > 0 else max(1, img_h - int(sp_y.value())))
+        sp_h.setToolTip("Height of crop in pixels")
+        form.addRow("X (left corner):", sp_x)
+        form.addRow("Y (top corner):", sp_y)
+        form.addRow("Width (px):", sp_w)
+        form.addRow("Height (px):", sp_h)
+        layout.addLayout(form)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        cx, cy, cw, ch = sp_x.value(), sp_y.value(), sp_w.value(), sp_h.value()
+        # Clamp to image bounds so the crop is always a valid slice.
+        cw = min(cw, img_w - cx)
+        ch = min(ch, img_h - cy)
+        if cw < 1 or ch < 1:
+            return None
+        return (int(cx), int(cy), int(cw), int(ch))
+
+    def _raw_frame_shape(self, record) -> Optional[Tuple[int, int]]:
+        """(H, W) of the raw (un-cropped) frames for ``record``, or None."""
+        vol = getattr(record, "_raw_volume", None)
+        if vol is not None:
+            h = int(getattr(vol, "height", 0) or 0)
+            w = int(getattr(vol, "width", 0) or 0)
+            if h > 0 and w > 0:
+                return (h, w)
+        for arr in (getattr(record, "_raw_channels", None) or {}).values():
+            shp = getattr(arr, "shape", None) or np.asarray(arr).shape
+            if len(shp) >= 2:
+                return (int(shp[-2]), int(shp[-1]))
+        meta = getattr(record, "nd2_metadata", {}) or {}
+        h = int(meta.get("height", 0) or 0)
+        w = int(meta.get("width", 0) or 0)
+        return (h, w) if h > 0 and w > 0 else None
+
+    def _on_crop_changed(self) -> None:
+        """The preview crop was set or cleared — rebuild the processed-plane
+        volume against the new geometry and re-render the base + preview."""
+        self._proc_volume = None
+        self._analysis_screen_results = {}
+        self._update_run_button()
+        if self._stage is Stage.ANALYSIS:
+            self._show_base_image()
+        self._request_preview()
+
     def _read_planes_frames(self, record, planes: List[tuple]) -> Dict[tuple, Dict[str, Any]]:
         """Raw ``{(m, t): {channel: (1, H, W)}}`` for ``planes``, read on the GUI
-        thread (one frame per channel per plane — cheap per plane)."""
+        thread (one frame per channel per plane — cheap per plane). Sliced to the
+        preview crop when one is active."""
         z_mode = getattr(record, "z_view_mode", None) or "max"
         z_index = int(getattr(record, "z_view_index", 0) or 0)
         vol = getattr(record, "_raw_volume", None)
@@ -1574,15 +1873,16 @@ class PipelinesPage(QWidget):
                 for c, name in enumerate(getattr(vol, "channel_names", [])):
                     try:
                         f = vol.get_frame(c=c, m=m, t=t, z=z_index, z_mode=z_mode)
-                        chans[name] = np.asarray(f)[None, ...]
+                        chans[name] = self._crop_frame(np.asarray(f)[None, ...])
                     except Exception:  # noqa: BLE001
                         continue
             else:
                 for name, arr in (record._raw_channels or {}).items():
                     a = (arr.materialize() if hasattr(arr, "materialize")
                          else np.asarray(arr))
-                    chans[name] = (a[[min(t, a.shape[0] - 1)]] if a.ndim == 3
-                                   else a[None, ...])
+                    frame = (a[[min(t, a.shape[0] - 1)]] if a.ndim == 3
+                             else a[None, ...])
+                    chans[name] = self._crop_frame(frame)
             if chans:
                 out[(int(m), int(t))] = chans
         return out
@@ -1608,6 +1908,9 @@ class PipelinesPage(QWidget):
         if vol is not None:
             base = (ProcessedFrameVolume(vol, recipe, normalized)
                     if recipe else vol)
+            # Preview crop: show only the cropped sub-region (analysis, overlays
+            # and measurements all run in this same crop space).
+            base = self._maybe_crop_volume(base)
             self._show_preview_volume(base)
             return
         # Fallback: in-RAM channels (small files).
@@ -1615,8 +1918,13 @@ class PipelinesPage(QWidget):
             return
         m, _, _ = self.viewer.coords()
         self._preview_m = m
+        base_channels = record._raw_channels
+        rect = self._crop_rect()
+        if rect is not None:
+            base_channels = {name: self._crop_frame(arr)
+                             for name, arr in record._raw_channels.items()}
         self.viewer.set_channels(
-            record._raw_channels, channel_display=record.channel_display,
+            base_channels, channel_display=record.channel_display,
             n_multipoints=self._record_n_multipoints(record), m=m,
         )
         if self._stage is Stage.ANALYSIS:
@@ -1655,11 +1963,10 @@ class PipelinesPage(QWidget):
         for (pm, pt) in planes:
             frame = self._extract_processed_frame(record, ch, pm, pt)
             if frame is not None:
-                frames_by_mt[(int(pm), int(pt))] = frame
+                frames_by_mt[(int(pm), int(pt))] = self._crop_frame(frame)
         if not frames_by_mt:
             return
-        metadata = dict(record.nd2_metadata)
-        metadata["pixel_size_um"] = record.pixel_size_um
+        metadata = self._preview_metadata(record)
         job = _AnalysisPreviewJob(
             _ANALYSIS_PREVIEW_KEY, cls, ch, frames_by_mt, metadata, params,
         )
@@ -1734,6 +2041,12 @@ class PipelinesPage(QWidget):
         res = self._analysis_screen_results.get((m, t))
         if res is not None:
             return res, 0
+        # Run masks only overlay when their geometry matches the current display:
+        # a cropped preview can't paint full-frame Run masks, and a full display
+        # can't paint crop-sized Run masks. ``_run_results_crop`` is the geometry
+        # the committed masks were computed at.
+        if self._run_results_crop != self._crop_rect():
+            return None, 0
         res = self._run_results_by_m.get(m)
         if res is not None:
             return res, int(t)
@@ -2080,8 +2393,7 @@ class PipelinesPage(QWidget):
         for nid in self._pv_screen_set:
             self._pv_states[nid] = "current"
         self._scenes[Stage.ANALYSIS].set_run_states(self._pv_states)
-        metadata = dict(record.nd2_metadata)
-        metadata["pixel_size_um"] = record.pixel_size_um
+        metadata = self._preview_metadata(record)
         job = _ResultsScreenMeasureJob(
             _PV_SCREEN_KEY, cls, ch, planes_frames, metadata, aparams, metrics,
         )
@@ -2171,6 +2483,10 @@ class PipelinesPage(QWidget):
             link_objects_with_params(
                 self._results_rows, node.params, pixel_size_um=px)
             self._populate_results_table(self._results_rows)
+            # Light up the Tracks / Vectors overlays + tabs in preview exactly as a
+            # Run does (previously preview linked ids but never built this state,
+            # so the tabs stayed hidden).
+            self._set_track_overlay_state(self._results_rows)
             n = len({r.get("track_id") for r in self._results_rows
                      if r.get("track_id") is not None})
             self._set_status(f"{node.title}: linked {n} track(s).")
@@ -2180,13 +2496,11 @@ class PipelinesPage(QWidget):
             else:
                 self._set_status(f"{node.title} (skipped — navigate is automatic)")
         elif op == SPECIAL_DISMISS_OP_KEY:
-            rejected = [r for r in self._results_rows
-                        if r.get("track_validation") == "rejected"]
-            if rejected:
-                self._results_rows = [r for r in self._results_rows
-                                      if r.get("track_validation") != "rejected"]
-                self._populate_results_table(self._results_rows)
-                self._set_status(f"Dismiss: dropped {len(rejected)} row(s).")
+            # Terminal discard — erase the objects on this branch (in preview the
+            # current rows are the branch subset) from the table + overlays, so
+            # preview matches a Run.
+            dropped = self._discard_objects(list(self._results_rows))
+            self._set_status(f"Dismiss: discarded {dropped} object row(s).")
         elif op == SPECIAL_CT_METRICS_OP_KEY:
             record = self._active_record()
             px = (getattr(record, "pixel_size_um", None)
@@ -2205,7 +2519,12 @@ class PipelinesPage(QWidget):
             self._set_status("Pause — preview stops here (Run executes the rest).")
 
     def _field_shape_for(self, record) -> Optional[tuple]:
-        """(H, W) of the loaded frames from the record metadata, or None."""
+        """(H, W) of the previewed frames — the crop dims when a preview crop is
+        active, otherwise the record metadata frame size, or None."""
+        rect = self._crop_rect()
+        if rect is not None:
+            _, _, w, h = rect
+            return (int(h), int(w))
         if record is None:
             return None
         meta = getattr(record, "nd2_metadata", {}) or {}
@@ -2236,6 +2555,11 @@ class PipelinesPage(QWidget):
     def _label_stack_for_m(self, m: int):
         """``((T, H, W) label stack, channel)`` for multipoint ``m`` — the whole
         run result when present (absolute-frame indexed), else None."""
+        # Run masks only apply when their geometry matches the current display
+        # (see _overlay_result_for); otherwise fall back to crop-space rows +
+        # cropped channels for the Spatial Maps preview.
+        if self._run_results_crop != self._crop_rect():
+            return None, ""
         res = self._run_results_by_m.get(m)
         if res is not None:
             masks = getattr(res, "label_masks", {}) or {}
@@ -2321,14 +2645,15 @@ class PipelinesPage(QWidget):
     def _read_processed_planes(self, record, planes: List[tuple],
                                names: List[str]) -> Dict[tuple, Dict[str, Any]]:
         """Processed ``{(m, t): {channel: (1, H, W)}}`` for ``planes`` (all
-        channels), read on the GUI thread for the results screen+measure job."""
+        channels), read on the GUI thread for the results screen+measure job.
+        Sliced to the preview crop when one is active."""
         out: Dict[tuple, Dict[str, Any]] = {}
         for (m, t) in planes:
             chans: Dict[str, Any] = {}
             for ch in names:
                 f = self._extract_processed_frame(record, ch, m, t)
                 if f is not None:
-                    chans[ch] = f
+                    chans[ch] = self._crop_frame(f)
             if chans:
                 out[(int(m), int(t))] = chans
         return out
@@ -2515,6 +2840,29 @@ class PipelinesPage(QWidget):
         cv.fig.tight_layout()
         cv.draw()
 
+    def _update_preview_plots(self) -> None:
+        """Rebuild the bottom-panel plots (Cells/frame, Area, Tracks/frame,
+        Track length) from the current preview rows (V1.46).
+
+        Preview previously drove only the overlays + measurements table; the
+        matplotlib plots were Run-only. This mirrors them for the preview walk,
+        scoped to the selected frames + crop. Inert during a Run (that path owns
+        the plots) and when Preview is off."""
+        if self._run_active or not self._btn_preview.isChecked():
+            _log.debug("preview plots skipped (run_active=%s, preview_on=%s)",
+                       self._run_active, self._btn_preview.isChecked())
+            return
+        rows = self._results_rows or []
+        # Rebuild from scratch so a removed Track-Objects node drops the track
+        # plots (the builders update in place and would otherwise leave stale tabs).
+        self._clear_plot_tabs()
+        if not rows:
+            _log.debug("preview plots: no rows to plot")
+            return
+        _log.info("preview plots: building from %d row(s)", len(rows))
+        self._update_analysis_plots(rows)   # Cells/frame + Area
+        self._update_track_plots(rows)      # Tracks/frame + Track length (if tracked)
+
     def _on_run_frame(self, key: str, m: int, t: int, labels) -> None:
         """Live per-frame stream from the analysis worker: paint the overlay on the
         just-finished frame and extend the Cells/frame plot (CellTracker's live
@@ -2576,7 +2924,11 @@ class PipelinesPage(QWidget):
                     self._proc_volume.set_planes(planes)
                     self.viewer.refresh()
                 else:
-                    self._proc_volume = PinnedProcessedVolume(vol, planes)
+                    # Pin the processed (already crop-sized) planes over a base
+                    # volume matching the same geometry — cropped when a preview
+                    # crop is active so raw (non-pinned) frames line up.
+                    self._proc_volume = PinnedProcessedVolume(
+                        self._maybe_crop_volume(vol), planes)
                     self._show_preview_volume(self._proc_volume)
             else:
                 # Small in-RAM file (no lazy volume): show the single processed
@@ -2625,6 +2977,14 @@ class PipelinesPage(QWidget):
                 return
             self._analysis_screen_results = dict(result.value.get("results") or {})
             self._results_rows = result.value.get("rows") or []
+            _log.info(
+                "Preview screen+measure done: %d plane result(s), %d row(s)",
+                len(self._analysis_screen_results), len(self._results_rows))
+            # Reset the track-overlay scratch; the downstream walk rebuilds it if a
+            # Track Objects node runs, so a graph *without* tracking clears any
+            # stale track tabs from a previous preview.
+            self._track_colormap = None
+            self._track_overlay_rows = []
             self._populate_results_table(self._results_rows)
             self.viewer.refresh()
             scene = self._scenes.get(Stage.ANALYSIS)
@@ -2633,6 +2993,15 @@ class PipelinesPage(QWidget):
                     self._pv_states[nid] = "done"
                 scene.set_run_states(self._pv_states)
             self._preview_walk_downstream()
+            # Build the bottom-panel plots from the previewed rows (the downstream
+            # walk may have added track_id / dismissed rows first), scoped to the
+            # selected frames + crop — previously these were Run-only.
+            self._update_preview_plots()
+            # Reveal the Segmentation / Spatial overlay tabs now that results
+            # exist — the async preview result lands *after* the node-promotion
+            # tab refresh, so without this the tabs stayed hidden (the Tracks /
+            # Vectors tabs are handled by the walk's _set_track_overlay_state).
+            self._update_overlay_tabs_available()
         elif result.key == _RUN_ANALYSIS_KEY:
             # Run: one multipoint's analysis finished — store it, then measure that
             # M on a worker (chained), so the if-else / specials see whole-file data.
@@ -2654,7 +3023,12 @@ class PipelinesPage(QWidget):
                     getattr(result.value, "volumetric_voxel_counts", None))
                 self._runner.submit(job)
             else:
-                self._advance_run_m()  # analysis failed for this M — skip it
+                # Analysis failed for this M — surface why (was silent), then skip.
+                msg = (f"Run: '{name or 'analysis'}' failed on "
+                       f"M{self._run_current_m + 1}: {result.error}")
+                _log.warning(msg)
+                self._set_status(msg)
+                self._advance_run_m()
         elif result.key == _RUN_MEASURE_KEY:
             # Run: one multipoint's measurements finished — tag with m_position,
             # then track within that M *on a worker* (the linker is O(n) heavy and
@@ -2744,6 +3118,46 @@ class PipelinesPage(QWidget):
             self._apply_processing()
 
     # ── Run (merged Analysis tab) ───────────────────────────────────────────
+    def _on_run_button(self) -> None:
+        """Run-button click. With no preview crop it starts a full-file Run. With
+        a crop set it drops a menu to choose full vs cropped."""
+        if self._preview_crop is not None and not self._run_active:
+            self._show_run_menu()
+        else:
+            self._start_run(cropped=False)
+
+    def _show_run_menu(self) -> None:
+        """Dropdown offering full-file vs cropped-region Run (crop is set)."""
+        menu = QMenu(self)
+        act_full = menu.addAction("Run full (uncropped) file")
+        rect = self._preview_crop
+        label = "Run cropped region"
+        if rect is not None:
+            label += f"  ({rect[2]}×{rect[3]} @ {rect[0]},{rect[1]})"
+        act_crop = menu.addAction(label)
+        act_full.triggered.connect(lambda: self._start_run(cropped=False))
+        act_crop.triggered.connect(lambda: self._start_run(cropped=True))
+        menu.exec(self._btn_run.mapToGlobal(self._btn_run.rect().bottomLeft()))
+
+    def _start_run(self, cropped: bool) -> None:
+        """Launch a Run, optionally scoped to the preview crop."""
+        self._run_cropped = bool(cropped and self._preview_crop is not None)
+        self._on_run()
+
+    def _update_run_button(self) -> None:
+        """Add a ▾ affordance + tooltip when a crop makes Run a full/cropped
+        choice; plain 'Run' otherwise."""
+        btn = getattr(self, "_btn_run", None)
+        if btn is None:
+            return
+        if self._preview_crop is not None:
+            btn.setText(" Run ▾")
+            btn.setToolTip("Run the pipeline — choose full file or the cropped "
+                           "region (a preview crop is active).")
+        else:
+            btn.setText(" Run")
+            btn.setToolTip("Run the pipeline (executes the graph)")
+
     def _on_run(self) -> None:
         """Execute the merged graph. A :class:`GraphRunner` walks it in topo
         order; the page paints each node shaded (pending / un-taken branch),
@@ -2777,6 +3191,9 @@ class PipelinesPage(QWidget):
         self._run_paused = False
         self._runner_obj = GraphRunner(sl)
         self._run_active = True
+        # Record the geometry this Run's masks will be computed at, so overlays
+        # know whether the committed masks match the current display (full vs crop).
+        self._run_results_crop = self._crop_rect()
         self._run_pending = ""
         self._run_context = {"rows": list(self._results_rows or []), "result": None}
         # Per-branch row scoping for object-lens if-else: rows carried on each
@@ -2914,6 +3331,19 @@ class PipelinesPage(QWidget):
         else:
             self._run_finish_node(node.id)
 
+    def _skip_analysis_node(self, node, reason: str) -> None:
+        """Complete an analysis node without running it, but say **why**.
+
+        Every precondition failure in :meth:`_run_analysis_node` used to bail
+        silently via ``_run_finish_node`` — the node went shaded→done and the Run
+        produced nothing, with no clue in the UI or logs. Route them here so the
+        reason lands in the status bar and the log (a Run must never silently do
+        nothing)."""
+        msg = f"Run: '{node.title}' skipped — {reason}"
+        _log.warning(msg)
+        self._set_status(msg)
+        self._run_finish_node(node.id)
+
     def _run_analysis_node(self, node) -> None:
         """Run the analysis pipeline over the WHOLE file — every multipoint, not
         just the current frame. Sets up the per-M loop; ``_advance_run_m`` submits
@@ -2923,12 +3353,16 @@ class PipelinesPage(QWidget):
         action = self._resolve_analysis_action(node.id)
         names = self._current_channel_names()
         if record is None or action is None or not names:
-            self._run_finish_node(node.id)
+            reason = ("no file imported" if record is None
+                      else "node has no analysis action"
+                      if action is None else "no channels available")
+            self._skip_analysis_node(node, reason)
             return
         name = analysis_pipeline_name_for_op_key(action.op_key)
         cls = AnalysisPipeline.get_pipeline(name)
         if cls is None:
-            self._run_finish_node(node.id)
+            self._skip_analysis_node(
+                node, f"analysis pipeline {name!r} is not registered")
             return
         params = dict(action.params)
         ch = params.get("channel_name") or names[0]
@@ -2937,15 +3371,22 @@ class PipelinesPage(QWidget):
         params["channel_name"] = ch
         view = record.processed_view()
         try:
-            channels = {nm: view[nm] for nm in view.keys()}
-        except Exception:  # noqa: BLE001
-            self._run_finish_node(node.id)
+            if self._crop_rect() is not None:
+                # Cropped Run: slice each channel to the crop. Slicing first (when
+                # the source supports it) keeps only the crop in RAM; otherwise
+                # _crop_channel_for_run materializes then crops.
+                channels = {nm: self._crop_channel_for_run(view[nm])
+                            for nm in view.keys()}
+            else:
+                channels = {nm: view[nm] for nm in view.keys()}
+        except Exception as exc:  # noqa: BLE001
+            self._skip_analysis_node(
+                node, f"could not read processed channels ({exc})")
             return
         if not channels:
-            self._run_finish_node(node.id)
+            self._skip_analysis_node(node, "processed view has no channels")
             return
-        metadata = dict(record.nd2_metadata)
-        metadata["pixel_size_um"] = record.pixel_size_um
+        metadata = self._preview_metadata(record)
         self._analysis_commit_pipeline = name
         self._run_analysis_ctx = {
             "node_id": node.id, "cls": cls, "name": name, "params": params,
@@ -3023,8 +3464,10 @@ class PipelinesPage(QWidget):
 
     def _materialize_channels_for_m(self, record, m: int) -> Dict[str, Any]:
         """``{channel: (T, H, W)}`` for multipoint ``m`` — image data the
-        validation / export / send-to-results steps need. Reads the raw volume
-        frame-by-frame (or indexes in-RAM channels for small files)."""
+        validation / export / send-to-results / Spatial Maps steps need. Reads
+        the raw volume frame-by-frame (or indexes in-RAM channels for small
+        files). Sliced to the preview crop when one is active (Spatial Maps
+        preview) — inert during a full Run."""
         out: Dict[str, np.ndarray] = {}
         vol = getattr(record, "_raw_volume", None)
         if vol is not None:
@@ -3040,11 +3483,11 @@ class PipelinesPage(QWidget):
                     except Exception:  # noqa: BLE001
                         pass
                 if frames:
-                    out[name] = np.stack(frames, axis=0)
+                    out[name] = self._crop_frame(np.stack(frames, axis=0))
             return out
         for name, arr in (record._raw_channels or {}).items():
             a = arr.materialize() if hasattr(arr, "materialize") else np.asarray(arr)
-            out[name] = a if a.ndim == 3 else a[None, ...]
+            out[name] = self._crop_frame(a if a.ndim == 3 else a[None, ...])
         return out
 
     def _ensure_run_rows(self) -> List[Dict[str, Any]]:
@@ -3143,16 +3586,20 @@ class PipelinesPage(QWidget):
             f"{title}: {n_tracks} track(s) across {len(rows)} objects ({method}).")
         self._run_finish_node(node.id if node is not None else self._run_pending)
 
-    def _build_track_overlay(self, rows: List[Dict[str, Any]]) -> None:
-        """Build the track colormap + long-track set, switch to the Tracks tab,
-        and play through the frames so the colored cells build up 'as we go',
-        ending on frame 0 with every tracked cell shown as a solid color."""
+    def _set_track_overlay_state(self, rows: List[Dict[str, Any]]) -> bool:
+        """Build the track colormap + long-track set + frozen overlay rows from
+        ``rows`` and refresh overlay-tab availability. Returns True if any tracks.
+
+        Shared by the Run (``_build_track_overlay``) and the preview walk so the
+        Tracks / Vectors overlays and their tabs light up in **both** paths — the
+        preview path previously linked track ids without ever building this state,
+        so ``has_tracks`` stayed False and the tabs never appeared."""
         from collections import Counter
         from nd2studios.backend.track_overlays import generate_track_colormap
         cnt = Counter(r.get("track_id") for r in rows
                       if r.get("track_id") is not None)
         if not cnt:
-            return
+            return False
         T = max((int(r.get("frame", 0)) for r in rows), default=0) + 1
         min_long = max(10, T // 10)
         long_ids = {tid for tid, c in cnt.items() if c >= min_long}
@@ -3164,6 +3611,15 @@ class PipelinesPage(QWidget):
         # rendering even after a downstream Dismiss empties ``_results_rows``.
         self._track_overlay_rows = list(rows)
         self._update_overlay_tabs_available()
+        return True
+
+    def _build_track_overlay(self, rows: List[Dict[str, Any]]) -> None:
+        """Build the track colormap + long-track set, switch to the Tracks tab,
+        and play through the frames so the colored cells build up 'as we go',
+        ending on frame 0 with every tracked cell shown as a solid color."""
+        if not self._set_track_overlay_state(rows):
+            return
+        T = max((int(r.get("frame", 0)) for r in rows), default=0) + 1
         self._select_overlay_tab("tracks")
         self._start_track_playthrough(T)
 
@@ -3297,19 +3753,64 @@ class PipelinesPage(QWidget):
         self._populate_results_table(rows)
         return rows
 
+    def _discard_objects(self, drop_rows: List[Dict[str, Any]]) -> int:
+        """Terminal discard: erase every object in ``drop_rows`` — its label, its
+        track id, and all of its frames — from the results table, the frozen
+        tracks/vectors overlay rows, and the committed segmentation label masks.
+        The object then vanishes from every viewer tab and never reaches a
+        downstream node. Returns the number of object rows removed.
+
+        The Run masks are edited in place (the object's label pixels are zeroed
+        per frame); intentional for a terminal discard, and it keeps exports and
+        the segmentation overlay consistent with what the viewer shows. Row stores
+        share dict identity, so dropping by ``id()`` reaches every store at once."""
+        drop_ids = {id(r) for r in drop_rows}
+        if not drop_ids:
+            return 0
+        # 1. Zero the dropped labels out of the primary segmentation masks so the
+        #    segmentation/masks overlay and exports stop showing them.
+        for r in drop_rows:
+            res = self._run_results_by_m.get(int(r.get("m_position", 0) or 0))
+            masks = getattr(res, "label_masks", None) if res is not None else None
+            if not masks:
+                continue
+            seg = r.get("segmentation_channel") or next(iter(masks), None)
+            arr = masks.get(seg) if seg is not None else None
+            lid = r.get("label_id")
+            f = int(r.get("frame", 0) or 0)
+            if arr is None or lid is None or not (0 <= f < arr.shape[0]):
+                continue
+            frame = np.asarray(arr[f])
+            frame[frame == int(lid)] = 0
+        # 2. Drop the rows from every row store (results table + frozen overlays).
+        def _survivors(rows):
+            return [r for r in (rows or []) if id(r) not in drop_ids]
+        self._run_context["rows"] = _survivors(self._run_context.get("rows"))
+        self._results_rows = _survivors(self._results_rows)
+        self._track_overlay_rows = _survivors(
+            getattr(self, "_track_overlay_rows", None))
+        # 3. Rebuild the track colormap from the survivors and refresh the views.
+        if not self._set_track_overlay_state(self._track_overlay_rows):
+            self._track_colormap = {}
+            self._track_long_ids = set()
+        self._populate_results_table(self._results_rows)
+        try:
+            self.viewer.invalidate_post_process_cache()
+            _, t, _ = self.viewer.coords()
+            self.viewer.set_current_frame(t=t)
+        except Exception:  # noqa: BLE001 — a repaint hiccup must not break a Run
+            pass
+        return len(drop_ids)
+
     def _run_dismiss(self, node) -> None:
-        """Dismiss: drop rejected-track rows from the stream; if none are flagged,
-        drop the whole current set (the data on this branch is discarded)."""
-        rows = self._ensure_run_rows()
-        rejected = [r for r in rows if r.get("track_validation") == "rejected"]
-        if rejected:
-            kept = [r for r in rows if r.get("track_validation") != "rejected"]
-            dropped = len(rejected)
-        else:
-            kept, dropped = [], len(rows)
-        self._run_context["rows"] = kept
-        self._results_rows = kept
-        self._populate_results_table(kept)
+        """Dismiss — terminal discard: every object routed to this node (its
+        track and all its frames) is erased from the results table, the overlays
+        and the segmentation masks, so it disappears from every viewer/results tab
+        and never reaches a downstream node. On an object-lens branch the incoming
+        rows are the branch's objects; with no upstream split it discards the whole
+        current set."""
+        rows = list(self._ensure_run_rows())
+        dropped = self._discard_objects(rows)
         self._set_status(f"Dismissed {dropped} object row(s).")
         self._run_finish_node(node.id)
 
@@ -3458,6 +3959,54 @@ class PipelinesPage(QWidget):
             scene = self._scenes.get(Stage.ANALYSIS)
             if scene is not None:
                 scene.clear_run_states()
+
+    # ── graph-authoritative recipe sync (V1.46) ─────────────────────────────
+    def _graph_recipe(self) -> List:
+        """The recipe the Processing node graph currently represents.
+
+        Linearizes the primary OUTPUT node's chain. Returns ``[]`` when there is
+        no OUTPUT node, when the OUTPUT is not connected back to the INPUT
+        (``recipe_for_node`` raises), or for a direct Input→Output wire (empty
+        chain) — i.e. the graph says "no processing".
+        """
+        outs = output_nodes(self._doc.processing)
+        if not outs:
+            return []
+        try:
+            return recipe_for_node(self._doc.processing, outs[0].id)
+        except ValueError:
+            return []
+
+    def _sync_committed_recipe_from_graph(self) -> None:
+        """Make the node graph authoritative: re-derive ``record.recipe`` from
+        the Processing graph so the Analysis base image / exports never show a
+        stale committed recipe that the (possibly empty) graph no longer holds.
+
+        Mirrors the record-side of :meth:`_apply_processing` (recipe, normalized
+        flag, processed view/channels) but does **not** persist to the session
+        workspace — that stays the explicit Apply action. No-ops when the
+        effective recipe is unchanged, so the lazy ``EnhancedDataset`` is only
+        rebuilt on a real change.
+        """
+        record = self._active_record()
+        if record is None or not record._raw_channels:
+            return
+        recipe = self._graph_recipe()
+        normalized = bool(self._normalized)
+        if (list(getattr(record, "recipe", []) or []) == recipe
+                and bool(getattr(record, "recipe_normalized", False)) == normalized):
+            return
+        from nd2studios.pipeline.stages.recipe_stage import EnhancedDataset
+        record.recipe = recipe
+        record.recipe_normalized = normalized
+        record._processed_channels = None
+        record._processed_view = (
+            EnhancedDataset(
+                record._raw_channels, recipe, normalized,
+                pixel_size_um=record.pixel_size_um,
+            )
+            if recipe else None
+        )
 
     def _apply_processing(self) -> None:
         record = self._active_record()
@@ -3715,6 +4264,18 @@ class PipelinesPage(QWidget):
         self._analysis_results_per_m = {}
         self._processing_planes = []
         self._proc_volume = None
+        # Preview crop is per-file — clear it (dims won't match a new file).
+        self._preview_crop = None
+        self._crop_selecting = False
+        self._run_cropped = False
+        self._run_results_crop = None
+        if getattr(self, "_btn_preview_crop", None) is not None:
+            self._btn_preview_crop.blockSignals(True)
+            self._btn_preview_crop.setChecked(False)
+            self._btn_preview_crop.blockSignals(False)
+            self._lbl_preview_crop.setText("")
+            self.viewer.set_crop_mode(False)
+        self._update_run_button()
         self._results_overlay_result = None
         self._results_rows = []
         self._populate_results_table([])

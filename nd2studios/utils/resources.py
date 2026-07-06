@@ -109,6 +109,29 @@ def recommended_worker_count() -> int:
     return min(detect().cpu_count_physical, 8)
 
 
+def recommended_process_count(per_worker_gb: float = 2.0, cap: int = 8) -> int:
+    """Worker-process count for heavyweight per-frame models (StarDist / TF).
+
+    Unlike :func:`recommended_worker_count` (thread pool for numpy /
+    scikit-image), this sizes a *process* pool where each worker loads its own
+    model + TensorFlow — a fixed ~1.5–2 GB resident set per worker. The count is
+    therefore bounded by three things:
+
+    * physical cores (each StarDist/TF process is pinned to one op-thread, so it
+      saturates ~one core),
+    * available RAM divided by ``per_worker_gb`` (so we never oversubscribe
+      memory and trigger swap on a constrained machine), and
+    * ``cap`` — beyond ~8 the per-process TF-init cost and diminishing returns
+      make more workers a net loss for typical timelapse lengths.
+
+    On a 32 GB / 16-core workstation with ~16 GB free this returns 8; on a 8 GB
+    laptop with ~3 GB free it returns 1 and the caller stays sequential.
+    """
+    res = detect()
+    by_ram = max(1, int(res.available_ram_gb / max(0.25, per_worker_gb)))
+    return max(1, min(res.cpu_count_physical, by_ram, cap))
+
+
 def log_system_resources() -> None:
     """Emit a one-line info log summarising host RAM + CPU.
 

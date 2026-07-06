@@ -39,7 +39,7 @@ from nd2studios.widgets.scale_bar import draw_scale_bar
 from nd2studios.widgets.frame_strip import FrameStrip
 from nd2studios.widgets.icon_button import icon_button, bind_toggle_icon
 from nd2studios.backend.celltracker.fields import (
-    compute_spatial_fields, FIELD_OPTIONS, _binned_mean_field, cell_footprint,
+    compute_spatial_fields, FIELD_OPTIONS,
 )
 from nd2studios.backend.celltracker.metrics import compute_self_fold_change
 from nd2studios.backend import spatial_templates
@@ -780,7 +780,7 @@ class SpatialMapsPanel(QWidget):
 
     def _refresh_field_columns(self) -> None:
         """Append numeric measurement columns (beyond the built-ins) to the Field
-        combo as binned ``col:<name>`` entries (Gaussian-weighted local mean)."""
+        combo as ``col:<name>`` entries (linearly interpolated onto the grid)."""
         self.combo_field.blockSignals(True)
         try:
             while self.combo_field.count() > self._n_builtin_fields:
@@ -970,41 +970,50 @@ class SpatialMapsPanel(QWidget):
             result["fold_change"] = ism / gm
         return result
 
-    def _bin_value_field(self, t: int, col: str, fill: float = np.nan):
-        """Bin a per-cell value column onto the grid as a Gaussian-weighted local
-        mean, masked to the cell footprint — the same method (and masking) the
-        built-in fields use (see
-        :func:`nd2studios.backend.celltracker.fields._binned_mean_field`). Returns
-        the grid array, or ``None`` when the frame has no usable samples. Shares the
-        grid already built by :meth:`_compute_frame`."""
+    def _interp_value_field(self, t: int, col: str, fill: Optional[float] = None):
+        """Interpolate a per-cell value column onto the grid via linear
+        ``griddata`` — the original Cell-Tracker method: triangulate the cell
+        centroids, linearly interpolate the value across the grid, fill the gaps
+        (with ``fill`` when given, else the frame mean), then Gaussian-smooth.
+        Falls back to ``nearest`` with fewer than four cells. Shares the grid built
+        by :meth:`_compute_frame`. Returns the grid array, or ``None`` when the
+        frame has no usable samples."""
+        from scipy.interpolate import griddata
+        from scipy.ndimage import gaussian_filter
+
         grid_y = self._current_fields.get("grid_y")
-        if grid_y is None:
+        grid_x = self._current_fields.get("grid_x")
+        if grid_y is None or grid_x is None:
             return None
         fdf = self._tracked_df[self._tracked_df["frame"] == t]
         if fdf.empty or col not in fdf.columns:
             return None
         vals = fdf[col].values.astype(float)
-        if not np.isfinite(vals).any():
+        ok = np.isfinite(vals)
+        if not ok.any():
             return None
-        cy = fdf["centroid_y"].values
-        cx = fdf["centroid_x"].values
-        gs = int(self.spin_grid.value())
-        footprint = cell_footprint(cy, cx, grid_y.shape, gs)
-        return _binned_mean_field(
-            cy, cx, vals, grid_y.shape, gs,
-            float(self.spin_sigma.value()), fill=fill, mask=footprint)
+        pts = np.column_stack([fdf["centroid_y"].values[ok],
+                               fdf["centroid_x"].values[ok]])
+        v = vals[ok]
+        method = "linear" if ok.sum() >= 4 else "nearest"
+        filln = float(np.nanmean(v)) if fill is None else float(fill)
+        try:
+            fd = griddata(pts, v, (grid_y, grid_x), method=method)
+            fd = np.nan_to_num(fd, nan=filln)
+        except Exception:  # noqa: BLE001 — degenerate point set (collinear, etc.)
+            fd = np.full_like(grid_y, filln)
+        return gaussian_filter(fd, sigma=float(self.spin_sigma.value()))
 
     def _compute_self_fold_field(self, t, int_col):
         self._tracked_df = compute_self_fold_change(self._tracked_df, int_col)
-        arr = self._bin_value_field(t, "_self_fold")
+        arr = self._interp_value_field(t, "_self_fold", fill=1.0)
         if arr is not None:
             self._current_fields["self_fold"] = arr
 
     def _interp_column(self, t, col):
-        """Bin an arbitrary numeric measurement column onto the grid as a
-        Gaussian-weighted local mean (covers the former 'Interpolated Spatial
-        Maps' node)."""
-        arr = self._bin_value_field(t, col)
+        """Linearly interpolate an arbitrary numeric measurement column onto the
+        grid (covers the former 'Interpolated Spatial Maps' node)."""
+        arr = self._interp_value_field(t, col)
         if arr is not None:
             self._current_fields[f"col:{col}"] = arr
 

@@ -223,16 +223,6 @@ def _eval_colocalization(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> bool:
     return _cmp(float(pos), op, val)
 
 
-def _track_lengths(rows: List[Dict[str, Any]]) -> Dict[Any, int]:
-    out: Dict[Any, int] = {}
-    for r in rows:
-        tid = r.get("track_id")
-        if tid is None:
-            continue
-        out[tid] = max(out.get(tid, 0), int(r.get("track_length") or 0))
-    return out
-
-
 def _eval_track_count(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> bool:
     op = str(p.get("comparator", ">"))
     val = _num(p.get("value", 0.0)) or 0.0
@@ -240,12 +230,33 @@ def _eval_track_count(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> bool:
     return _cmp(float(len(ids)), op, val)
 
 
+def _track_frame_counts(rows: List[Dict[str, Any]]) -> Dict[Any, int]:
+    """Per-track frame-appearance count — how many frames each ``track_id`` spans
+    in ``rows`` (one measurement row per object per frame). Independent of the
+    ``track_length`` column so it works even when Cell-Tracker metrics never ran."""
+    out: Dict[Any, int] = {}
+    for r in rows:
+        tid = r.get("track_id")
+        if tid is None:
+            continue
+        out[tid] = out.get(tid, 0) + 1
+    return out
+
+
 def _eval_track_persistence(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> bool:
-    min_frames = _num(p.get("min_frames", 2)) or 2
-    op = str(p.get("comparator", ">="))
-    val = _num(p.get("value", 1.0)) or 1.0
-    n = sum(1 for L in _track_lengths(rows).values() if L >= min_frames)
-    return _cmp(float(n), op, val)
+    """Per-track persistence: keep a track by how long it lasts. ``mode="min"``
+    passes when every track spans **≥ frames**; ``mode="max"`` when every track
+    spans **≤ frames**. In the object lens (Per track) each group is one track, so
+    this reads as "keep this track if it lasts at least / at most N frames"."""
+    mode = str(p.get("mode", "At least")).lower()
+    is_max = mode.startswith("at most") or mode == "max"
+    frames = _num(p.get("frames", 2)) or 0.0
+    counts = list(_track_frame_counts(rows).values())
+    if not counts:
+        return False
+    if is_max:
+        return all(float(c) <= frames for c in counts)
+    return all(float(c) >= frames for c in counts)
 
 
 def _eval_count_change(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> bool:
@@ -426,13 +437,14 @@ BLOCK_KINDS: Dict[str, Dict[str, Any]] = {
         "family": "Timelapse / tracking",
         "label": "Track persistence",
         "eval": _eval_track_persistence,
+        "object_lens_only": True,
         "summary": lambda p: (
-            f"# tracks lasting >= {p.get('min_frames',2)} frames "
-            f"{p.get('comparator','>=')} {p.get('value',1)}"),
+            f"track lasts {str(p.get('mode', 'At least')).lower()} "
+            f"{p.get('frames', 2)} frame(s)"),
         "params": [
-            _p("min_frames", "Min frames", "int", 2),
-            _p("comparator", "Is", "choice", ">=", CMP),
-            _p("value", "Value", "float", 1.0),
+            _p("mode", "Keep tracks lasting", "choice", "At least",
+               ["At least", "At most"]),
+            _p("frames", "Frames", "int", 2),
         ],
     },
     "count_change": {
@@ -480,6 +492,13 @@ def families() -> Dict[str, List[str]]:
 def block_label(kind: str) -> str:
     spec = BLOCK_KINDS.get(kind)
     return spec["label"] if spec else kind
+
+
+def is_object_lens_only(kind: str) -> bool:
+    """True for blocks that only make sense in an object lens (Each object / Per
+    track) if-else — e.g. per-track persistence. The builder hides these from a
+    whole-frame if-else so they never appear where they can't work."""
+    return bool((BLOCK_KINDS.get(kind) or {}).get("object_lens_only"))
 
 
 def block_param_schema(kind: str) -> List[Dict[str, Any]]:
