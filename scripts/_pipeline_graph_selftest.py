@@ -148,21 +148,28 @@ def main() -> int:
     assert len(merged_action_specs()) >= 9
     # Track Objects (was "Validate Tracked Objects") is in the palette with its
     # tracking params: shared (method / distance / length) + centroid-only
-    # (size / gap) + SerialTrack-only (st_mode / st_n_neighbors) + Cell-Tracker
-    # topology (ct_n_neighbors / ct_topo_weight) and fingerprint (ct_area_weight /
-    # ct_max_gap). The param popup shows the method-relevant subset via each
-    # spec's visible_when.
+    # (size / gap) + SerialTrack-only (mode / neighbors / global+local solver /
+    # smoothness / outlier + ghost-cull / ADMM iteration budget / warm start) +
+    # Cell-Tracker topology (ct_n_neighbors / ct_topo_weight) and fingerprint
+    # (ct_area_weight / ct_max_gap). The param popup shows the method-relevant
+    # subset via each spec's visible_when.
     assert SPECIAL_TRACK_OP_KEY in sp and sp[SPECIAL_TRACK_OP_KEY].title == "Track Objects"
     assert not any(s.title == "Validate Tracked Objects" for s in special_specs())
     track = build_node(sp[SPECIAL_TRACK_OP_KEY])
     assert set(track.params) == {
         "method", "max_distance", "distance_unit", "max_size_diff",
-        "min_track_length", "max_frame_gap", "st_mode", "st_n_neighbors",
+        "min_track_length", "max_frame_gap",
+        "st_mode", "st_n_neighbors", "st_n_neighbors_min", "st_solver",
+        "st_loc_solver", "st_smoothness", "st_outlier_threshold", "st_max_iter",
+        "st_iter_stop_threshold", "st_dist_missing", "st_use_prev_results",
         "ct_n_neighbors", "ct_topo_weight", "ct_area_weight", "ct_max_gap"}, track.params
-    method_choices = {s.name: s for s in param_specs_for(SPECIAL_TRACK_OP_KEY)}["method"].choices
+    st_specs = {s.name: s for s in param_specs_for(SPECIAL_TRACK_OP_KEY)}
+    method_choices = st_specs["method"].choices
     assert "SerialTrack (topology PTV)" in method_choices
     assert "Cell-Tracker: Topology (Hungarian)" in method_choices
     assert "Cell-Tracker: Spatial Fingerprint" in method_choices
+    # The ADMM global solver is routed in as a SerialTrack option.
+    assert set(st_specs["st_solver"].choices) == {"MLS", "Regularization", "ADMM"}
     # CellTracker supportive special nodes: Metrics augments rows; Field Maps
     # renders Eulerian heatmaps. Both carry flat params (no custom editor).
     from nd2studios.pipeline_graph.registry_adapter import (

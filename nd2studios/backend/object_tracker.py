@@ -61,6 +61,15 @@ def link_objects(
     method: str = METHOD_CENTROID,
     st_mode: str = "Incremental",
     st_n_neighbors: int = 25,
+    st_solver: str = "Regularization",
+    st_loc_solver: str = "Topology",
+    st_n_neighbors_min: int = 1,
+    st_smoothness: float = 0.1,
+    st_outlier_threshold: float = 5.0,
+    st_max_iter: int = 20,
+    st_iter_stop_threshold: float = 1e-2,
+    st_dist_missing: float = 5.0,
+    st_use_prev_results: bool = False,
     ct_n_neighbors: int = 5,
     ct_topo_weight: float = 0.3,
     ct_area_weight: float = 0.3,
@@ -108,6 +117,34 @@ def link_objects(
     st_n_neighbors:
         SerialTrack topology-descriptor neighbor count (``n_neighbors_max``).
         Ignored for the centroid method.
+    st_solver:
+        SerialTrack global-step solver: ``"MLS"`` (mesh-free moving least
+        squares), ``"Regularization"`` (scatter→grid smoothing; default), or
+        ``"ADMM"`` (augmented-Lagrangian with automatic L-curve α — most faithful
+        to the paper, costlier).  SerialTrack only.
+    st_loc_solver:
+        SerialTrack local matcher: ``"Topology"`` or
+        ``"Histogram then Topology"``.  SerialTrack only.
+    st_n_neighbors_min:
+        Floor for the exponential neighbor-count decay across iterations
+        (``n_neighbors_min``).  SerialTrack only.
+    st_smoothness:
+        Global smoothing strength (the ``α/µ`` knob; used by Regularization and
+        ADMM).  SerialTrack only.
+    st_outlier_threshold:
+        Westerweel normalized-median-residual cutoff (``0`` disables).
+        SerialTrack only.
+    st_max_iter:
+        Max ADMM iterations per frame pair.  SerialTrack only.
+    st_iter_stop_threshold:
+        ADMM convergence threshold on the displacement-update norm.  SerialTrack
+        only.
+    st_dist_missing:
+        Ghost-particle cull distance ``ε_d`` (px), active in late iterations.
+        SerialTrack only.
+    st_use_prev_results:
+        Enable the data-driven initial-guess predictor (warm start) for frames
+        ≥3.  The POD-GPR stage (frames ≥7) needs scikit-learn.  SerialTrack only.
     ct_n_neighbors:
         CellTracker topology-Hungarian neighbor count for the rotation-invariant
         descriptor.  Used only by ``METHOD_CT_TOPOLOGY``.
@@ -184,7 +221,13 @@ def link_objects(
         if method == METHOD_SERIALTRACK:
             _link_group_serialtrack(
                 group_rows, max_displacement_px, st_mode, st_n_neighbors,
-                _next_track_id, progress_cb=_group_cb,
+                _next_track_id,
+                solver_str=st_solver, loc_solver_str=st_loc_solver,
+                n_neighbors_min=st_n_neighbors_min, smoothness=st_smoothness,
+                outlier_threshold=st_outlier_threshold, max_iter=st_max_iter,
+                iter_stop_threshold=st_iter_stop_threshold,
+                dist_missing=st_dist_missing, use_prev_results=st_use_prev_results,
+                progress_cb=_group_cb,
             )
         elif method in (METHOD_CT_TOPOLOGY, METHOD_CT_FINGERPRINT):
             _link_group_celltracker(
@@ -241,7 +284,10 @@ def link_objects_with_params(
       (becomes ``max_displacement_px``; SerialTrack and the CellTracker linkers
       use it as the field of search / max link distance), ``min_track_length``.
     * centroid only — ``max_size_diff``, ``max_frame_gap``.
-    * SerialTrack only — ``st_mode``, ``st_n_neighbors``.
+    * SerialTrack only — ``st_mode``, ``st_n_neighbors``, ``st_solver``,
+      ``st_loc_solver``, ``st_n_neighbors_min``, ``st_smoothness``,
+      ``st_outlier_threshold``, ``st_max_iter``, ``st_iter_stop_threshold``,
+      ``st_dist_missing``, ``st_use_prev_results``.
     * Cell-Tracker topology only — ``ct_n_neighbors``, ``ct_topo_weight``.
     * Cell-Tracker fingerprint only — ``ct_area_weight``, ``ct_max_gap``.
 
@@ -262,6 +308,15 @@ def link_objects_with_params(
         method=str(params.get("method", METHOD_CENTROID)),
         st_mode=str(params.get("st_mode", "Incremental")),
         st_n_neighbors=int(params.get("st_n_neighbors", 25)),
+        st_solver=str(params.get("st_solver", "Regularization")),
+        st_loc_solver=str(params.get("st_loc_solver", "Topology")),
+        st_n_neighbors_min=int(params.get("st_n_neighbors_min", 1)),
+        st_smoothness=float(params.get("st_smoothness", 0.1)),
+        st_outlier_threshold=float(params.get("st_outlier_threshold", 5.0)),
+        st_max_iter=int(params.get("st_max_iter", 20)),
+        st_iter_stop_threshold=float(params.get("st_iter_stop_threshold", 1e-2)),
+        st_dist_missing=float(params.get("st_dist_missing", 5.0)),
+        st_use_prev_results=bool(params.get("st_use_prev_results", False)),
         ct_n_neighbors=int(params.get("ct_n_neighbors", 5)),
         ct_topo_weight=float(params.get("ct_topo_weight", 0.3)),
         ct_area_weight=float(params.get("ct_area_weight", 0.3)),
@@ -374,21 +429,34 @@ def _link_group_serialtrack(
     mode_str: str,
     n_neighbors_max: int,
     next_id: List[int],
+    *,
+    solver_str: str = "Regularization",
+    loc_solver_str: str = "Topology",
+    n_neighbors_min: int = 1,
+    smoothness: float = 0.1,
+    outlier_threshold: float = 5.0,
+    max_iter: int = 20,
+    iter_stop_threshold: float = 1e-2,
+    dist_missing: float = 5.0,
+    use_prev_results: bool = False,
     progress_cb: Optional[ProgressCB] = None,
 ) -> None:
     """Link objects within one (channel, m_position) group via SerialTrack.
 
     The object centroids are fed to SerialTrack's ``track_coordinates`` path as
     pre-detected particles (no image re-detection).  ``f_o_s`` is the field of
-    search (max neighbor radius, px) — the node's "Max distance" knob.  Each
-    detection's resulting track id is chained from the per-frame ``track_b2a``
-    index maps; ``min_track_length`` filtering happens in the caller's post-pass.
+    search (max neighbor radius, px) — the node's "Max distance" knob.  The
+    remaining keyword args are SerialTrack's own tunables (global/local solver,
+    neighbor-count decay, smoothing, outlier + ghost-cull thresholds, ADMM
+    iteration budget, warm-start predictor).  Each detection's track id is chained
+    from the per-frame ``track_b2a`` index maps; ``min_track_length`` filtering
+    happens in the caller's post-pass.
 
     The SerialTrack library (numba JIT) is imported lazily so a missing optional
     dependency surfaces only for this method and is caught by the node handlers.
     """
     from nd2studios.backend.serialtrack.config import (
-        DetectionConfig, TrackingConfig, TrackingMode,
+        DetectionConfig, GlobalSolver, LocalSolver, TrackingConfig, TrackingMode,
     )
     from nd2studios.backend.serialtrack.tracking import SerialTracker
 
@@ -412,18 +480,48 @@ def _link_group_serialtrack(
 
     mode = (TrackingMode.CUMULATIVE if mode_str == "Cumulative"
             else TrackingMode.INCREMENTAL)
+    global_solver = {
+        "MLS": GlobalSolver.MLS,
+        "Regularization": GlobalSolver.REGULARIZATION,
+        "ADMM": GlobalSolver.ADMM,
+    }.get(solver_str, GlobalSolver.REGULARIZATION)
+    local_solver = {
+        "Topology": LocalSolver.TOPOLOGY,
+        "Histogram then Topology": LocalSolver.HISTOGRAM_THEN_TOPOLOGY,
+    }.get(loc_solver_str, LocalSolver.TOPOLOGY)
+    n_max = max(2, int(n_neighbors_max))
     trk = TrackingConfig(
         mode=mode,
         f_o_s=float(f_o_s),
-        n_neighbors_max=max(2, int(n_neighbors_max)),
+        n_neighbors_max=n_max,
+        n_neighbors_min=min(n_max, max(1, int(n_neighbors_min))),
+        loc_solver=local_solver,
+        solver=global_solver,
+        smoothness=max(0.0, float(smoothness)),
+        outlier_threshold=max(0.0, float(outlier_threshold)),
+        max_iter=max(1, int(max_iter)),
+        iter_stop_threshold=max(0.0, float(iter_stop_threshold)),
+        dist_missing=max(0.0, float(dist_missing)),
+        use_prev_results=bool(use_prev_results),
         strain_n_neighbors=0,      # skip per-frame strain (not needed for ids)
-        use_prev_results=False,    # avoid the lazy sklearn POD-GPR path
     )
     # SerialTrack runs as one opaque (numba-JIT) call — no intra-call progress
     # hook — so we mark the start; per-frame updates follow in the chaining loop.
     if progress_cb is not None:
         progress_cb(0.0, f"SerialTrack linking {len(sorted_frames)} frames…")
-    session = SerialTracker(DetectionConfig(), trk).track_coordinates(coords_list)
+    try:
+        session = SerialTracker(
+            DetectionConfig(), trk).track_coordinates(coords_list)
+    except ImportError as exc:
+        # The only optional import on this path is scikit-learn, pulled in by the
+        # POD-GPR warm start (frames ≥7) when use_prev_results is on.
+        if use_prev_results:
+            raise RuntimeError(
+                "SerialTrack 'Use previous results' (POD-GPR warm start) needs "
+                "scikit-learn for sequences of 7+ frames — install it "
+                "(pip install scikit-learn) or turn the option off."
+            ) from exc
+        raise
 
     # Seed the reference (first) frame with fresh ids, then chain forward.
     ids_per_frame: List[List[int]] = [[] for _ in row_refs]

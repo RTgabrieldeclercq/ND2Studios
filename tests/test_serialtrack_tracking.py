@@ -96,6 +96,51 @@ def test_serialtrack_via_params_and_um_conversion():
     assert n_tracks == 6
 
 
+@pytest.mark.parametrize("solver", ["MLS", "Regularization", "ADMM"])
+def test_serialtrack_global_solvers(solver):
+    # All three global-step solvers (incl. the ADMM augmented-Lagrangian one)
+    # recover the same clean-translation tracks.
+    n_obj, n_frames = 6, 4
+    rows, _ = _make_rows(n_obj=n_obj, n_frames=n_frames)
+    out = link_objects(
+        rows, max_displacement_px=80.0, min_track_length=2,
+        method=METHOD_SERIALTRACK, st_mode="Incremental", st_solver=solver,
+        st_loc_solver="Topology", st_smoothness=0.1, st_max_iter=20,
+        st_outlier_threshold=5.0, st_iter_stop_threshold=1e-2,
+        st_n_neighbors=25, st_n_neighbors_min=1, st_dist_missing=5.0,
+    )
+    n_tracks = len({r["track_id"] for r in out if r["track_id"] is not None})
+    assert n_tracks == n_obj
+    assert all(r["track_length"] == n_frames for r in out)
+
+
+def test_serialtrack_via_params_full_surface_admm():
+    # The node param dict (all SerialTrack knobs, ADMM solver) flows through
+    # link_objects_with_params without error.
+    rows, _ = _make_rows(n_obj=6, n_frames=4)
+    params = dict(
+        method=METHOD_SERIALTRACK, max_distance=80.0, distance_unit="pixels",
+        min_track_length=2, st_mode="Cumulative", st_n_neighbors=20,
+        st_n_neighbors_min=1, st_solver="ADMM",
+        st_loc_solver="Histogram then Topology", st_smoothness=0.05,
+        st_outlier_threshold=3.0, st_max_iter=15, st_iter_stop_threshold=1e-2,
+        st_dist_missing=5.0, st_use_prev_results=False,
+    )
+    out = link_objects_with_params(rows, params)
+    assert len({r["track_id"] for r in out if r["track_id"] is not None}) == 6
+
+
+def test_serialtrack_use_prev_results_short_sequence():
+    # <7 frames never reaches the POD-GPR (sklearn) stage, so the warm start
+    # works even without scikit-learn installed.
+    rows, _ = _make_rows(n_obj=6, n_frames=5)
+    out = link_objects(
+        rows, max_displacement_px=80.0, method=METHOD_SERIALTRACK,
+        st_mode="Cumulative", st_solver="ADMM", st_use_prev_results=True,
+    )
+    assert len({r["track_id"] for r in out if r["track_id"] is not None}) == 6
+
+
 def test_serialtrack_matches_centroid_on_simple_translation():
     # On clean rigid translation both linkers should recover the same track count.
     rows_a, _ = _make_rows(seed=7)

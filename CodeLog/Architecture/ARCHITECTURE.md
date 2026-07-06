@@ -120,8 +120,14 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
     with distance/size/track-length/frame-gap thresholds) or **SerialTrack
     (topology PTV)** (`_link_group_serialtrack`, scale/rotation-invariant topology
     matching via the vendored `backend/serialtrack`, fed the object centroids
-    through its `track_coordinates` path; `st_mode` incremental/cumulative,
-    `st_n_neighbors`), or the two **Cell-Tracker** linkers (`_link_group_celltracker`,
+    through its `track_coordinates` path; exposes SerialTrack's full tunable surface
+    — `st_mode` incremental/cumulative, neighbor-count range (`st_n_neighbors` /
+    `st_n_neighbors_min`), **global solver `st_solver` MLS / Regularization /
+    ADMM**, local matcher `st_loc_solver`, `st_smoothness`, `st_outlier_threshold`,
+    ADMM budget `st_max_iter` / `st_iter_stop_threshold`, ghost-cull
+    `st_dist_missing`, and the POD-GPR warm start `st_use_prev_results`, which needs
+    the optional scikit-learn only for 7+ frames), or the two **Cell-Tracker**
+    linkers (`_link_group_celltracker`,
     bridging the row-dicts to/from the vendored `backend/celltracker` pandas
     trackers): **Topology (Hungarian)** (`track_timeseries`, rotation-invariant
     neighbor descriptor + distance; `ct_n_neighbors`, `ct_topo_weight`) and

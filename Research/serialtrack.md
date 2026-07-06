@@ -98,6 +98,15 @@ dual update `θ ← θ + û − u`. The smoothing ratio `α/µ` is the `smoothne
   field of search — still correct.
 - `f_o_s` ("field of search") is in **pixels**; we map the node's "Max distance"
   knob to it (after the µm→px conversion shared with the centroid path).
+- The Track Objects node exposes SerialTrack's **full tunable surface** — all
+  three global-step solvers (`GlobalSolver.MLS` / `REGULARIZATION` / `ADMM`), the
+  local matcher (`LocalSolver`), the neighbor-count range, `smoothness` (α/µ),
+  `outlier_threshold`, the ADMM budget (`max_iter`, `iter_stop_threshold`),
+  ghost-cull `dist_missing`, and the `use_prev_results` warm start. **ADMM** is the
+  augmented-Lagrangian solver (§2.2) with automatic L-curve α — the most faithful
+  to the paper, at higher cost; `REGULARIZATION` stays the default. The
+  `use_prev_results` POD-GPR stage (frames ≥7) is the only place scikit-learn is
+  reached, so it's kept an optional extra with a friendly install prompt.
 
 ### Validation strategy
 - Headless unit test (`tests/test_serialtrack_tracking.py`): synthetic objects

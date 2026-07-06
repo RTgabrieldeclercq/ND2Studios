@@ -4,6 +4,38 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
+## [Unreleased] - 2026-07-05 (Track Objects: full SerialTrack parameter surface + ADMM)
+
+### Added
+
+- **ADMM global solver routed into the SerialTrack tracking method**, plus the
+  method's **complete tunable-parameter surface** on the Track Objects node. When
+  *SerialTrack (topology PTV)* is the method, the param popup now exposes (all via
+  `ParamSpec.visible_when`, hidden for the other methods):
+  - `st_solver` — **Global solver** choice: **MLS** / **Regularization** (default)
+    / **ADMM** (augmented-Lagrangian with automatic L-curve α — the paper's most
+    faithful, costlier solver).
+  - `st_loc_solver` — **Local matcher**: *Topology* / *Histogram then Topology*.
+  - `st_n_neighbors` (Max neighbors) + `st_n_neighbors_min` (Min neighbors) — the
+    topology-descriptor neighbor-count range (`n_neighbors_max` / `n_neighbors_min`).
+  - `st_smoothness` — global smoothing strength (the α/µ knob).
+  - `st_outlier_threshold` — Westerweel normalized-median-residual cutoff (0 = off).
+  - `st_max_iter` + `st_iter_stop_threshold` — ADMM iteration budget + convergence
+    tolerance.
+  - `st_dist_missing` — ghost-particle cull distance ε_d.
+  - `st_use_prev_results` — data-driven warm start (extrapolation, then POD-GPR
+    from frame 7; the POD-GPR stage needs scikit-learn).
+
+### Changed
+
+- `backend/object_tracker.py`: `link_objects` / `link_objects_with_params` /
+  `_link_group_serialtrack` gain the full `st_*` parameter set and map the GUI
+  strings to SerialTrack's `GlobalSolver` / `LocalSolver` enums. `use_prev_results`
+  raises a friendly "install scikit-learn" `RuntimeError` only if it actually
+  reaches the POD-GPR stage (≥7 frames) without sklearn; short sequences work
+  regardless. scikit-learn stays an **optional** extra (not in `requirements.txt`),
+  unlike numba which the linking path always needs.
+
 ## [Unreleased] - 2026-07-03 (Pipeline Run: diagnose "runs but no results")
 
 ### Added

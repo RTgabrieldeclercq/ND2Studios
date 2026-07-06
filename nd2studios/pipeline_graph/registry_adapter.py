@@ -533,7 +533,85 @@ def param_specs_for(op_key: str) -> List[ParamSpec]:
                 default=25, min_val=2, max_val=100, step=1,
                 visible_when={"method": METHOD_SERIALTRACK},
                 tooltip="SerialTrack topology-descriptor size (number of nearest "
-                        "neighbors). Higher for dense seeding, lower for sparse.",
+                        "neighbors, n_neighbors_max). Higher for dense seeding, "
+                        "lower for sparse.",
+            ),
+            ParamSpec(
+                name="st_n_neighbors_min", label="Min neighbors",
+                param_type="int", default=1, min_val=1, max_val=100, step=1,
+                visible_when={"method": METHOD_SERIALTRACK},
+                tooltip="Floor for the exponential neighbor-count decay across "
+                        "iterations (n_neighbors_min). At ≤2 the matcher becomes a "
+                        "nearest-neighbor search. Keep at 1 unless you know better.",
+            ),
+            ParamSpec(
+                name="st_solver", label="Global solver", param_type="choice",
+                default="Regularization",
+                choices=["MLS", "Regularization", "ADMM"],
+                visible_when={"method": METHOD_SERIALTRACK},
+                tooltip="Global displacement solver. 'MLS' is mesh-free and fast; "
+                        "'Regularization' scatters to a grid and smooths (robust "
+                        "default); 'ADMM' is the augmented-Lagrangian solver with "
+                        "automatic L-curve α — most faithful to the paper and best "
+                        "for noisy / large-deformation data, but slower.",
+            ),
+            ParamSpec(
+                name="st_loc_solver", label="Local matcher", param_type="choice",
+                default="Topology",
+                choices=["Topology", "Histogram then Topology"],
+                visible_when={"method": METHOD_SERIALTRACK},
+                tooltip="Local matching strategy. 'Topology' uses the "
+                        "scale/rotation-invariant descriptor directly; 'Histogram "
+                        "then Topology' pre-matches by a displacement histogram "
+                        "first.",
+            ),
+            ParamSpec(
+                name="st_smoothness", label="Smoothness", param_type="float",
+                default=0.1, min_val=0.0, max_val=100.0, step=0.05,
+                visible_when={"method": METHOD_SERIALTRACK},
+                tooltip="Global smoothing strength (the α/µ knob; used by the "
+                        "Regularization and ADMM solvers). Higher = smoother, more "
+                        "noise rejection, less local detail. Paper range 1e-3…1e-1.",
+            ),
+            ParamSpec(
+                name="st_outlier_threshold", label="Outlier threshold",
+                param_type="float", default=5.0, min_val=0.0, max_val=100.0,
+                step=0.5,
+                visible_when={"method": METHOD_SERIALTRACK},
+                tooltip="Westerweel normalized-median-residual cutoff for rejecting "
+                        "spurious displacement vectors (typ. 2–5). 0 disables it.",
+            ),
+            ParamSpec(
+                name="st_max_iter", label="Max iterations", param_type="int",
+                default=20, min_val=1, max_val=1000, step=1,
+                visible_when={"method": METHOD_SERIALTRACK},
+                tooltip="Maximum ADMM iterations per frame pair. 20 is usually "
+                        "plenty; raise for very large deformations.",
+            ),
+            ParamSpec(
+                name="st_iter_stop_threshold", label="Convergence tol.",
+                param_type="float", default=0.01, min_val=0.0, max_val=10.0,
+                step=0.001,
+                visible_when={"method": METHOD_SERIALTRACK},
+                tooltip="ADMM convergence threshold on the displacement-update "
+                        "norm. Smaller = tighter convergence, more iterations.",
+            ),
+            ParamSpec(
+                name="st_dist_missing", label="Ghost-cull distance",
+                param_type="float", default=5.0, min_val=0.0, max_val=100000.0,
+                step=0.5,
+                visible_when={"method": METHOD_SERIALTRACK},
+                tooltip="Critical distance ε_d (px) for culling ghost particles "
+                        "(detected in only one frame), active in late iterations.",
+            ),
+            ParamSpec(
+                name="st_use_prev_results", label="Use previous results",
+                param_type="bool", default=False,
+                visible_when={"method": METHOD_SERIALTRACK},
+                tooltip="Warm-start each frame's solve with a data-driven initial "
+                        "guess (extrapolation, then POD-GPR from frame 7). Helps "
+                        "very large deformation; the POD-GPR stage needs "
+                        "scikit-learn (pip install scikit-learn).",
             ),
             ParamSpec(
                 name="ct_n_neighbors", label="Topology neighbors",
