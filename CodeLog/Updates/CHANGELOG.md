@@ -4,9 +4,1062 @@ All notable changes to ND2Studios will be documented in this file.
 
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
-## [Unreleased] - 2026-07-05 (Track Objects: full SerialTrack parameter surface + ADMM)
+## [Unreleased] - 2026-07-08 (Pipelines crop/channel viewer fixes)
+
+### Bug Fixes
+
+- **Analysis viewer reverted to raw after Apply → switch to Analysis (worst under
+  a preview crop).** Root cause: the Processing-preview result handler
+  (`_on_runner_done`, `_PREVIEW_KEY` branch) was **not stage-gated**.
+  `_apply_processing` ends with `_request_preview()`, and the crop preview also
+  runs a Processing-preview job; both are debounced + async. When the user
+  switched to the Analysis tab before the job finished, its result landed on the
+  Analysis tab and **overwrote** the base image — which `_show_base_image` had
+  correctly set to a fully-processed `ProcessedFrameVolume` — with the
+  Processing-preview `PinnedProcessedVolume`, which serves the recipe only on the
+  pinned plane and **raw everywhere else** (so the cropped Analysis view read
+  raw). Fix: the `_PREVIEW_KEY` handler drops its result when
+  `self._stage is not Stage.PROCESSING`, and `_select_stage` stops the preview
+  debounce + cancels the in-flight `_PREVIEW_KEY` job when leaving Processing, so
+  a stale Processing preview can never clobber the Analysis base. Diagnosed by
+  driving the real page against `Bolus_Top_crop_tiff.tif` (2-ch, 33×734×745);
+  the headless read path was already correct — the bug was purely the async
+  cross-tab clobber. (Earlier `bypass_pyramid` + per-channel backdrop fixes remain
+  for large-file / Spatial-Maps cases.)
+
+## [Unreleased] - 2026-07-08 (Registration: late-frame robustness + region/feature estimation — V1.60)
+
+Plan: `CodeLog/ClaudesPlan/V1.60_registration_roi_and_features.md`.
+Research: `Research/image_registration.md`.
+
+Fixes registration degrading at later timepoints of a timelapse, and adds
+region-of-interest and feature-based estimation. Root cause of the late-frame bug
+(reproduced on a synthetic series): the engine's confidence (NCC) already collapses
+when a frame fails, but the default `min_confidence=0` applied the spurious shift
+anyway — and `previous` mode then accumulated it (late-frame error reached 66–89 px;
+now bounded to ~10 px with the new defaults).
 
 ### Added
+
+- **Late-frame robustness** (`backend/registration/estimate.py`, `.../method.py`):
+  - **Hold-last-good gating** — `estimate_series` now holds the last good transform
+    (absolute modes) or skips the increment (`previous`) when `confidence <
+    min_confidence`, instead of snapping to identity; returns a per-frame `gated`
+    bool. `RigidRegistration` default `min_confidence` raised `0.0 → 0.2`.
+  - **`reference="template"`** — a two-pass anchor (`_build_template`: rough-stabilize
+    → average → register all frames to the template). Robust to cumulative drift and
+    to a bleached/atypical single anchor frame. **New default** reference.
+  - **`normalize="zscore"`** per-frame intensity normalization (counters photobleaching).
+  - `estimate_translation` now passes `disambiguate=True` (large-shift wrap guard).
+- **Region of interest (ROI)** — estimate the transform on a chosen sub-region, apply
+  it full-frame (lock onto a static landmark; ignore moving cells / debris):
+  - `estimate.roi_to_mask(roi, shape) -> (mask, bbox)`; `estimate_translation(mask=,
+    bbox=)` (rectangle → subpixel crop; freeform → masked phase correlation);
+    `ecc_align(mask=)` → ECC `inputMask`; `estimate_series(roi=)`.
+  - Node: hidden `roi` `ParamSpec` + a **"Pick ROI…"** popup button
+    (`pipelines_page._edit_registration_roi`) offering whole-frame / rectangle
+    (x/y/w/h) / freeform (drawn on the viewer, `_on_registration_shape`). Freeform
+    shapes rasterize via `backend/analysis/manual_mask.rasterize_shapes`.
+- **Feature-based model** (`model="feature"`) — `estimate.estimate_features` (ORB
+  keypoints + `match_descriptors` + RANSAC, Euclidean/Similarity/Affine) for large
+  displacement / rotation / scale / partial overlap (re-mount, multi-round); inlier
+  fraction is the confidence, too few inliers → identity fallback. New method params
+  `feature_transform`, `min_inliers` (visible when `model=feature`).
+- **Crop to common region** (translation) — node toggle `crop_to_common`: after
+  registration, crop every frame of every multipoint to the **largest rectangle that
+  is real (non-padded) data in all registered frames** (`estimate.common_translation_crop`),
+  so frames are equal-size, recentred, and free of the black drift borders. A single
+  region across all M (identical sizes). Published as `record._registration_crop` and
+  composed into `pipelines_page._crop_rect()` (intersected with any preview crop), so it
+  flows **everywhere downstream** — analysis (`_processed_channels_for_m`), export /
+  validation / spatial maps (`_materialize_channels_for_m`), the viewer base
+  (`_maybe_crop_volume`), the write-back, and the Registration panel — through the single
+  existing crop chokepoint. Register → crop (full-frame first). Cleared on each Run start.
+- **`tests/registration/test_robustness_roi_features.py`** — 15 tests: template+gating
+  vs the old default on a degraded series, `previous` no-explode, ROI beats whole-frame
+  + rect subpixel + freeform, feature rotation recovery / blank-field fallback / warp
+  convention, and common-region crop (valid-region math, no-overlap → None, end-to-end
+  equal-size border-free frames).
+
+### Changed
+
+- **`widgets/registration_panel.py`** — `set_data(gated=, min_confidence=)`; the drift
+  plot shades **held (low-confidence)** frames and the meta line counts them, so
+  late-frame degradation is visible at a glance.
+- **`pages/pipelines_page.py`** — `_RegisterJob` bundle carries `gated`/`min_confidence`;
+  the ROI spec rides through `node.params` into `method.run` (no job-signature change).
+
+### Bug Fixes
+
+- **Registered image played slowly in the viewer while the raw played fast.** The
+  registered display is the lazy `RegisteredFrameVolume`, whose `get_frame` ran a
+  full-resolution warp (`scipy.ndimage.shift` / `cv2.warp`) on **every** frame with no
+  cache, so playback/scrubbing recomputed it each tick (the raw streams a
+  pyramid/RAM plane). Fixed by adding a memory-budgeted LRU of warped display frames to
+  `RegisteredFrameVolume` (`executor.py`, mirrors `ProcessedFrameVolume`; transforms are
+  deterministic per `(m,t)` so caching is safe) — each frame is warped once, then loops
+  are instant. Also, `_apply_registration_writeback` now drives the display through that
+  cached lazy volume (`_show_base_image`) for lazy-volume files instead of pushing the
+  full-res materialized stack via `set_channels`.
+
+## [Unreleased] - 2026-07-07 (Pause-node crop preview on the registered image — V1.59)
+
+Plan: `CodeLog/ClaudesPlan/V1.59_pause_crop_preview_registered.md`.
+
+Makes the **Pause** node a troubleshooting checkpoint: when a Run pauses back to
+editor mode, the **Preview Crop** tool now drives a *downstream preview* on the
+cropped sub-region — and, when an **Image Registration** node ran upstream, that
+preview (and the displayed base) is the drift-corrected image, so the user can
+crop and check segmentation / tracking on the registered image before a full Run.
+Preview-only: a resumed Run stays full-frame.
+
+### Added
+
+- **`backend/registration/estimate.py`** — `apply_frame(frame, transforms, t,
+  interp_order=1)`: the single-plane analogue of `apply_series`; applies the
+  `t`-th per-frame shift/warp to one 2-D frame (identity / absent / out-of-range
+  `t` → unchanged).
+- **`pipeline_graph/executor.py`** — `RegisteredFrameVolume`: lazy `get_frame`
+  wrapper (`bypass_pyramid = True`) that applies the per-`(m, t)` registration
+  transform on read (no-op for an M without a transform). Exported from
+  `pipeline_graph/__init__.py`. Wrap **before** `CroppedVolume` → a crop of the
+  registered image.
+
+### Changed
+
+- **`pages/pipelines_page.py`**
+  - New helpers `_maybe_register_volume(record, vol)` and `_register_frame(record,
+    frame, m, t)` (gated on `record._registration_by_m`).
+  - Analysis/Results preview now applies registration then crops:
+    `_extract_processed_frame` registers the lazy-volume frame before return;
+    `_materialize_channels_for_m` registers the full stack before cropping.
+  - `_show_base_image` wraps the base in `_maybe_register_volume` before
+    `_maybe_crop_volume` (and prefers `_processed_channels` in the in-RAM
+    fallback), so arming the crop no longer reverts the viewer to the
+    un-registered image.
+  - `_processed_channels_for_m` now registers the **full** frame first, then crops
+    for a cropped Run (register → crop, was crop → register).
+  - Pause status message mentions the crop-preview workflow.
+
+## [Unreleased] - 2026-07-07 (Tracking: birth/death LAP + mask-overlap linker — V1.58)
+
+Plan: `CodeLog/ClaudesPlan/V1.58_tracking_lap_overlap.md`.
+
+Fixes the two post-StarDist tracking failure modes on dense monolayer nuclei: a
+high `max_distance` linked slow cells to distant ones, and a low `max_distance`
+chain-linked cells to their neighbors into propagating "currents". Both trace to
+the per-frame Hungarian assignment having no birth/death ("no-match") option, so
+it was forced to link the smaller side in full. Adds the Jaqaman-style LAP with
+no-match nodes and a new mask-overlap (IoU) linker that consumes the StarDist
+masks directly.
+
+### Added
+
+- **`backend/celltracker/tracking.py`**
+  - `solve_lap(cost, no_match_cost)` — Jaqaman et al. (2008) augmented
+    assignment with birth/death diagonals; a detection may stay unmatched at a
+    fixed cost instead of being force-linked. Splits the gated cost matrix into
+    connected components of finite-cost edges and solves each block
+    (`_solve_lap_block`) so dense fields stay fast (exact — dummy nodes never
+    couple components).
+  - `track_overlap(df, masks, min_iou=0.1, max_gap=1, no_match_cost=None,
+    progress_cb=None)` — links segmented objects by mask intersection-over-union
+    (`cost = 1 − IoU`, pairs below `min_iou` forbidden) via `solve_lap`; keeps a
+    track's last footprint for up to `max_gap` missed frames for overlap
+    re-linking. Helper `_frame_footprints` extracts per-label pixel indices in
+    one stable argsort over the foreground.
+- **`backend/object_tracker.py`** — `METHOD_CT_OVERLAP = "Cell-Tracker: Mask
+  Overlap (IoU)"` (added to `TRACKING_METHODS`); `_link_group_overlap` bridge;
+  new `link_objects` args `ct_min_iou` and `label_masks`
+  (`{(segmentation_channel, m_position): (T,H,W)}`), also on
+  `link_objects_with_params`.
+- **UI** — Track Objects node exposes the new method plus a `ct_min_iou`
+  ("Min overlap (IoU)") knob (`pipeline_graph/registry_adapter.py`).
+- **`tests/test_tracking_lap_overlap.py`** — birth/death LAP + overlap tests.
+
+### Changed
+
+- **`backend/celltracker/tracking.py`** — `link_frames` and `track_fingerprint`
+  now route their assignment through `solve_lap` (birth/death) instead of a bare
+  `linear_sum_assignment` + post-gate; out-of-gate pairs are marked `inf`.
+  `link_frames` / `track_timeseries` / `track_fingerprint` gain an optional
+  `no_match_cost` (defaults to `max_dist`). Gating is on raw distance, so
+  topology only ranks reachable candidates.
+- **`widgets/common.py`** — `ParamSpec.visible_when` values may be a single
+  choice or a list/tuple/set of choices (row shows if the current choice is any
+  of them). `ct_max_gap` is now shown for both the fingerprint and mask-overlap
+  linkers.
+- **`pages/pipelines_page.py`** — `_TrackJob` accepts `label_masks`;
+  `_run_track_objects` builds `{(channel, m): (T,H,W)}` from the per-M analysis
+  results (by reference) and passes it to the linker.
+
+### Bug Fixes
+
+- Tracking no longer force-links a slow cell to a distant one (high
+  `max_distance`) or chain-links neighbors into "currents" (low `max_distance`);
+  unmatched detections become births/deaths. On the reference monolayer clips,
+  implausible one-frame steps (> nuclear spacing) dropped from ~861/489/2554
+  (current topology linker) to ~7/3/31 with the overlap linker; the birth/death
+  LAP alone roughly halves them on pure centroids.
+
+## [Unreleased] - 2026-07-07 (Export cropped data from the Import tab — V1.57)
+
+Plan: `CodeLog/ClaudesPlan/V1.57_import_tab_crop_export.md`.
+
+Adds a self-contained **Export** control to each Import-tab `FilePanel`, so the
+user can write the currently-loaded (cropped) dataset to disk without leaving the
+first tab. Export honors **both** crops: the existing **T/M/Z tile-strip crop**
+(already baked into `record._raw_volume` by `CropWorker`) and a **new spatial XY
+ROI crop** drawn on the Import viewer. Works on any panel (primary and secondary
+side-by-side panels), each against its own `record`.
+
+### Added
+
+- **`nd2studios/widgets/file_panel.py`** — new "Export" group in the controls
+  sidebar:
+  - **XY crop tool** — `btn_crop_xy` (checkable, `fa5s.crop-alt`) enables
+    `MultiAxisViewer.set_crop_mode`; a rubber-band drag (`crop_rect_selected`) or
+    click (`canvas.clicked`, guarded by the toggle) opens `_show_xy_crop_dialog`
+    (spinbox confirm/edit, clamped to frame bounds). `_apply_xy_crop(x,y,w,h)`
+    stores the rect in `self._xy_crop` and `record.crop_rect` and updates
+    `lbl_xy_crop_status`; `btn_reset_xy` (`fa5s.undo`) / `_reset_xy_crop()` clears
+    it. The rect is stored (not applied to the live viewer) and realized only in
+    the exported file, so it composes with the T/M/Z crop and leaves M/T/Z
+    browsing intact. Reset automatically on each fresh load.
+  - **Export menu** — `btn_export` (`primaryBtn`, `fa5s.download`, disabled until a
+    file loads) opens a `QMenu`: *TIFF hyperstack…*, *Movie (MP4)…*, *Movie
+    (GIF)…*, *Image sequence (PNG)…*.
+  - **Export dispatch** reuses `ExportWorker`/`ExportRequest` wholesale:
+    `_export_source_channels()` builds the current M/Z channels via
+    `volume.all_channels_as_lazy(...)` and applies the XY crop through each
+    channel's `.crop(y0,y1,x0,x1)`; `_colors_enabled_lut()` reads colors/enabled/
+    LUT from `viewer.channel_state()`. TIFF uses `tiff_zstack` (raw volume +
+    `crop_rect`) for unprojected multi-Z stacks, else `tiff_stack` with pre-cropped
+    channels. Movie and image-sequence materialize the cropped channels and open
+    the shared `ExportPreviewDialog` (T-scrub + brightness/contrast/etc.) before
+    dispatch. `_run_export`/`_on_export_done` route progress/status through the
+    panel's existing `on_progress`/`on_status` callbacks; movie defaults to
+    `MovieOptions(fps=10)` with scale bar / timestamp / channel-label overlays on.
+
+## [Unreleased] - 2026-07-07 (Image registration — drift-correction processing node — V1.56)
+
+Plan: `CodeLog/ClaudesPlan/V1.56_image_registration.md`.
+Research: `Research/image_registration.md`.
+
+Adds **image registration**: stabilize a `(T,H,W)` channel series onto a reference
+frame (temporal drift correction), translation / rigid / affine. Ships two homes
+sharing one pure, Qt-free engine — a per-channel `EnhancementPlugin` (the quick
+recipe-step win) **and** a cross-channel `RegistrationMethod` + pipeline node
+("register once on the reference channel, apply to all channels"). The node is a
+**transform in the pipeline** (not a terminal viewer): wire it upstream of analysis /
+tracking and its drift correction flows to every downstream node, so analyses run on
+drift-free images.
+
+### Added
+
+- **`nd2studios/backend/registration/`** — new backend-pure package (no PySide6):
+  - **`estimate.py`** — the estimation + resampling engine, reusing the stitcher's
+    `_highpass`/`_hann2d`/`_ncc` primitives (`backend/stitch/register.py`):
+    - `estimate_translation(reference, moving, upsample=20, highpass_sigma=2.0,
+      window=True) -> (shift (row,col), ncc)` — sub-pixel phase correlation
+      (`skimage.registration.phase_cross_correlation`, `normalization="phase"`).
+    - `apply_shift(image, shift, order=1)` — `scipy.ndimage.shift`, dtype-preserving.
+    - `ecc_align(reference, moving, model="euclidean", init_shift=None, iters=200,
+      eps=1e-6, gauss=5, interp_order=1) -> (warp_matrix, cc, aligned)` —
+      `cv2.findTransformECC`, seeded from a phase-correlation translation.
+    - `apply_warp(image, warp_matrix, motion=None, output_shape=None, interp_order=1)`
+      — resample through an ECC warp (`cv2.WARP_INVERSE_MAP`), dtype-preserving.
+    - `stabilize(volume, model="translation", reference="previous", upsample=20,
+      highpass_sigma=2.0, interp_order=1, min_confidence=0.0, progress_cb=None,
+      cancelled_cb=None) -> (aligned (T,H,W), shifts (T,2), confidence (T,))` —
+      the series driver. Reference modes `first`/`previous` (cumulative)/`mean`;
+      models `translation`/`euclidean`/`affine`; confidence gating falls back to
+      identity below `min_confidence`. `MODELS`/`REFERENCE_MODES` constants exported.
+    - `estimate_series(series, model, reference, upsample, highpass_sigma,
+      min_confidence, …) -> {"model","reference","shifts" (T,2),"warps" (T,2,3)|None,
+      "confidence" (T,)}` — per-frame **absolute** effective transforms (composed ECC
+      warps for cumulative mode) that align each frame onto the anchor.
+    - `apply_series(series, transforms, interp_order=1) -> aligned (T,H,W)` — apply
+      those transforms to any channel (the "apply to all channels" half of
+      register-once).
+- **`nd2studios/plugins/enhancement/registration.py`** — `RegistrationPlugin`
+  (`@EnhancementPlugin.register`, name `"Registration (Drift Correction)"`): an
+  `Image -> Image` Processing node auto-enumerated by
+  `registry_adapter.enhancement_specs()`. Params `model`, `reference`, `upsample`,
+  `highpass_sigma`, `interp_order`, `min_confidence`; `execute` delegates to
+  `estimate.stabilize` and passes single frames / non-series through unchanged.
+- **`nd2studios/core/registration_registry.py`** — `RegistrationMethod(ABC)` +
+  `RegistrationResult` (per-frame `shifts_px`/`transforms`/`aligned`/`confidence`/
+  `pixel_size_um`, `shifts_um()`), reusing `ParamSpec`. Mirrors `core/dvc_registry.py`.
+- **`nd2studios/backend/registration/method.py`** — `RigidRegistration`
+  (`@RegistrationMethod.register`, `"Rigid / Translation"`): estimates the transform on
+  the reference series (`estimate_series`) and returns the bundle + aligned reference.
+- **Registration node + viewer** — a Special pipeline-graph node
+  (`SPECIAL_REGISTER_OP_KEY = "special:register"`, a HEXAGON with an `IMAGE` rainbow
+  channel input **and an `ANY` structural output**, in
+  `pipeline_graph/registry_adapter.py`) wired into `pages/pipelines_page.py`
+  (`_RegisterJob` off-thread reads each channel's `(T,H,W)` via `get_frame`, registers
+  the wired reference channel, applies the same transform to all channels;
+  `_run_register`/`_finish_register`), with a new `widgets/registration_panel.py`
+  "Registration" viewer tab (before/after playback + drift-vs-time plot + confidence).
+  Params come from `RigidRegistration().get_params()` + node scope
+  (`apply_to_all_channels`, `all_multipoints`).
+- **Registration flows downstream** — the node is a pipeline transform, not a terminal
+  sink: wire it upstream of analysis / tracking nodes. `_finish_register` publishes the
+  per-multipoint per-frame transforms on the record (`record._registration_by_m`);
+  `_processed_channels_for_m` applies them after the recipe
+  (`_apply_registration_to_channels` → `estimate.apply_series`) so **every downstream
+  analysis runs on the drift-corrected image, across all multipoints**. The image
+  viewer is redrawn to the aligned base for the shown M. `_on_run` clears the transforms
+  at the start of each Run (a graph without a Registration node is unaffected).
+- **`tests/registration/`** — synthetic-ground-truth tests (13): known sub-pixel
+  shift recovery (≤0.15 px @ upsample=20), apply/estimate round-trip, random-walk
+  drift reduction for `first`/`previous`/`mean`, dtype preservation, register-once-
+  apply-to-all, ECC euclidean rotation recovery, affine path smoke test.
+
+### Changed
+
+- **`nd2studios/__main__.py`** — force-import
+  `nd2studios.plugins.enhancement.registration` and
+  `nd2studios.backend.registration.method` at startup so the
+  `@EnhancementPlugin.register` / `@RegistrationMethod.register` decorators fire.
+- **`nd2studios/pipeline_graph/__init__.py`** — re-export `SPECIAL_REGISTER_OP_KEY`.
+- **`nd2studios/pages/pipelines_page.py`** — `registration` overlay tab (keys/labels/
+  `_on_overlay_tab_changed`/`_select_overlay_tab`/`_update_overlay_tabs_available`),
+  `_RUN_REGISTER_KEY` runner wiring (done/cancel/progress), preview + Run dispatch for
+  `SPECIAL_REGISTER_OP_KEY`, and `_reg_by_m` / `_registration_panel` state.
+
+## [Unreleased] - 2026-07-07 (Multipoint stitching pipeline — regime-aware rebuild — V1.54)
+
+Plan: `CodeLog/ClaudesPlan/V1.54_multipoint_stitch_pipeline.md`.
+Research: `Research/multipoint_stitching.md`.
+
+The multipoint (M) stitching **method** was replaced with a regime-aware
+pipeline (per the *Build Spec: Multipoint TIFF Image Stitching Pipeline*).
+"Stitching" is two problems: **overlapping** tiles are *registered* from image
+content; **zero-overlap** tiles share no pixels and must be placed from **stage
+coordinates** only. The pipeline inspects each dataset, decides the regime, and
+routes accordingly (a registrar on zero-overlap data would lock onto a noise
+peak). The **only** thing kept from the old stitcher is how metadata orients the
+M frames (stage-XY reads + the Nikon sign/flip convention).
+
+### Added
+
+- **`nd2studios/backend/stitch/`** — new backend-pure package (no PySide6):
+  - **`config.py`** — `StitchConfig` (regime, engine, `zero_overlap_tol`,
+    `overlap_frac`, `pixel_size_um`, `axis_flip_x/axis_flip_y/swap_xy`,
+    `align_channel`, `filter_sigma`, `max_shift_um`, `ncc_threshold`,
+    `upsample_factor`, `per_timepoint_registration`, `blend`,
+    `feather_width_px`, `fill_value`, `illumination_correction`, `z_mode`,
+    output/pyramid/memory knobs) with `to_dict`/`from_dict`. Defaults
+    (`axis_flip_x=True, axis_flip_y=False, swap_xy=False`) reproduce the exact
+    pre-V1.54 placement.
+  - **`positions.py`** — kept orientation math: `oriented_offsets_um`,
+    `coordinate_offsets_px`, and `compute_tile_layout` / `StitchLayout`
+    (backward-compatible with the preview widgets); `_cluster_axis`,
+    `_assign_index`.
+  - **`dataset.py`** — `Tile` / `Dataset` + `build_dataset(volume, stage_xy_um,
+    m_indices, config)`: per-tile grid (row/col), oriented offsets, grid-shape
+    inference, and overlap-fraction inference (`1 − step/tile_extent` per axis).
+  - **`regime.py`** — `decide_regime(dataset, config)` → `"overlap"` /
+    `"zero_overlap"` (explicit override, no-stage/single-tile → zero-overlap,
+    else `overlap_frac > zero_overlap_tol`).
+  - **`register.py`** — built-in phase-correlation engine:
+    `refine_positions(dataset, ref_frames, seed, config)`. Per adjacent pair:
+    high-pass + Hann window + `skimage.registration.phase_cross_correlation`
+    (`upsample_factor`), NCC confidence + `ncc_threshold` rejection, `max_shift`
+    bound; global optimization by weighted least squares Tikhonov-anchored to the
+    coordinate seed (`(L+λI)p = λs + c`, row/col decoupled). Falls back to
+    coordinates when no edge is trusted.
+  - **`engines.py`** — `compute_positions(dataset, ref_frames, config, regime)`
+    dispatch: `coordinate` / `phase_correlation` / `m2stitch` (grid; seeds
+    `position_initial_guess` from coords, reads `y_pos`/`x_pos`) / `ashlar`
+    (fully wired via `ashlar_engine.py`, never chosen by `auto`) / `auto`
+    (m2stitch on a clean grid else phase-correlation). `seed_positions`.
+  - **`ashlar_engine.py`** — `ashlar_positions(...)` + `ashlar_available()`:
+    in-memory `Metadata`/`Reader` adapter → `EdgeAligner` → `aligner.positions`;
+    auto-points `JAVA_HOME` at `jdk4py` so ashlar's `import jnius` succeeds
+    without a system JDK (the JVM never starts — registration is pure Python).
+  - **`compositor.py`** — `composite_frame(...)` with `feather` (border alpha
+    ramp) / `average` / `max` / `none` blending; float accumulation cast back to
+    the source dtype (uint16 → uint16); gap fill; `canvas_size`,
+    `normalize_positions`.
+  - **`illumination.py`** — `estimate_flatfield(tiles, config)` + `Flatfield`:
+    `basic` (BaSiC/basicpy, gated — raises if unimportable), `builtin`
+    (large-σ Gaussian flat-field fallback, always available), `supplied`.
+    `basicpy_available()`.
+  - **`writer.py`** — `write_ome_tiff(data, out_path, pixel_size_um,
+    channel_names, config)`: pyramidal, tiled, BigTIFF-auto OME-TIFF (`TZCYX`,
+    `PhysicalSizeX/Y` in µm, channel names, `subifds` pyramid levels).
+  - **`qc.py`** — `write_qc(...)`: JSON + matplotlib-Agg PNG (regime, engine,
+    per-tile positions, pairwise confidences, overlap, fallbacks).
+  - **`pipeline.py`** — `run_stitch(volume, stage_xy_um, m_indices,
+    channel_indices, config, out_path, meta, progress_cb) -> StitchResult`:
+    build dataset → decide regime → register once on `align_channel` → optional
+    illumination → composite every (T,Z,C) frame (disk-backed memmap when the
+    mosaic exceeds `max_memory_gb`) → pyramidal OME-TIFF → QC. Register-once,
+    apply-to-all-C/Z/T (spec §7); `per_timepoint_registration` re-registers per T.
+- **`tiff_loader.read_ome_tiff_metadata(filepath)`** — reads level-0 OME-TIFF
+  metadata (n_channels/T/Z, channel names + `PhysicalSizeX` via `ome-types`),
+  ignoring pyramidal sub-resolutions. `_SingleFileTIFFView` gained an OME branch
+  (multi-channel per-channel proxies; `_level0_pages()` sources frames from
+  `series[0].levels[0]`), so a stitched OME-TIFF **reloads** through the normal
+  single-file TIFF import (preserves the V1.16 round-trip guarantee).
+- **`tests/test_stitch_pipeline.py`** — 12 synthetic-ground-truth tests (regime
+  selection, exact zero-overlap placement, phase-corr + m2stitch position
+  recovery ≤3 px under jitter, OME round-trip + real reload path, memmap path,
+  built-in illumination, dtype preservation, ashlar gating).
+
+### Changed
+
+- **`backend/exporters/stitch_exporter.py`** is now a **compatibility shim**:
+  re-exports `StitchLayout`, `compute_tile_layout`, `_cluster_axis`,
+  `_assign_index` (from `backend/stitch/positions`), keeps `stitch_one_frame`,
+  and turns `export_stitched_tiff` into a **deprecated** wrapper that writes via
+  the new OME-TIFF writer (emits `DeprecationWarning`). All old import sites
+  (preview widgets, `scripts/inspect_nd2.py`, `scripts/verify_v113_layout.py`)
+  keep working.
+- **`workers/stitch_worker.py`** — `StitchRequest` now carries `stage_xy_um` +
+  `StitchConfig` + `m/channel indices` + `filepath` (no precomputed layout);
+  `StitchWorker.run_task` calls `run_stitch` and exposes `.result`.
+- **`pages/stitch_dialog.py`** — new **Stitching** group (regime / engine / blend
+  / align channel / illumination combos); output is a pyramidal OME-TIFF
+  (`.ome.tif`); the completion dialog reports regime/engine/canvas/QC. Tile
+  selection + coordinate-placement preview unchanged.
+- **Output format changed from ImageJ TZCYX hyperstack to pyramidal OME-TIFF.**
+  Reload was updated (above) to keep round-tripping.
+
+### Dependencies
+
+- Installed **m2stitch 0.7.2** (grid overlap engine, MIST reimplementation) and
+  **ashlar 1.20.0**. All engine deps are **optional gated extras** (like
+  cellpose/stardist), never hard deps; `auto` uses only m2stitch + the built-in
+  phase-correlation engine (no Java).
+- **ashlar is now fully wired via an in-memory reader** (`backend/stitch/
+  ashlar_engine.py`): ashlar's `EdgeAligner` registration is pure Python, so we
+  feed it a `Metadata`/`Reader` built from our tiles + coordinate seed and read
+  back `aligner.positions` — the JVM never starts. ashlar's `reg` module still
+  needs a JDK to satisfy its unconditional `import jnius`; we install
+  **`jdk4py`** (packaged Eclipse Temurin OpenJDK, pip wheel, no admin) and point
+  `JAVA_HOME` at it at runtime when the user hasn't set one. Verified: ashlar
+  recovers jittered grid positions to ~1.3 px. If neither `jdk4py` nor a
+  `JAVA_HOME` JDK is present, the ashlar engine raises a clear install hint.
+- **basicpy** is installed but not importable here
+  (hyperactive/gradient_free_optimizers API drift) → BaSiC is gated with a
+  friendly error and the `builtin` flat-field is the working default.
+- **pandas 3.0.3 → 2.3.3** (m2stitch requires `pandas<3`). Verified the app and
+  full test suite (184 tests) pass on 2.3.3.
+
+## [Unreleased] - 2026-07-06 (Checkpoint node — freeze upstream, iterate downstream — V1.53)
+
+Plan: `CodeLog/ClaudesPlan/V1.53_checkpoint_node.md`.
+
+### Changed
+
+- **Analysis preview is now a double-click-only, scoped "mini Run" (V1.49 rework).**
+  Two behavior changes to how the Analysis tab preview works:
+  - **Only a node double-click (re)generates the preview.** Navigation, parameter
+    edits, frame-strip selection, crop changes, and the normalize toggle no longer
+    recompute the analysis preview — they still refresh the (navigable) base image,
+    but the segmentation/tracking/measurement recompute happens *only* on a
+    deliberate double-click. Implemented with an `_analysis_preview_armed` flag set
+    by `_on_node_double_clicked` and consumed in `_do_preview` (the analysis branch
+    returns early when not armed). The Processing-tab live preview is unchanged.
+  - **A double-click runs the pipeline *up to the clicked node* on the selected
+    frames and fills every applicable tab.** All analysis double-clicks now route
+    through the same scoped-Run walk the results preview used (`_start_preview_walk`)
+    instead of the segmentation-only `_do_analysis_preview` path — so a single
+    double-click produces Segmentation, Tracks, Vectors, Spatial Maps, the
+    measurements table and the plots that the chain up to that node supports.
+    Clicking the raw input (nothing to run "up to") falls back to the whole
+    downstream chain via the new `_resolve_preview_run_target()`. The double-click
+    also re-asserts the base image so the overlay always lands on a current frame.
+    (`nd2studios/pages/pipelines_page.py`)
+
+### Added
+
+- **Checkpoint node** (white, in the Add-dialog "Checkpoint" tab). A pass-through
+  special node in the merged Analysis graph that *freezes* everything computed
+  upstream (segmentation / analysis label masks, measurement rows, tracks) when a
+  Run reaches it. On a later Run, as long as the upstream graph is unchanged, the
+  run **resumes from the checkpoint** with the frozen data restored — the
+  expensive upstream work (StarDist, tracking) never re-runs, so the user can
+  add / change / rewire downstream nodes and Run instantly.
+  - **Auto invalidation via upstream hash.** `_checkpoint_upstream_hash` hashes
+    the checkpoint's structural ancestors (op_key + params), the edges feeding
+    them (structural + channel wiring), any touching loop-edge config, plus the
+    Processing recipe / per-channel recipes / normalized flag and the Run crop.
+    A Run resumes from a checkpoint only when its stored hash still matches;
+    otherwise it re-runs from Input and re-freezes. Among several valid
+    checkpoints, the deepest (furthest-downstream) one is chosen.
+  - **Session RAM + per-node disk persistence.** Frozen masks / rows live in
+    `PipelinesPage._checkpoint_store` (`node_id -> {"hash", "data"}`) for the
+    session, released when the checkpoint is deleted (`_on_graph_changed` prunes
+    orphans) and cleared on file change (`load_from_experiment`). Each checkpoint
+    node has a **`persist_to_disk` bool param** (default off = session-only):
+    when on, **saving the pipeline** writes *that* checkpoint's frozen data to a
+    companion `<pipeline>.checkpoints/` cache (compressed NPZ of per-M label masks
+    + an `index.json` manifest holding the rows, track state, overlay style,
+    upstream hash and a source-file signature), and **loading the pipeline**
+    restores it, so the checkpoint survives app restarts. Session-only checkpoints
+    are never written, and toggling one back off removes its stale cache on the
+    next save. A cache reloaded against a different file or an edited graph re-runs
+    harmlessly because the source-file signature is folded into the upstream hash.
+  - **Resume execution.** `GraphRunner.__init__(sl, frozen=<ancestor ids>)` marks
+    each frozen node reached + done + dispatched and reaches its structural
+    successors, so a topological walk skips the frozen ancestors while the
+    checkpoint still runs and reconverging downstream nodes gate correctly.
+    `frozen` empty ⇒ identical to the pre-V1.53 behavior.
+  - **Visualization.** New `"cached"` node run-state (dimmed body + dashed white
+    border) shades the frozen upstream nodes during a resumed Run;
+    `NodeCategory.CHECKPOINT` maps to a new `Settings.ACCENT_WHITE`.
+  - New `SPECIAL_CHECKPOINT_OP_KEY` / `NodeCategory.CHECKPOINT`; new Qt-free
+    `pipeline_graph/checkpoint_io.py` (`save_checkpoints` / `load_checkpoints` /
+    `checkpoints_dir_for`); page methods `_run_checkpoint`,
+    `_checkpoint_ancestors`, `_checkpoint_upstream_hash`,
+    `_checkpoint_resume_target`, `_restore_checkpoint`, `_record_signature`,
+    `_save_checkpoint_cache`, `_load_checkpoint_cache`.
+    (`nd2studios/pipeline_graph/{model,registry_adapter,executor,checkpoint_io,__init__}.py`,
+    `nd2studios/core/settings.py`,
+    `nd2studios/widgets/node_board/{node_scene,node_item,add_node_dialog}.py`,
+    `nd2studios/pages/pipelines_page.py`)
+
+## [Unreleased] - 2026-07-06 (SerialTrack PTV field: bounded interpolation — V1.52)
+
+Plan: `CodeLog/ClaudesPlan/V1.52_serialtrack_bounded_field_interp.md`.
+
+### Bug Fixes
+
+- **SerialTrack PTV field vectors were enormous even though per-particle
+  displacements were small (< 20 px).** The per-particle vectors from
+  `particle_displacement` were correct; the *gridded field* was extrapolating
+  without bound. `compute_field_bundle` and the panel defaulted `smoothness` to
+  `1e-3` (> 0), and `scatter_to_grid` routes any `smoothness > 0` through
+  `RBFInterpolator(kernel="thin_plate_spline", degree=1)`. Thin-plate-spline is
+  a global interpolant whose kernel grows like `r²·log r`; the grid spans the
+  particle **bounding box**, so its corners / inter-cluster gaps lie outside the
+  convex hull, where the RBF extrapolated with no bound and no hull mask (a
+  clustered repro with all displacements < 21 px produced field values of
+  ±134 px). Fix: **wire back the original Cell-Tracker approach** for the
+  field-*output* path — linear interpolation inside the convex hull, zero
+  outside it (never extrapolated), plus an optional Gaussian blur. New
+  `scatter_to_grid_bounded` / `scatter_to_grid_multi_bounded` in
+  `serialtrack/regularization.py`; `compute_gridded_strain` now uses them and
+  reinterprets `smoothness` as a **Gaussian σ in grid cells** (Cell-Tracker's
+  `sigma`). The tracking global-step solvers (`solve_regularization`,
+  `ADMMLSolver`) still use the RBF `scatter_to_grid` and are unaffected. Post-fix
+  the field is bounded by the per-particle displacement range (±14 px).
+  (`nd2studios/backend/serialtrack/regularization.py`,
+  `nd2studios/backend/serialtrack/fields.py`,
+  `nd2studios/backend/serialtrack_analysis.py`,
+  `nd2studios/widgets/serialtrack_panel.py`)
+
+### Changed
+
+- **SerialTrack panel "Smooth" control** now represents a Gaussian smoothing σ
+  in grid cells (decimals 4→1, step 0.001→0.5, default 0.001→1.0) with a tooltip
+  describing the bounded (no-extrapolation) field model.
+
+## [Unreleased] - 2026-07-06 (Digital Volume Correlation node — ALDVC — V1.51)
+
+Adds **Digital Volume Correlation** (DVC) as a pipeline-graph analysis node — a
+clean-room Python port of FranckLab's Augmented Lagrangian DVC (ALDVC;
+Yang/Hazlett/Landauer/Franck 2020). Measures the dense displacement + strain
+field between a reference and a deformed timepoint of a wired channel: true
+**3D DVC** on confocal Z-stacks (reads full `(Z,H,W)` volumes), with a **2D DIC**
+fallback when there is no Z. Brings forward + completes the `Add-DVC` branch's
+Phase-0 scaffold (which only stubbed a single global FFT shift). Plan:
+`CodeLog/ClaudesPlan/V1.51_dvc_aldvc_node.md`; literature review:
+`Research/aldvc_literature_review.md`.
+
+### Added
+
+- **`backend/dvc/` engine** (new, pure numpy/scipy/scikit-image — no PySide6) —
+  the full ALDVC pipeline: `mesh.py` (subset grid + DOF pack/unpack, layout
+  matching SerialTrack's FD operator), `integer_search.py` (per-subset windowed
+  FFT normalized-cross-correlation seed + parabolic subvoxel + q-factor),
+  `icgn.py` (inverse-compositional Gauss-Newton subset solver — 6-DOF 2D /
+  12-DOF 3D, cached reference Hessian, warp composition, ZNSSD objective,
+  `map_coordinates` warping; optional μ/β penalty for the ADMM Subpb1),
+  `outliers.py` (cc + normalized-median test + nearest-value inpaint),
+  `global_step.py` (augmented-Lagrangian FD solve `(β·DᵀD+μI)û = β·Dᵀ(F+w_F) +
+  μ(u+w_u)` **reusing** `serialtrack.regularization._build_gradient_operator`,
+  plus F-coupling, β L-curve, Tikhonov, cached factorization), `admm.py` (the
+  ADMM outer loop + scaled duals + convergence), `strain.py` (infinitesimal /
+  Green-Lagrange / Almansi / Hencky measures with anisotropic-voxel scaling),
+  `engine.py` (`run_aldvc` staged orchestration). Validated on synthetic known
+  deformations to sub-voxel accuracy (2D rigid ≈0.003 vox, 2D affine ≈0.001 vox
+  + strain, 3D rigid ≈0.1 vox).
+- **`core/dvc_registry.py`** (brought forward from `Add-DVC`) — `DVCMethod` ABC
+  registry + `DVCResult` (dense displacement/strain field container) + typed
+  `DVCParams` (now incl. `search_radius`, `strain_smooth`); `backend/dvc/method.py`
+  registers `ALDVCMethod` (force-imported in `__main__.py`), whose `get_params`
+  is the single source of truth for the node's ParamSpec list.
+- **DVC pipeline node** — a Special node `"DVC (ALDVC)"` (`SPECIAL_DVC_OP_KEY`,
+  HEXAGON) in `registry_adapter._SPECIAL_OPS`, with an `IMAGE` input so it gets a
+  rainbow channel port (wire a channel pill to choose the channel). `_SPECIAL_OPS`
+  entries gained an optional 7th `input_types` override; `param_specs_for` exposes
+  `ref_frame` / `def_frame` + the ALDVC engine knobs.
+- **DVC viewer tab** (`widgets/dvc_panel.py`) — a "DVC" overlay tab that renders
+  displacement magnitude/components, strain components, effective strain,
+  divergence, curl, det(F), and von-Mises stress as heatmaps / contours / quiver
+  over the reference backdrop, with a Z-slice slider for 3D. Reuses
+  `serialtrack_analysis.scalar_field` by building a `FieldBundle` from the
+  `DVCResult` — no DVC-specific field maths.
+- **`pages/pipelines_page.py` wiring** — `_DVCJob(AnalysisJob)` runs the engine
+  off the GUI thread; `_run_dvc` reads the reference/deformed `(Z,H,W)` volumes
+  straight from `record._raw_volume.get_frame(z_mode="none")` (bypassing the
+  Z-collapse) for the viewed multipoint; `_finish_dvc` stores the field, opens the
+  DVC tab, completes the node. Progress/cancel/tab wiring mirrors Track Objects +
+  the SerialTrack panel.
+- **Parallelism** — `backend/dvc/parallel.py` fans the IC-GN sweep across a
+  shared-memory `ProcessPoolExecutor` (reusing
+  `compute/parallel/shared_array.py`); `local_icgn`/`run_admm`/`run_aldvc` take
+  `n_workers` (node param, 0 = auto = cores−1) and parallelize by default on grids
+  ≥ 64 subsets. Validated to match the serial result on synthetic affine 3D.
+- **GPU (opt-in)** — the FFT integer-search seed is backend-agnostic: `_ncc_fft`
+  runs the normalized cross-correlation on numpy/scipy (CPU) or, when the
+  `use_gpu` node param is on and CuPy is present, on `cupy`/`cupyx.scipy.signal`
+  with the volumes resident on the device (guarded, automatic CPU fallback). The
+  IC-GN sweep stays on CPU cores.
+- **All-multipoints sweep** — an `all_multipoints` node param runs one
+  reference→deformed pair per multipoint; results are keyed by M and switchable in
+  the DVC tab (`m_change_requested`). Default remains the single viewed M.
+- **DVC viewer — Cell-Tracker scale controls** — Auto (2–98th-percentile fit,
+  symmetric for divergent fields), manual **Min/Max**, and a **Global Scale**
+  button that fixes the range over the whole 3-D field (so the colour scale holds
+  while scrubbing Z) — the same model as `SpatialMapsPanel`.
+- **DVC viewer — image-viewer zoom controls** — Home / + / − / Pan / zoom-%,
+  scroll-to-zoom and drag-to-pan (same button set as the app's `ZoomToolbar`,
+  driving the matplotlib axis limits), plus per-field render range applied to the
+  heatmap / filled + line contours.
+- **Full-timelapse field series + playable viewer** — the DVC node now computes a
+  field for **every frame** (not a single pair), faithful to `main_ALDVC.m`'s
+  `ImgSeqNum = 2..N` loop: `tracking_mode` = **cumulative** (each frame vs the
+  fixed reference) or **incremental** (each frame vs the previous). The DVC tab
+  gained a `FrameStrip` + play/pause + fps so the series plays like every other
+  viewer; "Global Scale" now fits the colour range across the **whole series**.
+  Node params `tracking_mode`, `z_start`/`z_end` (Z sub-range) and `downsample`
+  (XY bin) replace the old single `def_frame` — the last two make deep/large
+  stacks (e.g. 201×4096² ≈ 6.7 GB/volume) tractable.
+- **True 3-D volume fetch** — new `LazyND2Volume.get_volume` /
+  `MaterializedDataset.get_volume` return the full `(Z,H,W)` block (one dask
+  slice / array view). `get_frame(z_mode="none")` only ever returned a single
+  plane, so DVC now reads real volumes; `_DVCJob` reads them per-frame off the
+  GUI thread (bounded memory) so a 121 GB file never lands in RAM whole.
+- **Robustness** — `mesh.build_grid` guarantees ≥2 grid nodes per axis where the
+  extent allows, and the global step uses a DVC-local finite-difference operator
+  (`global_step._build_fd_operator`) + `strain` now guards singleton axes, so a
+  thin (shallow-Z) grid can't overflow SerialTrack's operator or `np.gradient`.
+  Verified end-to-end on the real 121 GB ND2 (2ch×9T×201Z×4096², cumulative +
+  incremental, on a Z-cropped ÷16 sub-volume).
+
+### Fidelity follow-up (V1.55 — restores ALDVC's large-deformation / series layer)
+
+Plan: `CodeLog/ClaudesPlan/V1.55_dvc_aldvc_fidelity.md`. Closes the gaps between the
+V1.51 core solver and FranckLab `main_ALDVC.m` for large motion + time series:
+
+- **Incremental → cumulative accumulation** (`backend/dvc/tracking.py`) — incremental
+  mode now composes the per-step increments into a cumulative field by Lagrangian
+  point-tracking (`main_ALDVC.m` 631–706), the field ALDVC actually reports. The DVC
+  tab gained a **"Show: Cumulative / Increment"** toggle (the job returns both series).
+- **Cross-frame warm-start** — each frame seeds its IC-GN from the previous frame's
+  field (`run_aldvc(u0_seed=…, use_fft_seed=False)`; ALDVC's `U0 =
+  ResultDisp{ImgSeqNum-2}`), FFT-seeding only the first frame or when the new
+  `newFFTSearch` param is set.
+- **Multigrid integer seed** (`integer_search_multigrid`, `IntegerSearch3Multigrid`) —
+  coarse-to-fine FFT search (new `seed_levels`, default 3) brackets large displacement:
+  recovers an 18-vox shift at radius 6 (0.015 vox err) where single-scale fails (15.5);
+  neutral on within-radius motion. `integer_search` gained a per-subset `u0_center`.
+- New node params: `tracking_mode` (already), `seed_levels`, `newFFTSearch`. Verified
+  end-to-end on the real 121 GB ND2 (warm-start + accumulation + dual series).
+
+## [Unreleased] - 2026-07-06 (Loop / iteration connector — V1.49)
+
+Plan: `CodeLog/ClaudesPlan/V1.49_loop_iteration_connector.md`.
+
+### Bug Fixes
+
+- **Double-clicking an analysis node now shows its preview overlay (regression fix).**
+  The double-click preview reset (`_reset_analysis_preview`) clears the prior
+  per-plane results *before* `_update_merged_view_mode` runs, so
+  `_update_overlay_tabs_available` saw no segmentation results, **hid the
+  Segmentation tab and fell back to the (overlay-less) Image tab**. The preview
+  job then ran (progress bar flashed) and produced masks, but they were never
+  displayed because the viewer was on Image — while the Run button worked because
+  it explicitly re-selects the Segmentation tab. Fix: the analysis-preview and
+  results-walk done-handlers now re-run `_update_overlay_tabs_available()` and
+  re-select the Segmentation overlay once a result lands (if the viewer had
+  fallen back to Image), mirroring the Run path. Also: the analysis-preview
+  handler now surfaces the real pipeline error / an explicit "no result on the
+  crop" message instead of a silent generic error.
+  (`nd2studios/pages/pipelines_page.py`)
+
+- **Analysis viewer reverted to raw images under a preview crop** (and, more
+  generally, whenever the multi-resolution pyramid was engaged). The Pipelines
+  viewer receives the BigDataViewer-style raw pyramid (`attach_pyramid`, pushed to
+  every page's viewer). `MultiAxisViewer._read_volume_plane` short-circuits to
+  `self._pyramid_reader.get_frame(level, …)` when `_choose_pyramid_level() > 0` —
+  but the pyramid is built from the **raw** volume, so it bypassed the
+  `ProcessedFrameVolume` recipe (and the `CroppedVolume` crop), showing raw,
+  full-frame images. Swapping in a `CroppedVolume` made a pyramid level get picked,
+  so the Analysis base image dropped back to raw (the Processing preview, which
+  pins already-processed planes, looked fine). Fix: the processed / cropped preview
+  wrappers (`ProcessedFrameVolume`, `PinnedProcessedVolume`, `CroppedVolume`) now
+  declare `bypass_pyramid = True`, and `_choose_pyramid_level` returns 0 for any
+  volume carrying that flag — so the viewer falls through to the wrapper's
+  `get_frame` (which applies the per-channel recipe / crop). The raw pyramid still
+  accelerates the raw volume everywhere else.
+- **Double-clicking a node in the Analysis tab now refreshes the preview when a
+  preview crop is active.** On a double-click with a crop set, `_on_node_double_clicked`
+  re-asserts the cropped base image (`_show_base_image()`) after resetting the
+  previous preview and before requesting the new one, so the freshly-previewed
+  node's crop-sized overlay lands on a matching, freshly-rendered base (crisp, not
+  stretched). No behavior change when no crop is active. (`nd2studios/pages/pipelines_page.py`)
+
+- **Analysis preview now surfaces *why* nothing appeared.** The
+  `_ANALYSIS_PREVIEW_KEY` done-handler previously collapsed any not-ok/empty
+  result into a generic "Analysis preview error" with no detail and no log. It now
+  shows (and logs) the real error message when the pipeline fails, and a distinct
+  "produced no result on the previewed frame(s)/crop" message when the pipeline
+  ran but returned nothing (e.g. StarDist finding no objects in a small crop) — so
+  a "progress flashed but no overlay" case is diagnosable instead of silent.
+  (`nd2studios/pages/pipelines_page.py`)
+
+### Bug Fixes
+
+- **Processing pipeline did not go through to Analysis after Apply, when a
+  channel pill was wired but the main Input node wasn't** (V1.48 follow-up). In
+  the two-layer channel model a channel pill feeds a process's **rainbow**
+  (CHANNEL) port, while the process's **structural** image input comes from the
+  main Input node. Users naturally wire `channel → process → Output` and skip the
+  redundant `Input → process` structural wire — but `recipe_for_node` then raised
+  "not connected back to an input", so **Apply committed nothing** (empty recipe,
+  no `_processed_view`) and the Analysis tab showed raw. Likewise `GraphRunner`
+  started only at the Input node and walked structural edges, so a channel-fed
+  analysis node was **unreachable and never ran**. Fix: a channel wire into a
+  rainbow port now counts as a valid image source — `recipe_for_node` terminates
+  the chain at a channel-fed process (new `node_has_channel_input`), and
+  `GraphRunner` treats channel-source pills as pre-completed roots so channel-fed
+  processes are reachable and run. Wiring `channel → process → Output` now
+  commits and flows to the analysis with **no** separate Input→process wire
+  required (wiring it too still works).
+- **Channel-specific processing did not carry through to the analysis** (V1.48
+  follow-up). Processing and Analysis are separate node slices, each with their
+  own channel pills. When an analysis node had **no** channel wired in the
+  Analysis slice, `_analysis_channels_for` defaulted to the **first** channel —
+  which was often a *raw* channel that the (channel-specific) Processing recipe
+  never touched — so the analysis appeared to ignore the processing. Fix: an
+  unwired analysis node now defaults to the channel(s) that were **processed**
+  upstream (`record.recipe_by_channel`) before falling back to the first channel,
+  so a channel-specific Processing recipe flows through to the analysis by
+  default; explicit Analysis-slice wiring still wins. Also: the SerialTrack /
+  Spatial-Maps backdrop readers now honor per-channel recipes
+  (`apply_recipe(..., recipe_by_channel=…)`) instead of applying the single
+  recipe to every channel. (The processing→analysis *data* path — base image,
+  per-M Run channels, preview frames — was already per-channel-correct; this was
+  purely the default channel *selection* + the two backdrops.)
+
+### Added
+
+- **Loop / iteration connector — a new back-edge wire type.** A loop wire exits a
+  node's **bottom** output and returns to the **top** input of the same node or an
+  upstream node, defining an *iterative loop region* re-run per iteration. It is
+  drawn distinctly (amber, routed down the left gutter with a downward arrowhead)
+  and is **invisible to every DAG codepath** — recipe linearization, channel
+  propagation, topological order, `GraphRunner`, and the cycle check all ignore it
+  — so a graph without loops behaves exactly as before.
+  - **Model** (`pipeline_graph/model.py`): `Edge` gains `kind`
+    (`"structural"`/`"loop"`) + `params` (loop config). New `STRUCTURAL_KIND` /
+    `LOOP_KIND`, `is_loop_edge`, `can_connect_loop`, and structural-only
+    `GraphSlice` queries (`structural_edges`, `structural_incoming/outgoing`,
+    `structural_edge_into_port`, `loop_edges`). `predecessor`, `recipe_for_node`,
+    `structural_chain`, `channel_sets`, `edge_channels`, `topological_order`, and
+    `GraphRunner` now walk structural edges only.
+  - **Pure loop core** (`pipeline_graph/loop.py`, new): `loop_region`,
+    `loop_entry_map`, `iteration_plan` (parameter-sweep **grid**/`zip`, fixed
+    `count`, `until` with `max_iterations` cap), `expand_axis`,
+    `deduplicate_objects` (per-(m, channel, frame) **mask IoU** with a
+    centroid-distance fallback), `combine_iterations`
+    (`union_dedup`/`best`/`last`/`keep_all`), and `tracking_ratio`
+    (coverage + longest continuous run).
+  - **Stop conditions** (`pipeline_graph/conditions.py`): new
+    `nondup_object_count` and `tracking_coverage` (≥ X% over ≥ K continuous
+    frames) blocks, reusing the if-else `Condition` DSL for the "until" mode.
+  - **Node board** (`widgets/node_board/`): `EdgeItem` loop routing/style +
+    arrowhead + `set_loop_edge`; `NodeScene` loop-wire drag mode
+    (`set_loop_mode`), `can_connect_loop`-gated creation (self-loop + upstream
+    allowed, cycle check skipped, coexists with the structural feed),
+    `loop_edge_edit_requested` signal, scissors cuts loop edges unchanged.
+  - **Loop Settings dialog** (`widgets/node_board/loop_dialog.py`, new): opened on
+    loop-wire create / double-click — iteration mode, swept-parameter axes (with a
+    live iteration count), stop condition (`ConditionBuilderDialog`), combine rule
+    (+ dedup metric/threshold / best metric), and multipoint scope.
+  - **Execution** (`pages/pipelines_page.py`): a "Loop" toolbar toggle; when a Run
+    reaches a loop-entry analysis node it iterates that node's per-M computation
+    over the plan (applying param overrides, restored afterward), records each
+    iteration's rows + label masks, evaluates the stop condition, then combines
+    and publishes the merged result downstream. Multipoint scope: current M or all
+    M. Params are restored on finish / cancel.
+  - **Per-iteration plots** (`pages/pipelines_page.py`): a loop run overlays every
+    iteration on the same analysis plots (Cells/frame line + Area step-histogram)
+    in distinct colors with a **legend labelled by the swept parameters**
+    (e.g. `#2  Scale=0.5`), plus a dashed **Combined** series — so you can see how
+    each sweep value changed the result. `_update_analysis_plots_loop`,
+    `_loop_iter_label`, `_iteration_colors`; series stashed at combine time and
+    cleared on the next preview/run.
+  - **Serialization** (`pipeline_graph/io.py`): `PIPELINE_VERSION` → 4; loop edges
+    round-trip via `Edge.kind`/`params`; older graphs load as all-structural (no
+    migration needed).
+
+### Bug Fixes
+
+- **Loop combine froze the GUI and ran far longer than the iterations themselves.**
+  For a union+dedup loop the overlap de-duplication (`loop.deduplicate_objects`)
+  ran on the **GUI thread** and compared every detection pair by allocating a
+  **full-frame** boolean mask per pair — O(K²) full-image ops on a dense field
+  (hundreds of nuclei × dozens of frames × several iterations), i.e.
+  seconds-to-minutes of frozen UI at the end of a loop. Three fixes:
+  1. **Bounding-box-gated, cropped IoU.** `deduplicate_objects` now pre-filters
+     pairs by their `bbox_*` boxes (a cheap integer overlap test) and computes IoU
+     only on the union bounding box; `_rebuild_merged` paints each merged object
+     within its bbox slice — no full-frame allocations. A synthetic dense field
+     (19,800 detections, 33 frames, 2048² masks) now de-dups in ~0.6 s (was
+     minutes).
+  2. **Off-thread combine.** The union-dedup combine runs in a background
+     `_LoopCombineJob` (like `_TrackJob`), keyed `_RUN_LOOPCOMBINE_KEY`, so the
+     window stays responsive; the GUI only does the light per-M result rebuild
+     when it finishes (`_finalize_analysis_publish` / `_loop_finalize_union`).
+     Cheap rules (best / last / keep-all) stay synchronous.
+  3. **Per-iteration channel cache.** A current-multipoint loop caches the
+     processed channels once (`_loop_ctx["chan_cache"]`) instead of
+     re-materializing the volume and re-applying the recipe every iteration; the
+     analysis (e.g. StarDist) still re-runs per iteration as intended.
+
+- **A loop on the Track Objects node did nothing (appeared to "disappear").** The
+  loop driver only hooked the analysis node, so a loop anchored on Track was never
+  iterated — the node ran once and the loop had no effect (the loop *edge* itself
+  persisted). **Fix:** the loop driver now also drives Track-Objects entries —
+  `_run_track_objects` begins the loop (`_loop_maybe_begin`) and
+  `_finish_track_objects` records each iteration, re-runs tracking with the next
+  swept params, then combines. A new `_loop_entry_kind` gates loops to
+  Analysis/Track entries (any other entry runs once with a status note instead of
+  silently doing nothing); `_loop_start_next_iteration` dispatches the re-run by
+  kind. Track sweeps have no masks, so union+dedup falls back to **Last**; the
+  meaningful rules are **Keep all**, **Best (by tracking ratio)**, **Last**. The
+  "until" stop condition on a Track sweep now evaluates on the iteration's
+  `track_id` rows directly (so `tracking_coverage` works).
+
+### Added
+
+- **Per-iteration Tracks/frame + Track-length plots.** `_update_track_plots` now
+  overlays every loop iteration as its own colored, legended series (labelled by
+  the swept params) plus a dashed **Combined** line — mirroring the Cells/frame +
+  Area behavior (`_update_track_plots_loop`). Fixes the Tracks/frame plot not
+  updating for a parameter-sweep + Keep-all Track loop.
+- **"Save all iterations" + viewer iteration selector.** A new **Save all
+  iterations for viewing** checkbox in Loop Settings (`loop_dialog.py`;
+  `default_loop_config()` gains `save_iterations`) retains each iteration's result.
+  When set, a new **Iteration** dropdown appears beside the overlay tabs
+  (`_iter_combo`) listing "Combined" + each "#k …"; selecting an entry re-points
+  the viewer overlay, results table and plots to that iteration
+  (`_loop_build_saved_store` / `_populate_iteration_selector` /
+  `_on_iteration_selected`). Opt-in, since it holds every iteration's masks in RAM.
+- **Loops now run on more nodes + an extensible loop-entry registry.** The loop
+  driver is now data-driven (`_LOOP_KIND_BY_OP` / `_LOOP_RUN_BY_KIND` /
+  `_LOOP_ROW_KINDS`) with a generic `_loop_step(node, publish)` helper, so wiring a
+  new node into the loop is a small, uniform change. Newly loopable entries:
+  **DVC**, **Registration** (sweep their params; the node's own tab shows the final
+  "last" iteration), and **Cell-Tracker Metrics** (a row kind — full combine rules
+  + per-iteration plots + the viewer selector). `_loop_begin_combine(force_sync=…)`
+  keeps these off the union-dedup worker path; `_loop_entry_kind` lists the
+  loopable set and other nodes run once with a status note. New developer guide:
+  **`docs/DEVELOPING_LOOP_NODES.md`** documents the extension points + a wiring
+  checklist.
+
+## [Unreleased] - 2026-07-06 (Channel-wire pipeline + full M/T coverage — V1.48)
+
+Plan: `CodeLog/ClaudesPlan/V1.48_channel_wiring_and_mt_coverage.md`.
+
+### Bug Fixes
+
+- **Analysis Run / measurement only ever processed one multipoint's pixels** (whichever M
+  `record._raw_channels` held — M0 at import), while storing/tagging results under *every*
+  M key — so a whole-file Run silently analyzed M0's image for all M. Root cause:
+  `_run_analysis_node` captured `channels` once from the single-M `processed_view()`
+  (`EnhancedDataset` wraps `record._raw_channels`, which is one multipoint) and
+  `_advance_run_m` handed that same object to every per-M `PipelineCommitJob`; `m_index`
+  was only a result *tag* (`compute/pipeline_jobs.py`), never used to re-read image data.
+  The chained `_ResultsMeasureJob` likewise measured the single-M view. **Fix:** new
+  `PipelinesPage._processed_channels_for_m(record, m)` reads that M's channels from the
+  lazy volume (`all_channels_as_lazy(m=m)`) and applies the committed recipe;
+  `_advance_run_m` builds channels per M and the measurement reuses the same M's channels
+  (`_run_channels_m`). All multipoints (and all timepoints within each) are now truly
+  analyzed. Peak RAM is unchanged (one M at a time).
+
+### Added
+
+- **Track displacement / motility — measure basis + per-frame outlier rejection (V1.50).**
+  Plan: `CodeLog/ClaudesPlan/V1.50_track_displacement_basis_and_outlier_frame.md`.
+  The if-else **"Track displacement / motility"** block (`pipeline_graph/conditions.py`)
+  gains two params:
+  - **Measure** (`basis`) — `Net (first→last)` (default, unchanged behavior),
+    `Cumulative path` (the *accumulation* over the whole track = Σ frame-to-frame steps),
+    or `Per-frame step` (a single frame-to-frame *instance*; reduced per track as the max
+    step, so `max > value` means "any one step exceeds"). Reduced per track by
+    `_track_metric_value` over `_track_points`, then run through the existing
+    `aggregate`/`comparator`/`value` machinery.
+  - **Per-frame exceed** (`outlier`) — `Reject object` (default, route the whole track) or
+    `Reject frame only`. With `Per-frame step` + `Reject frame only`, `partition_rows` calls
+    the new `scrub_outlier_frames`, which drops each outlier frame row (a frame whose step
+    from the last *retained* frame exceeds the threshold) **before** routing — so a spike
+    apex is removed while the rest of the track survives and routes normally; the dropped
+    frame lands in neither branch. Frame-only rejection is inherently object-lens; a
+    whole-frame if-else degrades to `Reject object`. New helpers `_basis_kind`,
+    `_reject_frame_only`, `_track_points`, `_track_metric_value`, `_outlier_frame_row_ids`,
+    and public `scrub_outlier_frames` (exported from `pipeline_graph`). Existing saved
+    conditions default to `Net (first→last)` + `Reject object` (no behavior change).
+- **Channel-wire pipeline model (V1.48).** "Which channel a process runs on" is now graph
+  *wiring* instead of a per-node `channel_name` parameter:
+  - **Channel source nodes** under the Input node — one small colored pill per loaded
+    channel plus an **"All"** node — created / reconciled by
+    `PipelinesPage._ensure_channel_nodes` (per file). Each emits a new `PortType.CHANNEL`
+    payload.
+  - **Rainbow ports** on every process node (enhancement / analysis): a `CHANNEL`-typed
+    input on the left edge that accepts a channel wire, plus a `CHANNEL` output on the
+    right ("both sides"). Wiring a channel **spawns a fresh free rainbow port** for the
+    next channel (`NodeScene._sync_rainbow_ports`), so there is always one open.
+  - **Automatic downstream propagation:** a channel wired into a node "follows" the
+    standard (structural) wires downstream, and a channel wired into a *further* process
+    joins the set there — `executor.channel_sets` (topological union of channel-edge
+    sources + structural predecessors).
+  - **Channel-colored wires:** a pure channel wire is drawn dashed in its channel color;
+    every structural wire additionally shows one thin **channel-colored strand per channel
+    flowing through it** (`executor.edge_channels`, `EdgeItem.set_channel_strands`).
+  - **Per-channel processing "from the entry point":** the committed Processing recipe is
+    now per-channel (`executor.channel_recipes`) — a channel gets only the enhancement
+    steps at/after where it enters; **unwired channels stay raw**, in the committed
+    processed view *and* the viewer (`EnhancedDataset` / `ProcessedFrameVolume` /
+    `apply_recipe` gained a `recipe_by_channel` argument;
+    `ND2StudiosRecord.recipe_by_channel`).
+  - **Analysis on wired channels:** an analysis node segments the channel(s) wired into it
+    (`_analysis_channels_for`), running once per channel and merging per-channel
+    `label_masks` (new `_MultiChannelCommitJob` / multi-channel `_AnalysisPreviewJob` /
+    `_ResultsScreenMeasureJob`), so the downstream `segmentation_channel` grouping used by
+    tracking / results is preserved. A 2nd wired channel counterstains a
+    counterstain-capable pipeline (tear detection).
+  - **Scissors tool** in the control bar (by Preview): arm to cut any wire — channel or
+    standard — by dragging a stroke across it or clicking it (`NodeScene.set_cut_mode`).
+
+### Changed
+
+- **Analysis node popups no longer show `channel_name` / `counterstain_channel`** — the
+  channel is inferred from wiring (`registry_adapter.param_specs_for` strips them).
+  `Cell-Tracker Metrics`'s `intensity_channel` is kept (it selects a *measurement column*,
+  not a segmentation channel).
+- **Backward compatibility:** a slice with **no** channel wiring behaves exactly as before
+  (every process runs on all channels; analysis falls back to the old `channel_name` /
+  first channel). Loading a pre-V1.48 graph migrates process nodes by adding rainbow ports
+  (`NodeScene.ensure_rainbow_ports`) and shows the channel pills unwired, so the old graph
+  keeps working until channels are wired.
+
+## [Unreleased] - 2026-07-06 (SerialTrack PTV plots — V1.47, in progress)
+
+### Bug Fixes
+
+- **SerialTrack tracking aborted at frame 7, producing zero tracked objects** — root cause
+  was a **missing scikit-learn** in the Python 3.12 environment. The POD-GPR ADMM warm
+  start (`serialtrack/prediction.py::InitialGuessPredictor._predict_pod_gpr`, used for
+  frames ≥7 when `Use previous results` is on) imports scikit-learn; without it the
+  `ModuleNotFoundError` propagated out of the single `track_coordinates` call, so
+  `object_tracker._link_group_serialtrack` raised (its `except ImportError` re-raised a
+  clear `RuntimeError`) and **no `track_id` was written** — the run failed while the
+  results table still showed the pre-tracking segmentation rows, and the SerialTrack tab
+  correctly reported "no objects tracked" (log stopped at frame 6). Resolution:
+  **scikit-learn 1.9.0 installed into Python 3.12**; the POD-GPR warm start now runs as
+  intended and tracking completes across all frames (verified end-to-end: POD-GPR path
+  active, no fallback). No code change — scikit-learn is a required dependency for the
+  SerialTrack `Use previous results` path on 7+ frame sequences.
+
+### Added
+
+- **SerialTrack PTV analysis data layer** (`nd2studios/backend/serialtrack_analysis.py`,
+  new, Qt-free). Rebuilds Particle-Tracking-Velocimetry analysis products from tracked
+  measurement rows — because ND2Studios currently runs SerialTrack only to chain
+  `track_id` and discards its displacement/strain fields. Public API:
+  - `build_track_data(rows, m=None, *, pixel_size_um, z_step_um, time_step)` →
+    `TrackData` (per-frame `coords`/`track_ids`, chained `trajectories` matrix
+    `(N_tracks, n_frames, D)`). Dimensionality `D` auto-inferred (3 when rows carry
+    `centroid_z_px`, else 2) — so 3D lights up for volumetric/imported centroids while
+    today's 2D pipeline is unaffected.
+  - `particle_displacement(td, t, mode)` — per-particle displacement vectors
+    (`"cumulative"` vs a reference frame, or `"incremental"` frame-to-frame).
+  - `compute_field_bundle(td, t, *, grid_step, smoothness, physical)` → `FieldBundle`
+    with gridded `DisplacementField` + `StrainField` (via `serialtrack.fields.compute_gridded_strain`).
+  - Derived fields: `displacement_magnitude`, `velocity_components`, `divergence`
+    (dilatation), `curl` (2D scalar / 3D vorticity vector), `jacobian` (J = det(I+∂u/∂x)),
+    `effective_strain` (Von-Mises strain), `compute_stress` (linear-isotropic Hooke's
+    law) + `von_mises_from_sigma` (plane-strain in 2D), and a `scalar_field(fb, key)`
+    dispatcher for the panel's Field combo.
+  - Verified against an analytic 10 %-x-stretch deformation: `e_xx`/`div`/`det(F)`/`curl`
+    match to regularization tolerance. Plan: `CodeLog/ClaudesPlan/V1.47_serialtrack_ptv_plots.md`.
+- **SerialTrack PTV panel + viewer tab** (`nd2studios/widgets/serialtrack_panel.py`,
+  new; wired in `nd2studios/pages/pipelines_page.py`). A new **"SerialTrack"** tab in
+  the Pipelines image-viewer stack (sibling of the *Spatial Maps* tab), embedding
+  `SerialTrackPanel` — a matplotlib (`MplCanvas`) PTV analysis view driven by a
+  `FrameStrip` T-scrubber with play/pause + FPS. View modes:
+  - **Trajectories** — particle paths up to the current frame, colored by time or net
+    displacement, with XY / XZ / YZ projection for 3D data.
+  - **Scalar field** — heatmap / filled-contour / line-contour of any of ~17 fields
+    (displacement, velocity, strain εij, divergence, curl, det(F), effective strain,
+    Von Mises + σij stress), over an optional background channel image, with colorbar,
+    scale bar, per-field symmetric/divergent color scaling, and mid-Z slicing for 3D.
+  - **Quiver** and **Heatmap + Quiver** — magnitude-colored displacement vector field
+    (subsampled to an adjustable arrow density).
+  - **Displacement histogram** (per-frame magnitude distribution, mean/median markers).
+  - **Tracking dashboard** — detected/tracked bars + tracking-ratio line across frames.
+  - Controls: mode (cumulative vs incremental), grid step, smoothness, colormap,
+    stress material params (E, ν). Per-frame `FieldBundle` cache keeps playback smooth.
+  - Wiring: overlay-tab key `"serialtrack"`, lazy `_ensure_serialtrack_panel()` /
+    `_populate_serialtrack_panel()`, visible once tracked rows exist — mirrors the
+    Spatial Maps tab exactly. Verified headless (offscreen Qt) across all 38 view/field
+    combinations in 2D and 3D. (V1.47 phase 1.)
+
+### Added
+
+- **Preview-crop UX overhaul (Pipelines tab).** Several improvements to the
+  preview-crop tool:
+  - **Works with live Preview off.** Enabling/disabling the crop now refreshes
+    the displayed base image even when the Preview toggle is off (`_on_crop_changed`
+    → `_show_base_image(force=True)`), so you can set/clear a crop without live
+    compute running. Arming the tool with Preview off also shows a base image to
+    draw on if the viewer is empty.
+  - **Undo arrow (↩) left of the Preview Crop button** (`_btn_crop_undo`) steps
+    back through crop changes via an undo stack (`_crop_history`,
+    `_on_crop_undo`, `_apply_crop_state`) — restores the previous crop, or
+    no-crop. Reset on file change.
+  - **More prominent crop rectangle.** The rubber-band rectangle now draws a dark
+    halo under a bright magenta dashed line (both `ImageCanvas` and
+    `GpuImageCanvas`) so it stands out over any image content.
+  - **Live crop preview in the dialog.** The Preview Crop dialog shows a
+    real-time thumbnail of the cropped region (`_composite_full_frame_rgb` →
+    scaled `QLabel`) that updates as you edit X/Y/W/H or jog.
+  - **Jog pad.** A symmetric 4-way cross of chevron-icon buttons (qtawesome, so
+    they match the rest of the toolbar) around a configurable step (px) field in
+    the middle; each arrow shifts the whole region by the step in that direction,
+    clamped to the image. Equal-sized grid cells + a content-hugging group box
+    keep the cross exactly symmetric, and the step field is sized wide enough
+    (`scaled(58)`) that its value is fully visible (a too-narrow box previously
+    hid the number and made the pad look broken); jog buttons are
+    `autoDefault=False` so Enter accepts the dialog. Verified end-to-end (clicking
+    ▶ shifts the region and updates the live preview).
+    (`nd2studios/pages/pipelines_page.py`,
+    `nd2studios/widgets/image_viewer.py`, `nd2studios/widgets/gpu_image_canvas.py`)
+
+  A **skill** documenting ND2Studios button/icon/widget-layout conventions (icon
+  helpers, `scaled()` DPI, QSS object names, symmetric grid pads, dialog layout,
+  headless verification) is at `.claude/skills/nd2studios-widget-layout/SKILL.md`
+  so future UI additions follow the correct pattern.
 
 - **ADMM global solver routed into the SerialTrack tracking method**, plus the
   method's **complete tunable-parameter surface** on the Track Objects node. When

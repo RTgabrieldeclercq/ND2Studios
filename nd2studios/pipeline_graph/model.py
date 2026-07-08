@@ -32,6 +32,7 @@ class PortType(Enum):
     DATA = "data"      # List[Dict[str, Any]] measurement rows
     VALUE = "value"    # scalar / small param
     ANY = "any"        # wildcard — logic/special nodes accept & pass any payload
+    CHANNEL = "channel"  # V1.48 channel-flow layer: rainbow ports + channel wires
 
 
 class Stage(Enum):
@@ -60,6 +61,8 @@ class NodeCategory(Enum):
     RESULTS = "results"
     LOGIC = "logic"      # if-else branch nodes
     SPECIAL = "special"  # interactive / action nodes (validate, export, …)
+    CHANNEL = "channel"  # V1.48 channel source nodes (one per channel + "All")
+    CHECKPOINT = "checkpoint"  # V1.53 checkpoint node (white; freezes upstream)
 
 
 class ShapeKind(Enum):
@@ -68,6 +71,7 @@ class ShapeKind(Enum):
     RECT = "rect"          # default rounded rectangle
     TRIANGLE = "triangle"  # upright triangle (if-else: 1 in top, 2 out bottom)
     HEXAGON = "hexagon"    # special action nodes
+    PILL = "pill"          # V1.48 channel source nodes (small rounded capsule)
 
 
 _STAGE_CATEGORY = {
@@ -85,6 +89,17 @@ def category_for_stage(stage: Stage) -> "NodeCategory":
 def new_id(prefix: str = "n") -> str:
     """Short unique id, e.g. ``"node-1a2b3c4d"``."""
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+# ── edge kinds (V1.49) ───────────────────────────────────────────────────────
+# A structural edge is the normal top→bottom pipeline wire. A *loop* edge is the
+# V1.49 back-edge: it exits a node's bottom and returns to the top of the same
+# node or an upstream node, defining an iterative loop region. Loop edges are
+# **invisible** to every DAG codepath (recipe linearization, channel propagation,
+# topological order, GraphRunner, cycle detection) — only the loop executor sees
+# them — so a graph without loops behaves exactly as before.
+STRUCTURAL_KIND = "structural"
+LOOP_KIND = "loop"
 
 
 # ── dataclasses ────────────────────────────────────────────────────────────
@@ -187,6 +202,14 @@ class Edge:
     src_port: str
     dst_node: str
     dst_port: str
+    # V1.49: ``kind`` is ``"structural"`` (default) or ``"loop"``. ``params`` holds
+    # the loop configuration (sweep / stop condition / combine rule) for a loop
+    # edge; it is empty for structural edges.
+    kind: str = STRUCTURAL_KIND
+    params: Dict[str, Any] = field(default_factory=dict)
+
+    def is_loop(self) -> bool:
+        return self.kind == LOOP_KIND
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -195,6 +218,8 @@ class Edge:
             "src_port": self.src_port,
             "dst_node": self.dst_node,
             "dst_port": self.dst_port,
+            "kind": self.kind,
+            "params": dict(self.params),
         }
 
     @classmethod
@@ -205,6 +230,8 @@ class Edge:
             src_port=d["src_port"],
             dst_node=d["dst_node"],
             dst_port=d["dst_port"],
+            kind=str(d.get("kind", STRUCTURAL_KIND)),
+            params=dict(d.get("params", {})),
         )
 
 
@@ -292,6 +319,32 @@ class GraphSlice:
     def edge_into_port(self, node_id: str, port_id: str) -> Optional[Edge]:
         for e in self.edges.values():
             if e.dst_node == node_id and e.dst_port == port_id:
+                return e
+        return None
+
+    # ── structural-only queries (V1.49) ───────────────────────────────────
+    # DAG traversal (recipe linearization, channel propagation, GraphRunner)
+    # must ignore loop edges — these variants filter them out.
+    def structural_edges(self) -> List[Edge]:
+        return [e for e in self.edges.values() if e.kind != LOOP_KIND]
+
+    def loop_edges(self) -> List[Edge]:
+        return [e for e in self.edges.values() if e.kind == LOOP_KIND]
+
+    def structural_incoming(self, node_id: str) -> List[Edge]:
+        return [e for e in self.edges.values()
+                if e.dst_node == node_id and e.kind != LOOP_KIND]
+
+    def structural_outgoing(self, node_id: str) -> List[Edge]:
+        return [e for e in self.edges.values()
+                if e.src_node == node_id and e.kind != LOOP_KIND]
+
+    def structural_edge_into_port(
+        self, node_id: str, port_id: str
+    ) -> Optional[Edge]:
+        for e in self.edges.values():
+            if (e.dst_node == node_id and e.dst_port == port_id
+                    and e.kind != LOOP_KIND):
                 return e
         return None
 
@@ -394,12 +447,58 @@ def can_connect(src: Port, dst: Port) -> bool:
     special nodes accept any upstream and pass it through). Cycle and
     single-wire-per-input checks live in :func:`would_create_cycle` / the scene,
     which know the whole slice.
+
+    V1.48: the ``CHANNEL`` flavor is a separate layer — a channel wire pairs only
+    with another ``CHANNEL`` port (a rainbow port). It never connects to a
+    structural IMAGE/BINARY/DATA port, and not even to an ``ANY`` wildcard, so
+    channel wires must target a rainbow port explicitly.
     """
     if src.is_input or not dst.is_input:
         return False
+    if PortType.CHANNEL in (src.type, dst.type):
+        return src.type is PortType.CHANNEL and dst.type is PortType.CHANNEL
     if PortType.ANY in (src.type, dst.type):
         return True
     return src.type == dst.type
+
+
+def is_channel_port(port: Port) -> bool:
+    """True for a rainbow / channel-flow port (V1.48)."""
+    return port.type is PortType.CHANNEL
+
+
+def is_loop_edge(edge: Edge) -> bool:
+    """True for a V1.49 loop / iteration back-edge."""
+    return edge.kind == LOOP_KIND
+
+
+def can_connect_loop(src: Port, dst: Port) -> bool:
+    """True if a **loop** wire from output ``src`` to input ``dst`` is legal.
+
+    A loop edge reuses the node's existing *structural* ports: it leaves a
+    bottom output and returns to a top input. So ``src`` must be an output,
+    ``dst`` an input, and neither may be a CHANNEL (rainbow) port — channels
+    flow on their own layer. Unlike :func:`can_connect`, payload types need not
+    match (a loop just says "re-run this region"), and unlike a structural wire
+    the cycle check is deliberately skipped by the caller.
+    """
+    if src.is_input or not dst.is_input:
+        return False
+    if PortType.CHANNEL in (src.type, dst.type):
+        return False
+    return True
+
+
+def structural_input_port(node: Node) -> Optional[Port]:
+    """The node's first **structural** (non-channel) input port, if any.
+
+    ``node.input_port()`` returns ``inputs[0]``, which stays the structural port
+    because rainbow (CHANNEL) inputs are always appended after it. This helper is
+    explicit for callers that must skip rainbow ports."""
+    for p in node.inputs:
+        if p.type is not PortType.CHANNEL:
+            return p
+    return None
 
 
 def clone_node(node: Node, pos: Tuple[float, float]) -> Node:

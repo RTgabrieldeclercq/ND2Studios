@@ -14,16 +14,21 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional
 
 from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPainterPath, QPen
 from PySide6.QtWidgets import QGraphicsScene, QMenu
 
+from nd2studios.widgets.icon_button import scaled
+
 from nd2studios.core.settings import Settings
+from nd2studios.pipeline_graph.executor import edge_channels
+from nd2studios.pipeline_graph.loop import default_loop_config
 from nd2studios.pipeline_graph.model import (
-    Edge, GraphSlice, Node, NodeCategory, NodeRole, can_connect, clone_node,
-    new_id, would_create_cycle,
+    Edge, GraphSlice, LOOP_KIND, Node, NodeCategory, NodeRole, Port, PortType,
+    can_connect, can_connect_loop, clone_node, new_id, would_create_cycle,
 )
 from nd2studios.pipeline_graph.registry_adapter import (
-    SPECIAL_DISMISS_OP_KEY, NodeSpec, build_node,
+    RAINBOW_IN_NAME, RAINBOW_OUT_NAME, SPECIAL_DISMISS_OP_KEY, NodeSpec,
+    build_node, channel_name_for_op_key, spec_takes_channels,
 )
 from nd2studios.widgets.node_board.edge_item import EdgeItem
 from nd2studios.widgets.node_board.node_item import NodeItem
@@ -38,6 +43,9 @@ _CATEGORY_COLOR = {
     NodeCategory.RESULTS: Settings.ACCENT_GREEN,
     NodeCategory.LOGIC: Settings.ACCENT_PURPLE,
     NodeCategory.SPECIAL: Settings.ACCENT_ORANGE,
+    NodeCategory.CHECKPOINT: Settings.ACCENT_WHITE,  # V1.53 freeze/cache node
+    # Channel pills get their per-channel color at refresh; this is the fallback.
+    NodeCategory.CHANNEL: Settings.FG_SECONDARY,
 }
 
 
@@ -47,6 +55,7 @@ class NodeScene(QGraphicsScene):
     graph_changed = Signal()
     node_created = Signal(str)          # node_id
     node_renamed = Signal(str, str)     # node_id, new title
+    loop_edge_edit_requested = Signal(str)  # V1.49: loop edge_id to configure
 
     def __init__(
         self,
@@ -69,6 +78,20 @@ class NodeScene(QGraphicsScene):
         self._port_index: Dict[str, PortItem] = {}
         self._drag_from: Optional[PortItem] = None
         self._temp_edge: Optional[EdgeItem] = None
+        # V1.48 scissors: when armed, a left drag draws a cut stroke and any
+        # crossed wire (structural OR channel) is removed; a click cuts the wire
+        # under the cursor.
+        self._cut_mode = False
+        self._cut_start: Optional[QPointF] = None
+        self._cut_item = None
+        # V1.49 loop mode: when armed, a drag from a node's bottom output to the
+        # top input of the same or an upstream node creates a *loop* back-edge.
+        self._loop_mode = False
+        # V1.48 channel-flow context (pushed by the page): live channel names +
+        # their display colors, used to color channel wires / propagation strands
+        # / channel-source pills.
+        self._all_names: List[str] = []
+        self._channel_colors: Dict[str, str] = {}
 
         self.setBackgroundBrush(QColor(Settings.BG_PRIMARY))
         self.setSceneRect(-2000, -2000, 4000, 4000)
@@ -104,6 +127,8 @@ class NodeScene(QGraphicsScene):
         src = self._port_index.get(edge.src_port)
         color = src.color_hex() if src is not None else Settings.FG_PRIMARY
         item = EdgeItem(edge.id, color)
+        if edge.kind == LOOP_KIND:  # V1.49: amber left-gutter routing + arrow
+            item.set_loop_edge(True)
         self.addItem(item)
         self._edge_items[edge.id] = item
         self._refresh_edge_item(item, edge)
@@ -177,6 +202,47 @@ class NodeScene(QGraphicsScene):
         # uses it to keep the node's bridge name in sync.
         self.node_renamed.emit(node_id, title)
 
+    # ── loop connector (V1.49) ────────────────────────────────────────────
+    def set_loop_mode(self, on: bool) -> None:
+        """Arm / disarm loop-wire mode. While armed, a drag from a bottom output
+        to a top input (same node or an upstream node) creates a loop back-edge."""
+        self._loop_mode = bool(on)
+
+    def edit_loop_edge(self, edge_id: str) -> None:
+        """Request the page open the Loop Settings dialog for this loop edge."""
+        edge = self.slice.edges.get(edge_id)
+        if edge is not None and edge.kind == LOOP_KIND:
+            self.loop_edge_edit_requested.emit(edge_id)
+
+    def _has_loop_edge(self, src_node: str, dst_node: str) -> bool:
+        return any(e.kind == LOOP_KIND and e.src_node == src_node
+                   and e.dst_node == dst_node for e in self.slice.edges.values())
+
+    def _try_connect_loop(self, out_item: PortItem, in_item: PortItem) -> None:
+        """Create a loop back-edge (out=bottom, in=top). Unlike a structural wire
+        this permits a self-loop and skips the cycle check (loops are intentionally
+        cyclic); it coexists with the input's structural feed."""
+        out_node = out_item.node_item.node
+        in_node = in_item.node_item.node
+        if not can_connect_loop(out_item.port, in_item.port):
+            in_item.flash_reject()
+            return
+        if self._has_loop_edge(out_node.id, in_node.id):
+            in_item.flash_reject()  # already looped this pair
+            return
+        edge = Edge(
+            id=new_id("loop"),
+            src_node=out_node.id, src_port=out_item.port.id,
+            dst_node=in_node.id, dst_port=in_item.port.id,
+            kind=LOOP_KIND, params=default_loop_config(),
+        )
+        self.slice.add_edge(edge)
+        self._add_edge_item(edge)
+        self.graph_changed.emit()
+        # Open the settings dialog straight away so the loop is configured on
+        # creation (double-clicking it later reopens the same dialog).
+        self.loop_edge_edit_requested.emit(edge.id)
+
     # ── edge helpers ──────────────────────────────────────────────────────
     def disconnect_edge(self, edge_id: str) -> None:
         """Remove a single wire (the EdgeItem double-click handler calls this)."""
@@ -186,8 +252,16 @@ class NodeScene(QGraphicsScene):
         self.graph_changed.emit()
 
     def _remove_edge(self, edge_id: str) -> None:
+        edge = self.slice.edges.get(edge_id)
+        dst_node = edge.dst_node if edge is not None else None
         self.slice.remove_edge(edge_id)
         self._drop_edge_item(edge_id)
+        # V1.48: freeing a rainbow input may leave a surplus free port — trim it.
+        if dst_node is not None:
+            node = self.slice.nodes.get(dst_node)
+            if node is not None and any(p.type is PortType.CHANNEL
+                                        for p in node.inputs):
+                self._sync_rainbow_ports(dst_node)
 
     def _drop_edge_item(self, edge_id: str) -> None:
         item = self._edge_items.pop(edge_id, None)
@@ -200,6 +274,99 @@ class NodeScene(QGraphicsScene):
             edge = self.slice.edges.get(eid)
             if edge and (edge.src_node == nid or edge.dst_node == nid):
                 self._refresh_edge_item(item, edge)
+
+    # ── channel-flow layer (V1.48) ────────────────────────────────────────
+    def set_channel_context(self, all_names: List[str],
+                            channel_colors: Dict[str, str]) -> None:
+        """Push the live channel names + display colors, then recolor channel
+        wires / propagation strands / channel-source pills."""
+        self._all_names = list(all_names or [])
+        self._channel_colors = dict(channel_colors or {})
+        self.ensure_rainbow_ports()
+        self.refresh_channel_visuals()
+
+    def ensure_rainbow_ports(self) -> None:
+        """Guarantee every process node has rainbow channel ports + exactly one
+        free rainbow input (e.g. after loading a saved graph). Migrates process
+        nodes saved before V1.48 (no rainbow ports) by adding the initial pair."""
+        for nid, node in list(self.slice.nodes.items()):
+            has_rainbow = any(p.type is PortType.CHANNEL for p in node.inputs)
+            if not has_rainbow and spec_takes_channels(
+                    node.op_key, node.role, [p.type for p in node.inputs]):
+                node.inputs.append(
+                    Port(new_id("p"), RAINBOW_IN_NAME, PortType.CHANNEL, True))
+                node.outputs.append(
+                    Port(new_id("p"), RAINBOW_OUT_NAME, PortType.CHANNEL, False))
+                self._rebuild_node_ports(nid)
+            self._sync_rainbow_ports(nid)
+
+    def _sync_rainbow_ports(self, node_id: str) -> None:
+        """Keep exactly one FREE (unwired) rainbow input port on a process node:
+        add one when the last free port gets wired; trim surplus free ones on
+        disconnect. Rebuilds the node's ports when the set changes (V1.48)."""
+        node = self.slice.nodes.get(node_id)
+        if node is None:
+            return
+        rainbow = [p for p in node.inputs if p.type is PortType.CHANNEL]
+        if not rainbow:
+            return
+        wired_ids = {e.dst_port for e in self.slice.edges.values()}
+        free = [p for p in rainbow if p.id not in wired_ids]
+        changed = False
+        if not free:
+            node.inputs.append(
+                Port(new_id("p"), RAINBOW_IN_NAME, PortType.CHANNEL, True))
+            changed = True
+        else:
+            for victim in free[1:]:  # keep exactly one free
+                node.inputs.remove(victim)
+                changed = True
+        if changed:
+            self._rebuild_node_ports(node_id)
+
+    def _rebuild_node_ports(self, node_id: str) -> None:
+        item = self._node_items.get(node_id)
+        if item is None:
+            return
+        for pid in list(item.port_items.keys()):
+            self._port_index.pop(pid, None)
+        item.rebuild_ports()
+        for pid, pit in item.port_items.items():
+            self._port_index[pid] = pit
+        self._on_node_geometry_changed(item)
+        self.refresh_channel_visuals()
+
+    def refresh_channel_visuals(self) -> None:
+        """Recolor channel wires (channel-source color / rainbow), draw the
+        per-channel propagation strands on structural wires, and tint the
+        channel-source pills + their output ports (V1.48)."""
+        ec = edge_channels(self.slice, self._all_names) if self._all_names else {}
+        for eid, item in self._edge_items.items():
+            edge = self.slice.edges.get(eid)
+            if edge is None:
+                continue
+            src_port = self.slice.find_port(edge.src_port)
+            is_chan = src_port is not None and src_port.type is PortType.CHANNEL
+            chans = ec.get(eid, [])
+            colors = [self._channel_colors.get(c) or Settings.FG_SECONDARY
+                      for c in chans]
+            item.set_channel_edge(is_chan)
+            if is_chan and len(colors) == 1:
+                item.set_color(colors[0])
+                item.set_channel_strands([])
+            else:
+                item.set_channel_strands(colors)
+        for nid, item in self._node_items.items():
+            node = self.slice.nodes.get(nid)
+            if node is None or getattr(node, "category", None) is not NodeCategory.CHANNEL:
+                continue
+            nm = channel_name_for_op_key(node.op_key)
+            col = self._channel_colors.get(nm) if nm else None
+            item.set_accent(col or Settings.FG_SECONDARY)
+            for p in node.outputs:
+                pit = self._port_index.get(p.id)
+                if pit is not None:
+                    pit.set_display_color(col or "")  # "" → rainbow (the All node)
 
     # ── selection / double-click ──────────────────────────────────────────
     def _emit_selection(self) -> None:
@@ -248,6 +415,10 @@ class NodeScene(QGraphicsScene):
         return None
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        if self._cut_mode and event.button() == Qt.MouseButton.LeftButton:
+            self._begin_cut(event.scenePos())
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             port = self._port_at(event.scenePos())
             if port is not None and not port.port.is_input:
@@ -257,6 +428,13 @@ class NodeScene(QGraphicsScene):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._cut_mode and self._cut_start is not None:
+            if self._cut_item is not None:
+                self._cut_item.setLine(
+                    self._cut_start.x(), self._cut_start.y(),
+                    event.scenePos().x(), event.scenePos().y())
+            event.accept()
+            return
         if self._drag_from is not None and self._temp_edge is not None:
             self._temp_edge.set_endpoints(
                 self._drag_from.center_scene(), event.scenePos()
@@ -266,6 +444,11 @@ class NodeScene(QGraphicsScene):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._cut_mode and self._cut_start is not None:
+            self._perform_cut(self._cut_start, event.scenePos())
+            self._end_cut()
+            event.accept()
+            return
         if self._drag_from is not None:
             target = self._port_at(event.scenePos())
             self._finish_connection(target)
@@ -273,9 +456,59 @@ class NodeScene(QGraphicsScene):
             return
         super().mouseReleaseEvent(event)
 
+    # ── scissors / cut mode (V1.48) ────────────────────────────────────────
+    def set_cut_mode(self, on: bool) -> None:
+        """Arm / disarm the wire cutter. While armed, a left drag cuts every
+        crossed wire and a click cuts the wire under the cursor."""
+        self._cut_mode = bool(on)
+        if not on:
+            self._end_cut()
+
+    def _begin_cut(self, pos: QPointF) -> None:
+        self._cut_start = pos
+        pen = QPen(QColor(Settings.ACCENT_RED))
+        pen.setWidthF(scaled(1.6))
+        pen.setStyle(Qt.PenStyle.DashLine)
+        self._cut_item = self.addLine(pos.x(), pos.y(), pos.x(), pos.y(), pen)
+        self._cut_item.setZValue(50)
+
+    def _end_cut(self) -> None:
+        if self._cut_item is not None:
+            self.removeItem(self._cut_item)
+            self._cut_item = None
+        self._cut_start = None
+
+    def _perform_cut(self, a: QPointF, b: QPointF) -> None:
+        """Remove every wire crossed by the a→b stroke (or, for a click, the wire
+        under the cursor). Works for structural and channel wires alike."""
+        moved = (abs(a.x() - b.x()) + abs(a.y() - b.y())) > scaled(3)
+        to_cut: List[str] = []
+        if moved:
+            cut = QPainterPath(a)
+            cut.lineTo(b)
+            for eid, item in self._edge_items.items():
+                try:
+                    if item.shape().intersects(cut):
+                        to_cut.append(eid)
+                except Exception:  # noqa: BLE001
+                    continue
+        else:
+            for it in self.items(a):
+                if isinstance(it, EdgeItem):
+                    to_cut.append(it.edge_id)
+        changed = False
+        for eid in to_cut:
+            if eid in self._edge_items or eid in self.slice.edges:
+                self._remove_edge(eid)
+                changed = True
+        if changed:
+            self.graph_changed.emit()
+
     def _begin_connection(self, port_item: PortItem) -> None:
         self._drag_from = port_item
         self._temp_edge = EdgeItem("__temp__", port_item.color_hex())
+        if self._loop_mode:  # V1.49: preview the loop routing while dragging
+            self._temp_edge.set_loop_edge(True)
         self.addItem(self._temp_edge)
         self._temp_edge.set_endpoints(
             port_item.center_scene(), port_item.center_scene()
@@ -295,6 +528,9 @@ class NodeScene(QGraphicsScene):
         self._try_connect(src, target)
 
     def _try_connect(self, out_item: PortItem, in_item: PortItem) -> None:
+        if self._loop_mode:  # V1.49: loop-wire drag creates a back-edge instead
+            self._try_connect_loop(out_item, in_item)
+            return
         out_node = out_item.node_item.node
         in_node = in_item.node_item.node
         if out_node.id == in_node.id:
@@ -316,6 +552,10 @@ class NodeScene(QGraphicsScene):
         )
         self.slice.add_edge(edge)
         self._add_edge_item(edge)
+        # V1.48: wiring a channel into a rainbow input spawns a fresh free rainbow
+        # port for the next channel (so there's always one free to grab).
+        if in_item.port.type is PortType.CHANNEL:
+            self._sync_rainbow_ports(in_node.id)
         self.graph_changed.emit()
 
     # ── context menu (add nodes) ──────────────────────────────────────────

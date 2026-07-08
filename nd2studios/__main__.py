@@ -77,12 +77,15 @@ def main() -> None:
     # Force-import plugin/pipeline modules so decorator-based registration
     # runs at startup before any page is constructed.
     import nd2studios.plugins.enhancement.builtin  # noqa: F401
+    import nd2studios.plugins.enhancement.registration  # noqa: F401  # registers RegistrationPlugin (drift correction)
     import nd2studios.backend.analysis.nuclei_segmentation  # noqa: F401
     import nd2studios.backend.analysis.stardist_segmentation  # noqa: F401
     import nd2studios.backend.analysis.tear_detection  # noqa: F401
     import nd2studios.backend.analysis.histogram_threshold_pipeline  # noqa: F401
     import nd2studios.backend.analysis.spots_pipeline  # noqa: F401
     import nd2studios.backend.analysis.manual_mask  # noqa: F401
+    import nd2studios.backend.dvc.method  # noqa: F401  # registers ALDVCMethod (DVC node)
+    import nd2studios.backend.registration.method  # noqa: F401  # registers RigidRegistration (registration node)
 
     app = QApplication(sys.argv)
     app.setApplicationName(Settings.APP_NAME)

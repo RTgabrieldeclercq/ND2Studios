@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from nd2studios.core.settings import Settings
-from nd2studios.pipeline_graph.model import Node, NodeRole, ShapeKind
+from nd2studios.pipeline_graph.model import Node, NodeCategory, NodeRole, PortType, ShapeKind
 from nd2studios.widgets.icon_button import make_icon, scaled
 from nd2studios.widgets.node_board.port_item import PortItem
 
@@ -110,7 +110,9 @@ class NodeItem(QGraphicsObject):
         # (if-else), or a hexagon (special). The shape drives geometry, ports
         # and paint; the accent is the node's *category* color.
         self._shape = getattr(node, "shape_kind", ShapeKind.RECT) or ShapeKind.RECT
-        self._w = scaled(self.BASE_WIDTH)
+        # V1.48: channel-source nodes render as small pills (compact width).
+        self._w = (scaled(112) if self._shape is ShapeKind.PILL
+                   else scaled(self.BASE_WIDTH))
         self._lip_w = scaled(5)          # vertical accent strip on the LEFT edge
         self._title_h = scaled(26)
         self._body_pad = scaled(16)      # extra body height below the title row
@@ -144,10 +146,20 @@ class NodeItem(QGraphicsObject):
     # ── geometry ──────────────────────────────────────────────────────────
     def _height(self) -> float:
         # Ports live on the top/bottom edges (not stacked vertically), so the
-        # body height is fixed. Triangles are taller so the silhouette reads.
+        # body height is fixed. Triangles are taller so the silhouette reads;
+        # channel pills are short.
         if self._shape is ShapeKind.TRIANGLE:
             return self._tri_h
-        return self._title_h + self._body_pad
+        if self._shape is ShapeKind.PILL:
+            # Grow with the number of rainbow inputs so several channels fit down
+            # the left edge (channel-source pills have none → the base height).
+            n_ci = sum(1 for p in self.node.inputs if p.type is PortType.CHANNEL)
+            return scaled(26) + scaled(14) * max(0, n_ci)
+        n_ci = sum(1 for p in self.node.inputs if p.type is PortType.CHANNEL)
+        base = self._title_h + self._body_pad
+        # Rect process nodes stack their rainbow inputs down the left edge; grow
+        # so they don't crowd (base fits ~1 rainbow port).
+        return base + scaled(13) * max(0, n_ci - 1)
 
     def _is_shape(self) -> bool:
         """True for the non-rectangular silhouettes (triangle / hexagon)."""
@@ -156,6 +168,11 @@ class NodeItem(QGraphicsObject):
     def _port_x(self, i: int, n: int) -> float:
         """Even horizontal spread for ``n`` ports along a top/bottom edge."""
         return self._w * (i + 1) / (n + 1)
+
+    def _port_y(self, i: int, n: int) -> float:
+        """Even vertical spread for ``n`` ports along a left/right edge (V1.48
+        rainbow channel ports)."""
+        return self._height() * (i + 1) / (n + 1)
 
     def _body_path(self) -> QPainterPath:
         """The node silhouette in item coordinates (origin at top-left)."""
@@ -177,6 +194,8 @@ class NodeItem(QGraphicsObject):
             p.lineTo(inset, h)
             p.lineTo(0.0, h / 2.0)
             p.closeSubpath()
+        elif self._shape is ShapeKind.PILL:
+            p.addRoundedRect(QRectF(0, 0, w, h), h / 2.0, h / 2.0)
         else:
             p.addRoundedRect(QRectF(0, 0, w, h), self._radius, self._radius)
         return p
@@ -200,8 +219,9 @@ class NodeItem(QGraphicsObject):
 
     def set_run_state(self, state: str) -> None:
         """Run visualization: ``"shaded"`` (pending / un-taken branch — dimmed),
-        ``"current"`` (executing — gold outline), ``"done"`` / ``""`` (normal).
-        Independent of the preview highlight."""
+        ``"current"`` (executing — gold outline), ``"cached"`` (V1.53 frozen
+        upstream — dimmed with a white border, won't re-run), ``"done"`` / ``""``
+        (normal). Independent of the preview highlight."""
         state = state or ""
         if state == self._run_state:
             return
@@ -240,19 +260,56 @@ class NodeItem(QGraphicsObject):
                           else self._port_x(i, n_out), h)
                 self.port_items[port.id] = it
             return
-        # rect / hexagon: inputs on the TOP edge (y=0); outputs on the BOTTOM.
-        n_in = len(self.node.inputs)
-        for i, port in enumerate(self.node.inputs):
+        # V1.48: structural (non-channel) ports flow vertically — inputs on the
+        # TOP edge, outputs on the BOTTOM. Rainbow CHANNEL ports flow
+        # horizontally — inputs on the LEFT edge, outputs on the RIGHT — so
+        # channel flow reads orthogonal to pipeline flow.
+        struct_in = [p for p in self.node.inputs if p.type is not PortType.CHANNEL]
+        struct_out = [p for p in self.node.outputs if p.type is not PortType.CHANNEL]
+        chan_in = [p for p in self.node.inputs if p.type is PortType.CHANNEL]
+        chan_out = [p for p in self.node.outputs if p.type is PortType.CHANNEL]
+        n_in = len(struct_in)
+        for i, port in enumerate(struct_in):
             it = PortItem(port, self)
             it.setPos(self._port_x(i, n_in), 0.0)
             self.port_items[port.id] = it
-        n_out = len(self.node.outputs)
-        for i, port in enumerate(self.node.outputs):
+        n_out = len(struct_out)
+        for i, port in enumerate(struct_out):
             it = PortItem(port, self)
             it.setPos(self._port_x(i, n_out), h)
             self.port_items[port.id] = it
+        n_ci = len(chan_in)
+        for i, port in enumerate(chan_in):
+            it = PortItem(port, self)
+            it.setPos(0.0, self._port_y(i, n_ci))
+            self.port_items[port.id] = it
+        n_co = len(chan_out)
+        for i, port in enumerate(chan_out):
+            it = PortItem(port, self)
+            it.setPos(self._w, self._port_y(i, n_co))
+            self.port_items[port.id] = it
+
+    def rebuild_ports(self) -> None:
+        """Recreate the port items from the (mutated) model — used when rainbow
+        channel ports are spawned / trimmed (V1.48). The node's height may change
+        with the rainbow-input count, so bracket it with ``prepareGeometryChange``.
+        The caller (scene) re-indexes ports and refreshes touching edges."""
+        self.prepareGeometryChange()
+        scene = self.scene()
+        for it in list(self.port_items.values()):
+            if scene is not None:
+                scene.removeItem(it)
+            else:
+                it.setParentItem(None)
+        self.port_items.clear()
+        self._build_ports()
+        self.update()
 
     def _build_buttons(self) -> None:
+        # V1.48: channel-source pills are auto-managed by the page — no corner
+        # controls (disconnect/duplicate/delete would desync them).
+        if getattr(self.node, "category", None) is NodeCategory.CHANNEL:
+            return
         specs = [
             ("fa5s.unlink", "Disconnect", "disconnect_node", Settings.ACCENT_CYAN),
             ("fa5s.clone", "Duplicate", "duplicate_node", Settings.FG_SECONDARY),
@@ -287,9 +344,14 @@ class NodeItem(QGraphicsObject):
     # ── paint ─────────────────────────────────────────────────────────────
     def paint(self, painter: QPainter, option, widget=None) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if self._shape is ShapeKind.PILL:
+            self._paint_pill(painter)
+            return
         selected = self.isSelected()
-        # Dim for a disabled node OR a Run "shaded" node (pending / un-taken).
-        dim = (not self.node.enabled) or (self._run_state == "shaded")
+        # Dim for a disabled node, a Run "shaded" node (pending / un-taken), or a
+        # V1.53 "cached" node (frozen upstream of a checkpoint — won't re-run).
+        cached = self._run_state == "cached"
+        dim = (not self.node.enabled) or (self._run_state == "shaded") or cached
         current = self._run_state == "current"
         h = self._height()
         body_path = self._body_path()
@@ -325,6 +387,11 @@ class NodeItem(QGraphicsObject):
         if self._previewed or current:
             border = QPen(QColor(Settings.ACCENT_GOLD))
             border.setWidthF(scaled(3))
+        elif cached:
+            # Frozen upstream: dashed white outline signals "cached, won't re-run".
+            border = QPen(QColor(Settings.ACCENT_WHITE))
+            border.setWidthF(scaled(1.6))
+            border.setStyle(Qt.PenStyle.DashLine)
         elif self._highlight:
             border = QPen(QColor(Settings.ACCENT_GOLD))
             border.setWidthF(scaled(2))
@@ -371,6 +438,36 @@ class NodeItem(QGraphicsObject):
         # Port labels (small, subdued) for action nodes with named ports.
         if self.node.role is NodeRole.ACTION:
             return
+
+    def _paint_pill(self, painter: QPainter) -> None:
+        """Compact channel-source capsule, tinted its channel color (V1.48)."""
+        h = self._height()
+        body = self._body_path()
+        dim = not self.node.enabled
+        accent = QColor(self._accent)
+        fill = QColor(accent)
+        fill.setAlpha(40 if dim else 78)
+        painter.fillPath(body, fill)
+        if self._previewed or self._highlight:
+            pen = QPen(QColor(Settings.ACCENT_GOLD))
+            pen.setWidthF(scaled(2))
+        else:
+            pen = QPen(accent)
+            pen.setWidthF(scaled(1.6) if not self.isSelected() else scaled(2.2))
+        painter.setPen(pen)
+        painter.drawPath(body)
+        font = QFont()
+        font.setPointSizeF(8.5)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(Settings.FG_PRIMARY if not dim else Settings.FG_SECONDARY))
+        # Leave room on the right for the channel output port dot.
+        text_rect = QRectF(scaled(10), 0, self._w - scaled(26), h)
+        metrics = QFontMetrics(font)
+        text = metrics.elidedText(self.node.title, Qt.TextElideMode.ElideRight,
+                                  int(text_rect.width()))
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter
+                         | Qt.AlignmentFlag.AlignLeft, text)
 
     # ── interaction ───────────────────────────────────────────────────────
     def itemChange(self, change, value):  # noqa: N802 (Qt naming)
@@ -419,6 +516,10 @@ class NodeItem(QGraphicsObject):
         # Renamable (OUTPUT) nodes consume the double-click for inline editing
         # (armed on press) rather than promoting to the previewed node.
         if self._is_renamable():
+            event.accept()
+            return
+        # Channel-source pills are not previewable — swallow the double-click.
+        if getattr(self.node, "category", None) is NodeCategory.CHANNEL:
             event.accept()
             return
         scene = self.scene()

@@ -57,7 +57,7 @@ _THUMB = 210
 # Order + labels for the Add-dialog category tabs (V1.45 merge).
 _CATEGORY_ORDER = [
     NodeCategory.PROCESSING, NodeCategory.ANALYSIS, NodeCategory.RESULTS,
-    NodeCategory.LOGIC, NodeCategory.SPECIAL,
+    NodeCategory.LOGIC, NodeCategory.SPECIAL, NodeCategory.CHECKPOINT,
 ]
 _CATEGORY_LABEL = {
     NodeCategory.PROCESSING: "Processing",
@@ -65,6 +65,7 @@ _CATEGORY_LABEL = {
     NodeCategory.RESULTS: "Results",
     NodeCategory.LOGIC: "Logic",
     NodeCategory.SPECIAL: "Special",
+    NodeCategory.CHECKPOINT: "Checkpoint",  # V1.53 freeze/cache node
 }
 
 

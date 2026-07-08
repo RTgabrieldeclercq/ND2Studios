@@ -2,6 +2,60 @@
 
 **Version:** V1.46
 
+## V1.57 additions (Export cropped data from the Import tab)
+
+- **`widgets/file_panel.py`** grows an "Export" group. It now assembles an
+  `ExportRequest` and runs `ExportWorker` directly (the Import tab becomes a
+  second front-end onto the existing exporter stack, alongside the Export page),
+  scoped to the panel's own `record` so secondary side-by-side panels can export
+  too.
+- **Spatial XY export crop** — a rubber-band tool on the panel's `MultiAxisViewer`
+  (`set_crop_mode` → `crop_rect_selected` / `canvas.clicked` → confirm dialog)
+  stores an `(x,y,w,h)` rect in `self._xy_crop` / `record.crop_rect`. Unlike the
+  Recipe tab's crop (which mutates `_raw_channels`), this rect is **not** applied
+  to the live viewer — it is realized only in the exported file, so it composes
+  with the V1.43 T/M/Z tile-strip crop (which already swapped `record._raw_volume`)
+  without disturbing M/T/Z browsing.
+- Export builds channels via `volume.all_channels_as_lazy(...)` at the viewer's
+  current M/Z, applies the XY crop through each lazy channel's `.crop()`, and reads
+  colors/enabled/LUT from `viewer.channel_state()`. Modes: `tiff_zstack` (raw
+  volume + `crop_rect`) for unprojected multi-Z, else `tiff_stack`; `movie` and
+  `image_sequence` reuse `ExportPreviewDialog`. Progress/status flow through the
+  panel's existing `on_progress`/`on_status` callbacks.
+
+## V1.51 additions (Digital Volume Correlation — ALDVC node)
+
+A new measurement capability: **Digital Volume/Image Correlation** (DVC/DIC), a
+clean-room Python port of FranckLab's Augmented Lagrangian DVC (ALDVC). It
+consumes full `(Z,H,W)` volumes (or `(H,W)` images) and produces a dense
+displacement + strain **field** — which neither `EnhancementPlugin`
+(`(T,H,W)→(T,H,W)`) nor `AnalysisPipeline` (label masks + rows) can represent —
+so it uses a **third registry** and a dedicated result type + viewer.
+
+- **`backend/dvc/`** — pure (no-Qt) engine package. `mesh.py` centralizes the
+  subset grid + DOF pack/unpack conventions (0-based, C-order, `(z,y,x)` axis
+  order) to match SerialTrack's FD gradient operator, which the global step
+  **reuses**. Stages: `integer_search` (windowed FFT NCC seed) → `outliers`
+  (median test + inpaint) → `icgn` (inverse-compositional Gauss-Newton subset
+  solver, the DVC-specific core SerialTrack lacks) → `global_step` + `admm`
+  (augmented-Lagrangian compatibility, reusing
+  `serialtrack.regularization._build_gradient_operator`) → `strain`.
+  `engine.run_aldvc` orchestrates; `method.ALDVCMethod` registers it.
+- **`core/dvc_registry.py`** — `DVCMethod(ABC)` (reusing `plugin_registry.ParamSpec`),
+  `DVCResult` (grid coords + displacement/strain fields + diagnostics), `DVCParams`.
+  Qt-free (callable headless).
+- **DVC node + viewer** — a Special pipeline-graph node (`SPECIAL_DVC_OP_KEY`, an
+  IMAGE-input special so it takes a rainbow channel wire) dispatched in
+  `pages/pipelines_page.py` (`_DVCJob` off-thread, `_run_dvc` / `_finish_dvc`),
+  with a `widgets/dvc_panel.py` "DVC" viewer tab that reuses
+  `serialtrack_analysis.scalar_field` (via a `FieldBundle` built from the result).
+
+**Data-flow note:** DVC is a consumer of the *un-collapsed* Z axis. The node
+reads `record._raw_volume.get_frame(c, m, t, z_mode="none")` for its reference /
+deformed timepoints, deliberately bypassing the Z-collapsing recipe/export path;
+recipes/exports continue to operate on the `(T,H,W)` projection, so DVC is purely
+additive.
+
 ## V1.46 additions (Streaming, Resource-Aware Analysis)
 
 - **`backend/analysis/plane_runner.py`** — `run_planes_to_labels`, the shared
@@ -64,6 +118,66 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
     slice into the merged Analysis slice on load; `_migrate_v2_to_v3` retargets
     the retired `special:validate_tracks` node to `special:track_objects`
     ("Track Objects").
+  - **V1.49 loop / iteration connector.** A third edge *kind* — the loop
+    back-edge — re-runs a region of the graph while sweeping parameters or
+    iterating toward a target. `model.py` adds `Edge.kind`
+    (`STRUCTURAL_KIND`/`LOOP_KIND`) + `Edge.params` (loop config),
+    `is_loop_edge`, `can_connect_loop` (structural output→input, non-CHANNEL,
+    self-loop + upstream allowed, no cycle check), and **structural-only**
+    `GraphSlice` queries; every DAG walk (`predecessor`, `recipe_for_node`,
+    `structural_chain`, `channel_sets`, `edge_channels`, `topological_order`,
+    `GraphRunner`) filters to structural edges so loops are invisible to normal
+    execution. `loop.py` (new, Qt-free) is the loop core: `loop_region`
+    (entry=dst, exit=src, body = fwd-reachable(entry) ∩ bwd-reachable(exit)),
+    `iteration_plan` (sweep grid/`zip`, fixed `count`, `until` capped by
+    `max_iterations`), `deduplicate_objects` (per-(m, channel, frame) mask-IoU
+    with centroid fallback), `combine_iterations`
+    (`union_dedup`/`best`/`last`/`keep_all`), and `tracking_ratio`.
+    `conditions.py` adds `nondup_object_count` + `tracking_coverage` blocks for
+    the "until" stop test. `io.py` bumps `schema_version` to 4 (loop edges
+    round-trip; older graphs load all-structural). The Qt side —
+    `widgets/node_board/edge_item.py` (amber left-gutter routing + arrowhead),
+    `node_scene.py` (loop drag mode + `loop_edge_edit_requested`),
+    `loop_dialog.py` (`LoopSettingsDialog`), and `pages/pipelines_page.py` (a
+    "Loop" toggle + a loop driver that re-runs a loop-entry node across the plan
+    and combines the iterations) — drives execution, reusing the per-M Run
+    machinery. The driver supports **Analysis and Track-Objects** entries
+    (`_loop_entry_kind` gates the rest; `_loop_rerun_entry` dispatches the re-run);
+    a Track sweep has no masks so union+dedup falls back to Last. The heavy
+    union-dedup runs off-thread in `_LoopCombineJob`; dedup is bbox-gated + cropped
+    (no full-frame allocations) and a current-M loop caches processed channels
+    across iterations (`_loop_ctx["chan_cache"]`). Plots overlay every iteration
+    (`_update_analysis_plots_loop` / `_update_track_plots_loop`, colored + legended
+    + a dashed Combined). An opt-in **"Save all iterations"** config retains each
+    iteration's result (`_loop_build_saved_store`) so a viewer **iteration
+    dropdown** (`_iter_combo` / `_on_iteration_selected`) can step the
+    overlay/table/plots through "Combined" + each "#k …". The loop-entry dispatch
+    is a small **registry** (`_LOOP_KIND_BY_OP` / `_LOOP_RUN_BY_KIND` /
+    `_LOOP_ROW_KINDS`) with a generic `_loop_step(node, publish)` helper, so a new
+    node is wired in uniformly — currently Analysis, Track Objects, Cell-Tracker
+    Metrics (row kinds: combine rules + plots + selector) and DVC / Registration
+    (custom-output kinds: sweep params, keep the final result in the node's own
+    tab). The wiring recipe is documented in `docs/DEVELOPING_LOOP_NODES.md`.
+  - **V1.48 channel-wire layer.** A second wire layer decides *which channels*
+    flow through each process, decoupled from the structural (order) wires.
+    `model.py` adds `PortType.CHANNEL`, `NodeCategory.CHANNEL`, `ShapeKind.PILL`,
+    and `can_connect` pairs `CHANNEL` only with `CHANNEL` (never a structural or
+    `ANY` port). `registry_adapter.py` adds `channel_source_spec` /
+    `channel_all_spec` (the per-channel + "All" source pills, one `CHANNEL`
+    output), and `build_node` appends **rainbow ports** (a `CHANNEL` input on the
+    left, output on the right) to every channel-taking process (`spec_takes_channels`
+    = an ACTION with an `IMAGE` structural input, i.e. enhancement + analysis).
+    `executor.py` adds `channel_sets` (topological union of channel-edge sources +
+    structural predecessors → each node's effective channel set; **all channels**
+    when a slice has no channel wiring, for backward compatibility),
+    `channel_recipes` (per-channel Processing recipe — a channel gets only the
+    enhancement steps at/after where it enters; unwired ⇒ absent ⇒ raw),
+    `edge_channels` (channels on each wire, for the colored strands), and
+    `has_channel_wiring`. `apply_recipe`, `EnhancedDataset` and
+    `ProcessedFrameVolume` gained a `recipe_by_channel` argument so unwired
+    channels stay raw everywhere the processed data is read (viewer, export,
+    per-M analysis). `param_specs_for` strips `channel_name` /
+    `counterstain_channel` from analysis-node popups (channel is now wiring).
   - **V1.45 merge (Phase 1):** `model.py` adds `NodeCategory`
     (PROCESSING/ANALYSIS/RESULTS/LOGIC/SPECIAL) + `ShapeKind`
     (RECT/TRIANGLE/HEXAGON) on `Node`; `PipelineDoc.merged` aliases the analysis
@@ -98,7 +212,20 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
     never reach a downstream node (Run and preview share the helper). **Per-track
     persistence** (`track_persistence`, `object_lens_only`) is a single min/max
     frame-count test evaluated per track (`_track_frame_counts`) and is offered by
-    `ConditionBuilderDialog` only when its `lens` kwarg is Each object. The Run's
+    `ConditionBuilderDialog` only when its `lens` kwarg is Each object.
+  - **V1.50 track displacement basis + outlier-frame scrubbing:** the
+    `track_displacement` block gains a **Measure** basis — `Net (first→last)`
+    (default, back-compatible), `Cumulative path` (Σ frame-to-frame steps), or
+    `Per-frame step` (max single step, so `max > value` ≡ "any step exceeds") —
+    reduced per track by `_track_metric_value` over `_track_points`, then run
+    through the existing `_aggregate`/`_cmp`. With `Per-frame step` + a **Per-frame
+    exceed = Reject frame only** setting, `partition_rows` first calls
+    `scrub_outlier_frames`: outlier frame rows (each frame whose step from the last
+    *retained* frame exceeds the threshold) are dropped so a spike apex is removed
+    while the track survives on its remaining frames — the outlier frame lands in
+    **neither** branch. Frame-only scrubbing is inherently object-lens; a
+    whole-frame if-else (`evaluate_condition`, one bool per frame) degrades to
+    Reject-object behavior. The Run's
     interactive nodes reuse the review dialogs — `widgets/track_validation_dialog.py`
     (`TrackValidationDialog`, the Review Objects **Single objects** mode, unit
     model that also reviews untracked objects; V1.45 each cropped panel matches
@@ -183,7 +310,29 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
     `_normalize_special_categories` refreshes it for old saved graphs on load.
     `backend/results_engine` exporters (Export), and push to the
     top-level `ResultsPage` (Send to Results). Pause retains the `GraphRunner` so
-    Run resumes from the pause point. **Run spans the whole file:** an analysis
+    Run resumes from the pause point. **Checkpoint (V1.53):** a white pass-through
+    special node freezes the accumulated Run state (per-M analysis results, rows,
+    track overlays) into `PipelinesPage._checkpoint_store` when the Run reaches it,
+    stamped with an *upstream hash* (`_checkpoint_upstream_hash`: the checkpoint's
+    structural ancestors + params, the edges feeding them incl. channel wiring, any
+    touching loop config, plus the Processing recipe / normalized flag / crop). On
+    the next Run, `_checkpoint_resume_target` picks the deepest checkpoint whose
+    hash still matches and `_on_run` builds `GraphRunner(sl, frozen=<ancestors>)` —
+    which marks the ancestors done and reaches their successors, so the walk skips
+    all upstream compute (segmentation / tracking) and only the downstream pipeline
+    runs against the restored data (`_restore_checkpoint`); the frozen nodes render
+    in a `"cached"` state (dashed white). A stale hash falls back to a full Run and
+    re-freezes. Frozen arrays are session-scoped RAM — cleared on file change,
+    pruned when a checkpoint node is deleted — **and, per node, optionally
+    persisted to disk**: each checkpoint carries a `persist_to_disk` param
+    (default off = session-only), and when on, saving the pipeline writes that
+    checkpoint's masks/rows/tracks to a companion `<pipeline>.checkpoints/` cache
+    (compressed NPZ + `index.json`, via the Qt-free
+    `pipeline_graph/checkpoint_io.py`) and loading restores it, so the checkpoint
+    survives restarts (toggling it back off removes the stale cache on next save);
+    the upstream hash folds in a source-file signature (`_record_signature`) so a
+    cache reloaded against a different file invalidates through the same gate.
+    **Run spans the whole file:** an analysis
     node loops every multipoint (`_advance_run_m`) — per-M analysis job →
     measurement job → accumulate rows tagged `m_position` — so the if-else and
     special nodes evaluate over the full dataset (Export writes every M, Review
@@ -233,7 +382,19 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
   **category** (analysis pink / results green / logic purple / special orange /
   Dismiss red) with a `set_run_state` (shaded / current-gold / done); `NodeScene`
   gained `set_run_states` / `clear_run_states`; `AddNodeDialog` groups its
-  catalog into per-category tabs.
+  catalog into per-category tabs. **V1.48 channel wiring:** `NodeItem` renders
+  channel-source `PILL`s (tinted their channel color), places `CHANNEL` (rainbow)
+  ports on the left/right edges (structural ports stay top/bottom), and grows
+  with its rainbow-input count (`rebuild_ports` for dynamic ports); `PortItem`
+  paints a rainbow gradient for a channel-agnostic port or a channel color via
+  `set_display_color`; `EdgeItem` draws a dashed channel-colored wire
+  (`set_channel_edge`) and thin per-channel propagation **strands** parallel to a
+  structural wire (`set_channel_strands`). `NodeScene` colors channel wires +
+  pills and lays out rainbow ports from a pushed context (`set_channel_context` /
+  `refresh_channel_visuals`), spawns/trims the free rainbow input on connect/
+  disconnect and migrates pre-V1.48 nodes (`ensure_rainbow_ports` /
+  `_sync_rainbow_ports`), and hosts the **scissors** cut mode (`set_cut_mode`: a
+  drag stroke or click removes any crossed wire, structural or channel).
 - **`pages/pipelines_page.py` (new)** — 50/50 `QSplitter`: node board (sub-tab
   selector + control bar with Add / Preview / Apply / Undo and a slim preview
   `QProgressBar` + one `QGraphicsView` swapping scenes) and a reused
@@ -284,6 +445,20 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
   measurement rows to prune a branch, and painting shaded → gold → done via
   `NodeScene.set_run_states`. **Pause** clears run states (editor mode); previews
   are suppressed while a Run is active.
+  **V1.48 — full M/T coverage + channel wiring.** A Run now reads each
+  multipoint's channels via `_processed_channels_for_m(record, m)`
+  (`all_channels_as_lazy(m=m)` + the committed recipe) and reuses them for that
+  M's measurement, so every M/T is truly analyzed (previously every M reused a
+  single cached M — the M0-for-all bug). Channel source pills under the Input
+  node (`_ensure_channel_nodes`) drive which channels flow: `_graph_channel_recipes`
+  commits **per-channel** Processing recipes (`record.recipe_by_channel`; unwired
+  channels stay raw in the viewer base, preview and export), and
+  `_analysis_channels_for` / `_analysis_run_spec` pick the channel(s) an analysis
+  node segments from its wired rainbow ports (2nd wire = counterstain), run once
+  per channel and merge per-channel `label_masks` (`_MultiChannelCommitJob`,
+  multi-channel `_AnalysisPreviewJob` / `_ResultsScreenMeasureJob`) so downstream
+  `segmentation_channel` grouping is preserved. A slice with no channel wiring
+  behaves exactly as pre-V1.48.
 - **V1.46 viewer overhaul:** the right pane wraps the viewer with an **overlay tab
   bar** (Image / Segmentation / Tracks / Vectors: cells / Vectors: field) and the
   bottom split is a **data `QTabWidget`** (Measurements + `MplCanvas` plot tabs:
@@ -326,7 +501,15 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
   cropped region and overlays/masks/rows share one crop-space coordinate system.
   `_field_shape_for` and `_preview_metadata` report crop dims (Vectors: field,
   Spatial Maps). Toggling the button off (or a file change, in
-  `load_from_experiment`) clears the crop; it is never serialized.
+  `load_from_experiment`) clears the crop; it is never serialized. Crop set/clear
+  refreshes the displayed base even with live Preview off
+  (`_on_crop_changed` → `_show_base_image(force=True)`). An **undo** arrow
+  (`_btn_crop_undo`, left of the crop button) restores prior crops from a
+  `_crop_history` stack (`_on_crop_undo` / `_apply_crop_state`). The crop dialog
+  (`_show_preview_crop_dialog`) has a **live preview** thumbnail
+  (`_composite_full_frame_rgb`) and a **jog pad** (▲▼◀▶ + step) that shifts the
+  region. The rubber-band rectangle draws a dark halo under a bright magenta line
+  (`ImageCanvas.paintEvent` / `GpuImageCanvas._ToolOverlayItem`).
 - **V1.46 cropped Run:** the Run button (`_on_run_button`) is a plain full-file
   Run with no crop, but with a preview crop set it drops a menu
   (`_show_run_menu`) — **Run full** vs **Run cropped region** — and shows a ▾
@@ -606,6 +789,7 @@ built, opens `MainWindow`.
 | `tile_layout.py` (V1.3, auto-sized V1.6) | `TileLayoutWidget` — interactive multipoint layout with two modes (`"navigate"` / `"select"`), `QPainter` rendering, hit-testing in cached widget rects, hover preview, tile-index labels, and an expand-to-modal `⤢` button. V1.6: `_adapt_minimum_size()` runs after every `set_tile_layout()` and sets `setMinimumSize(n_cols × 50 + margins, n_rows × 50 + header + margins)` so the host's `QScrollArea` can scroll when the natural size exceeds the viewport. Three signals: `navigate_requested(m)`, `selection_changed(set[int])`, `expand_requested`. `TileLayoutDialog` (V1.6: wraps the widget in its own `QScrollArea`) is the modal "expand" wrapper — auto-closes after click in navigate mode, stays open in select mode |
 | `scale_bar.py` | Matplotlib scale-bar rendering helpers (used by `MplCanvas` consumers) |
 | `spatial_maps_panel.py` (V1.46) | `SpatialMapsPanel` — the in-viewer **Spatial Maps** tab; a faithful port of Cell-Tracker's spatial page over `backend/celltracker/fields.compute_spatial_fields` + `metrics.compute_self_fold_change` (+ `backend/interp_maps.compute_interp_map` for arbitrary measurement columns). One set of control widgets is reparented between two layouts by `set_compact(bool)`: a compact top dropdown bar (docked viewer) and the full vertical collapsible sidebar (maximized viewer). Frame navigation uses the ND2Studios `FrameStrip` (NIS-style tile strip) + play/pause + FPS controls — same set as `MultiAxisViewer._make_axis_row` — not a plain slider. Scrubbing is debounced (a fast drag renders only the final frame) and a per-frame field cache (keyed by `(t, grid, sigma, channel, source)`, cleared on those param changes) makes revisits / playback instant; the tab opens with a fast single-frame colour-scale fit (`_autofit_scale_from_current`) instead of the all-frames pass, which is reserved for the "Global Scale" button. The canvas supports **zoom / pan** (Home/+/−/Pan buttons, scroll-zoom, drag-pan) via matplotlib data limits (`_zoom_about` / `_apply_view`, persisted in `_view` across redraws), and the colour bar is a **fixed axes pinned to the figure's right edge** so it stays at the viewer border when zoomed. Also: an optional multipoint selector (`m_change_requested`), `get_config`/`apply_config`, a template strip (Save / Load file / preset combo) backed by `backend/spatial_templates`, `set_node_templates(names)` to pre-load a node's templates, and an in-tab **Save** (current frame / all frames, PNG or raw-field TIFF). `SpatialTemplatePicker(QDialog)` edits which library templates a node carries (add/remove/reorder + Import JSON). Fed by `pipelines_page._populate_spatial_panel` via `celltracker_bridge.build_tracked_df` + per-M label/channel stacks |
+| `serialtrack_panel.py` (V1.47) | `SerialTrackPanel` — the in-viewer **SerialTrack** PTV tab (sibling of Spatial Maps). An `MplCanvas` analysis view driven by a `FrameStrip` + play/pause/FPS, fed by `pipelines_page._populate_serialtrack_panel` with the raw tracked rows (it builds its own `TrackData` via `backend/serialtrack_analysis`). View modes: **Trajectories** (paths to the current frame, colored by time or net displacement, XY/XZ/YZ projection for 3D), **Scalar field** (heatmap / filled- / line-contour of any of ~17 displacement/velocity/strain/stress fields, with background channel, colorbar, scale bar, divergent auto-scaling, mid-Z slicing for 3D), **Quiver** / **Heatmap+Quiver** (magnitude-colored, adjustable arrow density), **Displacement histogram**, **Tracking dashboard**. Controls: cumulative/incremental mode, grid step, smoothness, colormap, stress E/ν. A per-frame `FieldBundle` cache keyed by `(t, mode, grid, smoothness)` keeps playback smooth. Rebuilds displacement/strain fields from tracked rows because the tracking engine currently discards them |
 | `video_player.py` | Play/Pause/FPS playback controls |
 | `custom_grips.py` | Per-edge frameless-window resize widgets. Lean reimplementation of PyDracula's `CustomGrip` |
 | `export_preview_dialog.py` (V1.32) | `ExportPreviewDialog(channels, colors, enabled, pixel_size_um, frame_timestamps_s, lut_settings, movie_options, title)` — modal preview shown after the user confirms movie or image-sequence export settings. Embeds an `ImageCanvas` + `ZoomToolbar` with a T scrubber, a ▶ Play / ⏸ Pause toggle, and an in-dialog FPS spin box; a second `QTimer` advances T at the chosen FPS so the user sees the movie actually play back with brightness / contrast / saturation / hue / fade applied live. Manually grabbing the T slider pauses playback. Exposes the five adjustment sliders (each a `_LabeledSlider`) and a "Show overlays in preview" toggle. A 30 ms single-shot debounce coalesces slider drags before recompositing; the play-tick path renders directly to keep the frame rate honest. `adjustments()` returns the user-chosen `ImageAdjustments` once the dialog is accepted; the dialog itself never runs the export. `closeEvent`/`done()` stop the playback timer so it can't outlive the dialog |
@@ -616,10 +800,11 @@ built, opens `MainWindow`.
 |---|---|
 | `nd2_loader.py` | `ND2Metadata` dataclass, `read_nd2_metadata`, `read_nd2_metadata_extended` (returns dict with full metadata: T/Z/C/P, pixel size, z step, channel names + colors + emission/excitation + exposures, objective + camera + microscope, binning, frame timestamps, **per-M stage XY/Z** — tries `f.experiment` XYPosLoop first, falls back to `frame_metadata()` per-M; `stage_layout_source` includes method suffix e.g. `"stage_xy:experiment"`, loops), `load_nd2_timeseries`, `LazyND2Channel` (numpy-protocol on-demand frame proxy with `__getitem__`, `materialize`, `crop`), `load_nd2_timeseries_lazy`, `z_project` |
 | `nd2_volume.py` (V1.1) | `LazyND2Volume` exposing `(M, T, Z, H, W)`. `get_frame(c, m, t, z, z_mode, z_start, z_end)` returns a single (H, W) array on demand. `to_lazy_channel(c, m, z_mode, z_index, ...)` collapses to a V1.0 `LazyND2Channel` so the recipe pipeline keeps the `(T, H, W)` contract |
-| `tiff_loader.py` (V1.17, multi-Z multi-C support V1.30) | `get_tiff_info`, `load_tiff_stack`, `LazyTIFFChannel` (lazy `(T,H,W)` view; `n_pages_per_t`/`page_within_t` params enable per-channel access; V1.17: caches `tifffile.TiffFile` handle on first read via `_ensure_open()`; V1.30: new `z_stride` param so Z accumulator reads `base_page + z * z_stride` — `z_stride=n_c` for ImageJ TZCYX hyperstacks, `z_stride=1` for single-channel multi-Z), `load_tiff_stack_lazy`, `read_imagej_tiff_metadata`, `load_imagej_tiff_channels(z_projection="max")` (V1.30: passes `n_z`/`z_stride=n_c`/`z_projection` so multi-channel multi-Z files actually project Z), `_SingleFileTIFFView` (V1.30: `get_frame` reads pages directly for multi-Z files honoring `z`/`z_mode`; `to_lazy_channel` builds proxies that honor `z_mode`/`z_index`/Z range; caches a `tifffile.TiffFile` for direct page reads), `LazyMultiFileTIFFVolume` (V1.30: `to_lazy_channel` propagates `z_mode`/`z_index`/`z_*`/`t_*` through to the underlying view), `assign_dimensions`, `extract_2d_timeseries` |
+| `tiff_loader.py` (V1.17, multi-Z multi-C support V1.30) | `get_tiff_info`, `load_tiff_stack`, `LazyTIFFChannel` (lazy `(T,H,W)` view; `n_pages_per_t`/`page_within_t` params enable per-channel access; V1.17: caches `tifffile.TiffFile` handle on first read via `_ensure_open()`; V1.30: new `z_stride` param so Z accumulator reads `base_page + z * z_stride` — `z_stride=n_c` for ImageJ TZCYX hyperstacks, `z_stride=1` for single-channel multi-Z), `load_tiff_stack_lazy`, `read_imagej_tiff_metadata`, `load_imagej_tiff_channels(z_projection="max")` (V1.30: passes `n_z`/`z_stride=n_c`/`z_projection` so multi-channel multi-Z files actually project Z), `_SingleFileTIFFView` (V1.30: `get_frame` reads pages directly for multi-Z files honoring `z`/`z_mode`; `to_lazy_channel` builds proxies that honor `z_mode`/`z_index`/Z range; caches a `tifffile.TiffFile` for direct page reads), `LazyMultiFileTIFFVolume` (V1.30: `to_lazy_channel` propagates `z_mode`/`z_index`/`z_*`/`t_*` through to the underlying view), `assign_dimensions`, `extract_2d_timeseries`. **V1.54**: `read_ome_tiff_metadata()` reads level-0 OME-TIFF metadata (channels/T/Z + `PhysicalSizeX` via `ome-types`, skipping pyramidal sub-resolutions); `read_tiff_meta_fast` and `_SingleFileTIFFView` gained an OME branch (`_level0_pages()` sources frames from `series[0].levels[0]`; multi-channel OME uses the ImageJ TZCYX per-channel proxy layout) so the pyramidal OME-TIFF written by the V1.54 stitcher reloads through the normal single-file TIFF import |
 | `frame_cache.py` (V1.17, V1.34 adaptive budget, V1.35 pin / stats) | `FrameCache`: thread-safe LRU cache keyed by `(c, m, t, z, z_mode)` storing normalized `(H, W)` frames. `get`/`put`/`contains`/`clear` all lock-protected. Default budget 300 MB (in practice sized by `recommended_cache_budget_bytes`). **V1.35 Phase 3** adds: `CacheStats` (hits / misses / evictions / current_bytes / peak_bytes / `hit_rate`) updated under the same lock; `pin(key)` / `unpin(key)` / `is_pinned(key)` that exempt a key from eviction so the on-screen composite's planes can't be evicted by the prefetcher's neighbor writes; `set_max_bytes(n)` to resize on the fly; `current_bytes`/`max_bytes`/`__len__` accessors. Inserted arrays are flagged `writeable=False` so accidental in-place mutation downstream fails with `ValueError`. Eviction skips pinned entries and breaks out when only pins remain (over-budget but never evicting a displayed plane). `clear()` drops both entries and pins; hit/miss/eviction counters persist across `clear()` so a session-long hit rate stays meaningful |
 | `normalization.py` | `normalize_frame_means` (frame-mean intensity normalization) |
 | `recipes.py` | `build_recipe`, `save_recipe`, `load_recipe` for `.nd2s_recipe.json` (kind = `nd2studios.recipe`) |
+| `serialtrack_analysis.py` (V1.47) | Qt-free PTV analysis data layer for the SerialTrack tab. `build_track_data(rows, m, …)` → `TrackData` (per-frame coords/track_ids + a chained `(N_tracks, n_frames, D)` trajectory matrix; `D` auto-inferred from `centroid_z_px`). `particle_displacement(td, t, mode)` gives cumulative/incremental per-particle vectors; `compute_field_bundle(td, t, …)` scatters them to a grid and computes `DisplacementField`+`StrainField` via `serialtrack.fields.compute_gridded_strain`. Derived helpers: `displacement_magnitude`, `velocity_components`, `divergence`, `curl` (2D scalar / 3D vorticity), `jacobian` (det(I+∂u/∂x)), `effective_strain`, `compute_stress` (linear-isotropic Hooke) + `von_mises_from_sigma`, and a `scalar_field(fb, key)` dispatcher. Exists because `object_tracker._link_group_serialtrack` runs SerialTrack only to chain `track_id` and discards its fields |
 | `spatial_templates.py` (V1.46) | Global JSON library of named Spatial Maps configurations under `~/.nd2studios/spatial_map_templates` (one `*.nd2s_spatialmap.json` per template). `list_templates` / `load_template` / `save_template` / `delete_template`; `read_template_file` parses a single-template or bundle file, `import_file` merges it into the library (cross-machine portability), `export_file` writes a bundle. Pure stdlib (no Qt/numpy). Consumed by `widgets/spatial_maps_panel.py` and the Spatial Maps nodes (which store template **names**) |
 | `exporters/tiff_exporter.py` | `export_tiff_stack(stack, filepath, bit_depth, pixel_size_um, progress_cb)` (single-channel `(T,H,W)` or `(T,Z,H,W)`, used by label-mask export); `export_tiff_hyperstack(channels, enabled, filepath, bit_depth, pixel_size_um, progress_cb)` (V1.29 — multi-channel, writes a single `(T,Z,C,H,W)` ImageJ TZCYX hyperstack with `Labels=[<channel names>]`, `unit=um`, `spacing`, resolution; same file construction as `export_stitched_tiff`). BigTIFF auto-switch |
 | `exporters/composite_exporter.py` | `export_rgb_composite_tiff(channels, colors, enabled, filepath, …, image_adjustments)`, `_composite_frame(…, image_adjustments)`, `CHANNEL_COLORS`. V1.32: `ImageAdjustments` dataclass (`brightness`, `contrast`, `saturation`, `hue`, `fade`); vectorised `apply_image_adjustments(rgb, adj)` for contrast / saturation / hue / fade on the final RGB; `_apply_brightness_to_gray(gray, brightness)` applies brightness as **multiplicative gain** (`gain = 1 + brightness/100`) inside the composite loop *before* the channel colour LUT is mixed in. The gain semantic keeps background pixels near zero (only signal scales visibly — additive offset would lift the noise floor as much as the peaks) and the per-channel placement keeps a red-only channel pure red rather than washing toward white. `ImageAdjustments.is_identity_post_composite()` lets the composite pass skip the post-RGB pass when only brightness is set |
@@ -635,7 +820,8 @@ built, opens `MainWindow`.
 | `template.py` (V1.23) | `save_template()` / `write_template()` / `load_template()` for `.nd2st.json` pipeline templates (import, recipe, analysis, results configs without data). `TEMPLATE_EXTENSION = ".nd2st.json"` |
 | `analysis/spots_pipeline.py` (V1.21) | `BrightDarkSpotsPipeline` — adapter that registers `spots/` into the `AnalysisPipeline` registry. Iterates T frames, calls `BrightDarkSpotsSegmenter.run(frame)` per slice, stacks `(T,H,W)` int32 label arrays, and assembles `AnalysisResult` with extra measurement columns (`diameter_px`, `contrast_score`, `circularity`, `polarity`). 11 `ParamSpec` parameters. `intensity_percentile=0.0` maps to gate disabled. Sets `bit_depth_strict=False` |
 | `analysis/spots/` (V1.21, GPU dispatch V1.39) | Qt-free subpackage implementing the GA3-style scale-space spot detector. `validation.py`: re-exports `histothresh.validation` helpers + `validate_diameter()`. `scale_space.py`: `resolve_sigma()` (FWHM-matched sigma, Marr-Hildreth ratio), `log_response()` (σ²-normalised LoG, positive for bright), `dog_response()` (DoG band-pass, positive for bright). **V1.39 Phase 7**: `gaussian_filter` and `gaussian_laplace` imports route through `compute.gpu.ops` (which itself dispatches to `cupyx.scipy.ndimage` on GPU and falls back to `scipy.ndimage` on CPU); the DoG and LoG response functions are unchanged structurally. `detection.py`: `find_extrema()` (peak_local_max on normalised response, intensity-gate suppression, contrast gate), `h_transform_seeds()` (h-maxima / h-minima). `symmetry.py`: `SYMMETRY_FLOOR` dict, `circularity()`, `filter_by_symmetry()` (GA3 All/More/Medium/Less bins). `grow.py`: `grow_seeds_dilation()` (disk morphology), `grow_seeds_watershed()` (watershed-from-marker; negated image for bright). `config.py`: `SpotsConfig` dataclass with `__post_init__` validation. `identifier.py`: `BrightDarkSpotsSegmenter` orchestrator (12-step: validate → sigma → DoG/LoG → normalise → intensity mask → peak detection → label rasterisation → symmetry gate → grow → re-label → regionprops → provenance); `SpotsResult` dataclass |
-| `exporters/stitch_exporter.py` (V1.1, layout rewritten V1.14, export format V1.15, metadata aligned V1.29, Z-preserving V1.30) | `StitchLayout` dataclass; `compute_tile_layout(stage_xy_um, pixel_size_um, tile_h, tile_w, m_indices)` converts stage XY µm to pixel offsets directly: `offset_x = round((sx - min_x) / pixel_size_um)`, `offset_y = round((max_y - sy) / pixel_size_um)` (Y flipped). Canvas = bounding box of all tile corners. Physical gaps between non-adjacent tiles appear as empty pixels. `source = "physical"`. Grid fallback when no stage XY data. Helper functions `_cluster_axis`, `_assign_index`, `_serpentine_layout` retained but not in the main path. `stitch_one_frame(tile_frames, layout, dtype)`, `export_stitched_tiff(volume, layout, m_indices, channel_indices, channel_colors, filepath, ...)` writes a `(T, Z, C, H, W)` ImageJ TZCYX hyperstack with `Labels=[<channel names>]`, `unit=um`, `spacing=pixel_size_um`, resolution. `z_mode="none"` on a multi-Z file keeps every Z plane (`Z = volume.n_zslices`); projection modes and single-Z files collapse to `Z=1`. File construction matches the Export page's `export_tiff_hyperstack` exactly so the two writers produce identical headers; re-importable into ND2Studios as a multi-channel multi-Z TIFF |
+| `exporters/stitch_exporter.py` (V1.1 → **V1.54 compatibility shim**) | Thin shim over the new `backend/stitch/` package. Re-exports `StitchLayout`, `compute_tile_layout`, `_cluster_axis`, `_assign_index` (from `backend/stitch/positions`) for the preview widgets & diagnostic scripts; keeps `stitch_one_frame(tile_frames, layout, dtype)` (coordinate overwrite). `export_stitched_tiff(...)` is **deprecated** (emits `DeprecationWarning`) and now writes a pyramidal OME-TIFF via `backend/stitch/writer.write_ome_tiff`. New code calls `backend.stitch.run_stitch` |
+| `stitch/` package (**V1.54** regime-aware multipoint stitching, backend-pure) | Replaces the old coordinate-only stitch **method**. `config.py` (`StitchConfig` — regime/engine/blend/illumination/orientation/output knobs; defaults reproduce the historical placement); `positions.py` (kept orientation math `oriented_offsets_um` / `coordinate_offsets_px`; `compute_tile_layout`/`StitchLayout`; `_cluster_axis`); `dataset.py` (`Tile`/`Dataset`, `build_dataset` — grid + overlap-fraction inference); `regime.py` (`decide_regime` overlap vs zero_overlap); `register.py` (built-in phase-correlation + Hann/high-pass + NCC rejection + weighted-least-squares global opt anchored to the coordinate seed); `engines.py` (`compute_positions` dispatch: coordinate / phase_correlation / m2stitch (grid, MIST) / ashlar / auto); `ashlar_engine.py` (in-memory `Metadata`/`Reader` → `EdgeAligner`; auto-points `JAVA_HOME` at bundled `jdk4py` so ashlar's `import jnius` works without a system JDK — the JVM never starts since registration is pure Python); `compositor.py` (`composite_frame` feather/average/max/none, dtype-preserving); `illumination.py` (BaSiC gated / builtin flat-field / supplied); `writer.py` (`write_ome_tiff` — pyramidal, tiled, BigTIFF, TZCYX, PhysicalSize, channel names); `qc.py` (JSON + PNG report); `pipeline.py` (`run_stitch(volume, stage_xy_um, m_indices, channel_indices, config, out_path, meta, progress_cb) -> StitchResult` — register once on `align_channel`, reuse positions for all C/Z/T, disk-backed memmap for large mosaics). Optional deps `m2stitch`/`ashlar`/`basicpy` are lazily gated (never hard deps) |
 
 ### `plugins/enhancement/builtin.py`
 19 enhancement plugins (Normalize, CLAHE, GaussianBlur, MedianFilter,
@@ -646,6 +832,111 @@ NLMDenoise, WaveletDenoise, TVDenoise) registered via
 `@PluginBase.register`. Each declares parameters via `ParamSpec` so
 `ParamEditor` can auto-generate a form for it.
 
+### `plugins/enhancement/registration.py` (V1.56)
+`RegistrationPlugin` (`"Registration (Drift Correction)"`) — a Processing-stage
+`Image -> Image` node that stabilizes a `(T,H,W)` series onto a reference frame
+(temporal drift correction). Auto-enumerated by `registry_adapter.enhancement_specs()`
+(no node-graph surgery); `execute` delegates to the pure `backend/registration/`
+engine. Force-imported in `__main__.py`. Single-channel only (per-channel drift);
+cross-channel "register once, apply to all" is deferred to a future
+`RegistrationMethod` registry.
+
+### `backend/registration/` (V1.56, backend-pure, no Qt)
+`estimate.py` — image-registration estimation + resampling, reusing the stitcher's
+`_highpass`/`_hann2d`/`_ncc` (`backend/stitch/register.py`): `estimate_translation`
+(sub-pixel phase correlation), `apply_shift` (`scipy.ndimage.shift`), `ecc_align`
+(`cv2.findTransformECC`, translation/euclidean/affine/homography, seeded from the
+phase-correlation shift), `apply_warp` (`cv2.WARP_INVERSE_MAP`), `stabilize` — the
+single-channel `(T,H,W)` driver, and `estimate_series` / `apply_series` — the
+cross-channel pair (per-frame **absolute** effective transforms + apply-to-any-channel,
+so the transform estimated on the reference channel aligns all channels: register once,
+apply to all). Reference modes `first`/`previous`/`mean`; dtype-preserving.
+`method.py` — `RigidRegistration` (`@RegistrationMethod.register`) drives it for the
+node. See `Research/image_registration.md`.
+
+**V1.60 additions** (late-frame robustness + region/feature). `estimate_series` gained:
+`reference="template"` (a two-pass anchor via `_build_template` — rough-stabilize then
+average; the new default, robust to accumulation + photobleaching); **hold-last-good
+gating** (`min_confidence` holds the prior good transform / skips a bad `previous`
+increment instead of snapping to identity) returning a per-frame `gated` bool;
+`normalize="zscore"`; and `model="feature"`. `estimate_translation` passes
+`disambiguate=True` (wrap guard) and accepts `mask`/`bbox` for ROI (rectangle → subpixel
+crop; freeform → masked phase correlation); `ecc_align` accepts a `mask` (ECC
+`inputMask`). `roi_to_mask(roi, shape)` turns a serializable ROI spec (`rect` /
+`shapes`, freeform via `manual_mask.rasterize_shapes`) into `(mask, bbox)`.
+`estimate_features` = ORB keypoints + `match_descriptors` + RANSAC (Euclidean/Similarity/
+Affine), warp maps reference→moving, confidence = inlier fraction, identity fallback —
+for large motion / rotation / multi-round.
+
+### `core/registration_registry.py` (V1.56)
+`RegistrationMethod(ABC)` (reusing `plugin_registry.ParamSpec`) + `RegistrationResult`
+(per-frame `shifts_px` / affine `transforms` / `aligned` reference series / `confidence`
+/ `pixel_size_um`, with `shifts_um()`). The cross-channel registration paradigm
+(parametric transform + register-once-apply-to-all), distinct from `EnhancementPlugin`
+(per-channel), `AnalysisPipeline` (masks), and `DVCMethod` (dense field). Mirrors
+`core/dvc_registry.py`.
+
+### Registration node + viewer (V1.56)
+A Special pipeline-graph node (`SPECIAL_REGISTER_OP_KEY = "special:register"`, a HEXAGON
+with an `IMAGE` rainbow channel input **and an `ANY` structural output** in
+`pipeline_graph/registry_adapter.py`) wired into `pages/pipelines_page.py`
+(`_RegisterJob` off-thread — reads each channel's `(T,H,W)` via `get_frame`, registers
+the wired reference channel, applies to all channels; `_run_register` /
+`_finish_register`), with a `widgets/registration_panel.py` "Registration" viewer tab
+(before/after playback + drift-vs-time plot + confidence; **V1.60** shades
+held/low-confidence frames). Node params = `RigidRegistration().get_params()` (incl.
+V1.60 `model=…/feature`, `reference=…/template`, `normalize`, `feature_transform`,
+`min_inliers`) + scope (`apply_to_all_channels`, `all_multipoints`, `crop_to_common`) +
+a hidden `roi` set by the popup's **"Pick ROI…"** button (`_edit_registration_roi` →
+whole-frame / rectangle dialog / freeform draw captured by `_on_registration_shape`).
+The ROI spec rides through `node.params` into `method.run` (no `_RegisterJob` change);
+registration estimates on the ROI and applies full-frame.
+
+**V1.60 common-region crop.** `crop_to_common` (translation only) makes
+`_finish_register` publish `record._registration_crop = (y0,y1,x0,x1)` — the largest
+border-free rectangle common to all registered frames of all M
+(`estimate.common_translation_crop` over the stacked shifts; single region across M).
+`_crop_rect()` composes it with any preview crop (`_intersect_crop_rects` /
+`_registration_crop_rect`), so the crop reaches every consumer through the existing crop
+chokepoint (`_processed_channels_for_m`, `_materialize_channels_for_m`,
+`_maybe_crop_volume`, the write-back, the panel). Register → crop (full-frame first).
+Cleared on each Run start.
+
+Unlike DVC (a terminal viewer sink), registration is a **transform in the pipeline**:
+wire it *upstream* of analysis / tracking nodes and its correction flows to them.
+`_finish_register` publishes the per-M per-frame transforms on the record
+(`record._registration_by_m`, `_registration_interp_order`); `_processed_channels_for_m`
+(the single point every downstream analysis reads channels from) applies them *after*
+the recipe via `_apply_registration_to_channels` (→ `estimate.apply_series`), so every
+multipoint's analysis runs on the drift-corrected image. The main image viewer is
+redrawn to the aligned base for the shown M (`_apply_registration_writeback` →
+`record._processed_channels` + `viewer.set_channels`). `_on_run` clears
+`record._registration_by_m` at the start of each Run so a graph without a Registration
+node is unaffected. Data-flow note: registration operates on the projected `(T,H,W)`
+channels (2D drift), unlike DVC which consumes the un-collapsed Z volume.
+
+**V1.59 — Pause-node crop preview on the registered image.** The transforms
+published on the record persist through a **Pause** (they clear only at the next
+fresh Run start), so a paused-back-to-editor preview can reuse them. The preview
+readers now apply registration **then** crop: `_extract_processed_frame` registers
+the lazy-volume frame (via `_register_frame` → `estimate.apply_frame`, the
+single-plane analogue of `apply_series`) before its callers `_crop_frame` it, and
+`_materialize_channels_for_m` registers the full stack before cropping. The
+displayed base stays drift-corrected under a crop: `_show_base_image` wraps the
+base in `RegisteredFrameVolume` (`pipeline_graph/executor.py`, a `get_frame` proxy
+applying the per-`(m,t)` transform, no-op for an M without one) via
+`_maybe_register_volume` **before** `_maybe_crop_volume`, so arming the crop tool
+no longer reverts the viewer to the un-registered image; the in-RAM fallback
+prefers the registered `_processed_channels`. **V1.60 perf:** `RegisteredFrameVolume`
+holds a memory-budgeted LRU of warped display frames (the warp is a full-res
+`scipy.ndimage.shift`/`cv2.warp`; without the cache, playback recomputed it every
+tick and the registered image crawled while the raw pyramid played fast) — each
+`(c,m,t,z)` is warped once, then loops are instant. `_apply_registration_writeback`
+drives the display through this cached lazy volume for lazy-volume files rather than
+the full-res materialized `set_channels`. For consistency
+`_processed_channels_for_m` also registers the full frame before cropping a cropped
+Run (register → crop). This is **preview-only** — a resumed Run stays full-frame.
+
 ### `workers/`
 
 | File | Purpose |
@@ -654,7 +945,7 @@ NLMDenoise, WaveletDenoise, TVDenoise) registered via
 | `load_worker.py` | `LoadWorker` — opens an ND2 (extended metadata + lazy channels) or TIFF (single-channel TYX) file off the GUI thread |
 | `recipe_worker.py` | `RecipeWorker` — applies an ordered recipe to each channel; lazy proxies are materialized once per channel; optional frame-mean normalization first |
 | `export_worker.py` | `ExportRequest` dataclass + `ExportWorker` dispatching to `tiff_stack`, `tiff_zstack`, `rgb_composite`, `movie`, or `image_sequence` (V1.32) mode. `ExportRequest` carries an optional `image_adjustments: ImageAdjustments` shared across modes, plus `basename` / `iterate_volume` / `z_mode` / `z_view_index` for image-sequence jobs |
-| `stitch_worker.py` (V1.1) | `StitchRequest` + `StitchWorker` wrapping `export_stitched_tiff` with progress / status signals |
+| `stitch_worker.py` (V1.1 → V1.54) | `StitchRequest` (volume + `stage_xy_um` + `StitchConfig` + m/channel indices + filepath) + `StitchWorker` wrapping `backend.stitch.run_stitch` with progress / status; exposes `.result` (`StitchResult`: out_path, regime, engine, canvas, positions, QC paths) |
 | `analysis_worker.py` (V1.19, deprecated V1.37) | `AnalysisWorker(BaseWorker)` — runs any `AnalysisPipeline.run()` in a background thread; passes `progress_cb` and `cancelled_cb` (Qt-free lambda). **Deprecated** in V1.37: new analysis code submits `PipelinePreviewJob` / `PipelineCommitJob` to the project-wide `JobRunner` (see `compute/`). Kept for `BatchWorker` and any out-of-tree callers |
 | `batch_worker.py` (V1.23) | `BatchWorker(BaseWorker)` — sequential per-file pipeline runner. Extra signal `file_done(int, int)`. For each file: calls `LoadWorker.run_task()` → `RecipeWorker.run_task()` → `pipeline.run()` → `results_engine.compute_measurements()` synchronously within the thread. Errors per file are caught and reported without aborting. Writes `batch_results.csv` to output dir at end |
 | `prefetch_worker.py` (V1.17, V1.35 velocity-aware) | `PrefetchManager(QThread)` — single background thread that fills a `FrameCache` with neighbor T (or Z) frames. Opens its own volume handle inside `run()`. Queue is replaced on each `request_neighbors()` call. Emits `frame_ready(c, m, t, z, z_mode)` via queued signal. Only wired up for the ND2 volume path in `set_volume()`. **V1.35 Phase 3**: constructor accepts `radius_t` / `radius_z`; the manager tracks the previous focus + `time.perf_counter()` timestamp and derives a T-axis velocity from successive `request_neighbors` calls. Forward scrubs (≥ +1 plane/sec) bias the window to `[t - 2, t + radius_t]`; backward scrubs bias the opposite side; a stop falls back to a symmetric `radius_t // 2` window. 1.5 s TTL on the focus history resets the bias after an idle pause. Z-axis fallback (single-T volumes) stays symmetric ±`radius_z`. `cancel_all()` clears the queue without resetting velocity history (mid-scrub mouse release should keep the prediction) |
@@ -842,10 +1133,16 @@ ND2StudiosRecord.recipe              (List[(plugin_name, params)])
 .tif (single multi-channel TZCYX ImageJ hyperstack, V1.29)
 .tif (RGB composite) | .mp4 / .gif on disk
 
-Side branch (Import page → Stitch M…):
-   _raw_volume → StitchDialog → StitchWorker → export_stitched_tiff()
-   → multi-page TIFF (single-channel or RGB composite). The original
-   ND2 is never touched.
+Side branch (Import page → Stitch M…, V1.54 regime-aware):
+   _raw_volume + stage_xy_um → StitchDialog → StitchWorker
+   → backend.stitch.run_stitch():
+       build_dataset → decide_regime (overlap vs zero_overlap)
+       → compute_positions (register once on align channel via
+         m2stitch/phase-correlation, or coordinate placement)
+       → composite (feather/…) → write_ome_tiff (pyramidal OME-TIFF)
+       → write_qc (JSON + PNG)
+   → .ome.tif (+ .stitch_qc.json/.png). The original ND2 is never
+   touched. Reloadable via the normal TIFF import (tiff_loader OME path).
 
 Side branch (Analysis page — V1.19):
    _processed_channels (or _raw_channels) → AnalysisPage._on_run()

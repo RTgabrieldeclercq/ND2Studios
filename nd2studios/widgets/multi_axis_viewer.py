@@ -1640,6 +1640,15 @@ class MultiAxisViewer(QWidget):
         reader = self._pyramid_reader
         if reader is None or self._volume is None:
             return 0
+        # V1.49: the pyramid is built from the RAW volume. When the displayed
+        # volume applies a recipe (ProcessedFrameVolume), serves pinned processed
+        # planes (PinnedProcessedVolume) or crops (CroppedVolume), reading from
+        # the raw pyramid would bypass processing / the crop and show raw, full-
+        # frame images — the "processing doesn't reach the Analysis viewer under a
+        # crop / zoom-out" bug. Force level 0 so ``_read_volume_plane`` falls
+        # through to the wrapper's ``get_frame`` (which applies the recipe / crop).
+        if getattr(self._volume, "bypass_pyramid", False):
+            return 0
         # Both canvases expose ``width()``; the GPU canvas additionally
         # has a pyqtgraph ViewBox for the source-pixel rect.
         try:

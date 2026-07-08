@@ -23,17 +23,20 @@ from __future__ import annotations
 
 import gc
 import os
+from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+    QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import icon_button
 from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
 from nd2studios.workers.load_worker import LoadWorker
 
@@ -136,6 +139,13 @@ class FilePanel(QWidget):
         self._cb_add_file = on_add_file
         self._show_close = show_close_button
 
+        # V1.57 — spatial XY export crop (x, y, w, h in full-frame pixels), and
+        # the background export worker. The XY crop is stored as a rect (the
+        # live viewer keeps browsing the full volume) and is realized only in
+        # the exported file, composing with the T/M/Z tile-strip crop.
+        self._xy_crop: Optional[Tuple[int, int, int, int]] = None
+        self._export_worker = None
+
         self._build_ui()
 
     # ── Construction ────────────────────────────────────────────────
@@ -160,6 +170,9 @@ class FilePanel(QWidget):
         self.viewer.channels_changed.connect(self._on_channels_changed)
         self.viewer.stitch_requested.connect(self._on_stitch_clicked)
         self.viewer.crop_to_selection_requested.connect(self._on_crop_to_selection)
+        # V1.57 — spatial XY crop tool (rubber-band drag or click-to-enter).
+        self.viewer.crop_rect_selected.connect(self._on_xy_crop_drag)
+        self.viewer.canvas.clicked.connect(self._on_xy_canvas_click)
         self._full_volume = None      # original dataset before any crop
         self._full_timestamps = None
         self._crop_worker = None
@@ -313,8 +326,58 @@ class FilePanel(QWidget):
         self.btn_revert_crop.setVisible(False)
         sl.addWidget(self.btn_revert_crop)
 
+        sl.addWidget(self._build_export_group())
+
         sl.addStretch(1)
         return ctrl
+
+    def _build_export_group(self) -> QGroupBox:
+        """V1.57 — spatial XY crop tool + one-click export of the cropped data.
+
+        Export honors both the T/M/Z tile-strip crop (already baked into
+        ``record._raw_volume``) and the spatial XY rectangle stored here.
+        """
+        group = QGroupBox("Export")
+        gl = QVBoxLayout(group)
+
+        crop_row = QHBoxLayout()
+        self.btn_crop_xy = icon_button(
+            "fa5s.crop-alt",
+            "Crop — draw a rectangle on the image to set the export region",
+            text=" Crop XY", checkable=True, object_name="toggleBtn",
+        )
+        self.btn_crop_xy.toggled.connect(self._on_crop_xy_toggled)
+        crop_row.addWidget(self.btn_crop_xy)
+        self.btn_reset_xy = icon_button(
+            "fa5s.undo", "Reset — clear the XY export crop", text=" Reset",
+            object_name="compactBtn",
+        )
+        self.btn_reset_xy.setEnabled(False)
+        self.btn_reset_xy.clicked.connect(self._reset_xy_crop)
+        crop_row.addWidget(self.btn_reset_xy)
+        gl.addLayout(crop_row)
+
+        self.lbl_xy_crop_status = QLabel("No XY crop")
+        self.lbl_xy_crop_status.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;"
+        )
+        gl.addWidget(self.lbl_xy_crop_status)
+
+        self.btn_export = icon_button(
+            "fa5s.download",
+            "Export — write the current (cropped) data to disk",
+            text=" Export cropped…", object_name="primaryBtn",
+        )
+        self.btn_export.setEnabled(False)
+        menu = QMenu(self.btn_export)
+        menu.addAction("TIFF hyperstack…", self._export_tiff)
+        menu.addAction("Movie (MP4)…", lambda: self._export_movie("mp4"))
+        menu.addAction("Movie (GIF)…", lambda: self._export_movie("gif"))
+        menu.addAction("Image sequence (PNG)…", self._export_image_sequence)
+        self.btn_export.setMenu(menu)
+        gl.addWidget(self.btn_export)
+
+        return group
 
     # ── Sidebar collapse/expand ──────────────────────────────────────
 
@@ -430,6 +493,8 @@ class FilePanel(QWidget):
         self._full_volume = None
         self._full_timestamps = None
         self.btn_revert_crop.setVisible(False)
+        # V1.57 — a fresh import clears the spatial XY export crop.
+        self._reset_xy_crop()
         self.viewer.set_frame_timestamps(rec._frame_timestamps)
         if volume is not None:
             self.viewer.set_volume(
@@ -447,6 +512,7 @@ class FilePanel(QWidget):
             )
 
         self.btn_confirm.setEnabled(True)
+        self.btn_export.setEnabled(True)
         n_m = int(meta.get("n_multipoints", 1))
         self.btn_stitch.setEnabled(n_m > 1)
 
@@ -569,6 +635,313 @@ class FilePanel(QWidget):
         self.btn_revert_crop.setVisible(False)
         if self._cb_status:
             self._cb_status("Reverted to full dataset.")
+
+    # ── V1.57 spatial XY export crop ──
+    def _on_crop_xy_toggled(self, enabled: bool) -> None:
+        self.viewer.set_crop_mode(enabled)
+
+    def _on_xy_crop_drag(self, x: int, y: int, w: int, h: int) -> None:
+        if not self.btn_crop_xy.isChecked():
+            return
+        result = self._show_xy_crop_dialog(x, y, w, h)
+        if result is not None:
+            self._apply_xy_crop(*result)
+
+    def _on_xy_canvas_click(self, iy: float, ix: float) -> None:
+        if not self.btn_crop_xy.isChecked():
+            return
+        result = self._show_xy_crop_dialog(int(ix), int(iy), 0, 0)
+        if result is not None:
+            self._apply_xy_crop(*result)
+
+    def _frame_hw(self) -> Optional[Tuple[int, int]]:
+        """Full-frame (height, width) of the currently loaded data, or None."""
+        rec = self.record
+        vol = rec._raw_volume
+        if vol is not None:
+            return int(vol.height), int(vol.width)
+        src = rec._raw_channels or {}
+        if not src:
+            return None
+        sample = next(iter(src.values()))
+        shape = getattr(sample, "shape", None) or np.asarray(sample).shape
+        return int(shape[-2]), int(shape[-1])
+
+    def _show_xy_crop_dialog(
+        self, x: int, y: int, w: int, h: int
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Confirm/edit the export crop rectangle. Returns (x, y, w, h) or None."""
+        hw = self._frame_hw()
+        if hw is None:
+            return None
+        img_h, img_w = hw
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Crop export region")
+        layout = QVBoxLayout(dlg)
+        info = QLabel(
+            f"Image: {img_w} × {img_h} px  "
+            f"(X = columns from left, Y = rows from top)"
+        )
+        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        sp_x = QSpinBox(); sp_x.setRange(0, img_w - 1)
+        sp_x.setValue(max(0, min(x, img_w - 1)))
+        sp_y = QSpinBox(); sp_y.setRange(0, img_h - 1)
+        sp_y.setValue(max(0, min(y, img_h - 1)))
+        sp_w = QSpinBox(); sp_w.setRange(1, img_w)
+        sp_w.setValue(w if w > 0 else max(1, img_w - x))
+        sp_h = QSpinBox(); sp_h.setRange(1, img_h)
+        sp_h.setValue(h if h > 0 else max(1, img_h - y))
+        form.addRow("X (left corner):", sp_x)
+        form.addRow("Y (top corner):", sp_y)
+        form.addRow("Width (px):", sp_w)
+        form.addRow("Height (px):", sp_h)
+        layout.addLayout(form)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        cx, cy, cw, ch = sp_x.value(), sp_y.value(), sp_w.value(), sp_h.value()
+        cw = min(cw, img_w - cx)
+        ch = min(ch, img_h - cy)
+        return (cx, cy, cw, ch)
+
+    def _apply_xy_crop(self, x: int, y: int, w: int, h: int) -> None:
+        self._xy_crop = (x, y, w, h)
+        self.record.crop_rect = (x, y, w, h)
+        self.btn_crop_xy.setChecked(False)
+        self.btn_reset_xy.setEnabled(True)
+        self.lbl_xy_crop_status.setText(
+            f"Export crop: x={x}, y={y}, {w}×{h} px")
+
+    def _reset_xy_crop(self) -> None:
+        self._xy_crop = None
+        self.record.crop_rect = None
+        if hasattr(self, "btn_crop_xy"):
+            self.btn_crop_xy.setChecked(False)
+            self.btn_reset_xy.setEnabled(False)
+            self.lbl_xy_crop_status.setText("No XY crop")
+
+    # ── V1.57 export from the Import tab ──
+    def _export_basename(self) -> str:
+        stem = (os.path.splitext(os.path.basename(self._filepath))[0]
+                if self._filepath else "export")
+        return f"{stem}_crop" if self._xy_crop is not None else stem
+
+    def _export_source_channels(self) -> "OrderedDict[str, Any]":
+        """Channels for the current M/Z view, with the XY crop applied.
+
+        The T/M/Z tile-strip crop is already reflected because the cropped
+        volume replaced ``record._raw_volume``.
+        """
+        rec = self.record
+        vol = rec._raw_volume
+        if vol is not None:
+            m, _t, z = self.viewer.coords()
+            chans: "OrderedDict[str, Any]" = OrderedDict(
+                vol.all_channels_as_lazy(
+                    m=int(m), z_mode=self.combo_zproj.currentText(),
+                    z_index=int(z),
+                )
+            )
+        else:
+            chans = OrderedDict(rec._raw_channels or {})
+
+        if self._xy_crop is not None:
+            x, y, w, h = self._xy_crop
+            cropped: "OrderedDict[str, Any]" = OrderedDict()
+            for name, ch in chans.items():
+                crop_fn = getattr(ch, "crop", None)
+                if callable(crop_fn):
+                    cropped[name] = crop_fn(y, y + h, x, x + w)
+                else:
+                    cropped[name] = np.asarray(ch)[..., y:y + h, x:x + w]
+            chans = cropped
+        return chans
+
+    def _colors_enabled_lut(self, names):
+        from nd2studios.widgets.image_viewer import CHANNEL_COLORS
+        state = self.viewer.channel_state()
+        colors: Dict[str, Tuple[int, int, int]] = {}
+        enabled: Dict[str, bool] = {}
+        lut: Dict[str, Tuple[float, float, float]] = {}
+        for name in names:
+            cfg = state.get(name, {})
+            colors[name] = CHANNEL_COLORS.get(
+                cfg.get("color", "gray"), (255, 255, 255))
+            enabled[name] = bool(cfg.get("enabled", True))
+            if "lut_lo" in cfg and "lut_hi" in cfg:
+                lut[name] = (
+                    float(cfg["lut_lo"]), float(cfg["lut_hi"]),
+                    float(cfg.get("lut_gamma", 1.0)),
+                )
+        return colors, enabled, lut
+
+    def _frame_timestamps(self):
+        ts = self.record._frame_timestamps
+        return np.asarray(ts) if ts is not None else None
+
+    def _pixel_size_um(self) -> float:
+        return float(self.record.pixel_size_um or 1.0)
+
+    def _export_tiff(self) -> None:
+        from nd2studios.workers.export_worker import ExportRequest
+        rec = self.record
+        if rec._raw_volume is None and not rec._raw_channels:
+            QMessageBox.information(self, "Nothing to export", "Load a file first.")
+            return
+
+        is_zstack = (
+            rec._raw_volume is not None
+            and rec.n_zslices > 1
+            and self.combo_zproj.currentText() == "none"
+        )
+        suffix = "_zstack" if is_zstack else "_tiff"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export TIFF", f"{self._export_basename()}{suffix}.tif",
+            "TIFF (*.tif *.tiff);;All files (*)",
+        )
+        if not path:
+            return
+
+        if is_zstack:
+            vol = rec._raw_volume
+            m, _t, _z = self.viewer.coords()
+            state = self.viewer.channel_state()
+            enabled = {
+                name: bool(state.get(name, {}).get("enabled", True))
+                for name in vol.channel_names
+            }
+            req = ExportRequest(
+                mode="tiff_zstack", filepath=path, enabled=enabled,
+                pixel_size_um=self._pixel_size_um(), bit_depth="passthrough",
+                raw_volume=vol, m_index=int(m), crop_rect=self._xy_crop,
+            )
+        else:
+            chans = self._export_source_channels()
+            if not chans:
+                QMessageBox.information(self, "Nothing to export", "Load a file first.")
+                return
+            colors, enabled, _lut = self._colors_enabled_lut(chans)
+            req = ExportRequest(
+                mode="tiff_stack", filepath=path, channels=dict(chans),
+                colors=colors, enabled=enabled,
+                pixel_size_um=self._pixel_size_um(), bit_depth="passthrough",
+            )
+        self._run_export(req, "Writing TIFF…")
+
+    def _materialized_channels(self) -> Dict[str, np.ndarray]:
+        out: Dict[str, np.ndarray] = {}
+        for name, ch in self._export_source_channels().items():
+            m = getattr(ch, "materialize", None)
+            out[name] = m() if callable(m) else np.asarray(ch)
+        return out
+
+    def _export_movie(self, fmt: str) -> None:
+        from nd2studios.backend.exporters.movie_exporter import MovieOptions
+        from nd2studios.widgets.export_preview_dialog import ExportPreviewDialog
+        from nd2studios.workers.export_worker import ExportRequest
+
+        channels = self._materialized_channels()
+        if not channels:
+            QMessageBox.information(self, "Nothing to export", "Load a file first.")
+            return
+        colors, enabled, lut = self._colors_enabled_lut(channels)
+        ext = ".mp4" if fmt == "mp4" else ".gif"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Movie", f"{self._export_basename()}_movie{ext}",
+            f"{fmt.upper()} (*{ext});;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(ext):
+            path += ext
+
+        opts = MovieOptions(fps=10.0, codec=fmt)
+        dlg = ExportPreviewDialog(
+            channels=channels, colors=colors, enabled=enabled,
+            pixel_size_um=self._pixel_size_um(),
+            frame_timestamps_s=self._frame_timestamps(),
+            lut_settings=lut, movie_options=opts,
+            title="Movie Export — Preview", parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        req = ExportRequest(
+            mode="movie", filepath=path, channels=channels, colors=colors,
+            enabled=enabled, pixel_size_um=self._pixel_size_um(),
+            frame_timestamps_s=self._frame_timestamps(), movie_options=opts,
+            lut_settings=lut, image_adjustments=dlg.adjustments(),
+        )
+        self._run_export(req, "Rendering movie…")
+
+    def _export_image_sequence(self) -> None:
+        from nd2studios.backend.exporters.movie_exporter import MovieOptions
+        from nd2studios.widgets.export_preview_dialog import ExportPreviewDialog
+        from nd2studios.workers.export_worker import ExportRequest
+
+        channels = self._materialized_channels()
+        if not channels:
+            QMessageBox.information(self, "Nothing to export", "Load a file first.")
+            return
+        colors, enabled, lut = self._colors_enabled_lut(channels)
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "Choose output folder for image sequence", "")
+        if not out_dir:
+            return
+
+        opts = MovieOptions(fps=10.0, codec="mp4")
+        dlg = ExportPreviewDialog(
+            channels=channels, colors=colors, enabled=enabled,
+            pixel_size_um=self._pixel_size_um(),
+            frame_timestamps_s=self._frame_timestamps(),
+            lut_settings=lut, movie_options=opts,
+            title="Image Sequence Export — Preview", parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        req = ExportRequest(
+            mode="image_sequence", filepath=out_dir, channels=channels,
+            colors=colors, enabled=enabled, pixel_size_um=self._pixel_size_um(),
+            frame_timestamps_s=self._frame_timestamps(), movie_options=opts,
+            lut_settings=lut, image_adjustments=dlg.adjustments(),
+            basename=self._export_basename(),
+        )
+        self._run_export(req, "Writing image sequence…")
+
+    def _run_export(self, request, label: str) -> None:
+        from nd2studios.workers.export_worker import ExportWorker
+        if self._export_worker is not None and self._export_worker.isRunning():
+            QMessageBox.information(self, "Busy", "An export is already running.")
+            return
+        self._export_worker = ExportWorker(request, parent=self)
+        if self._cb_progress:
+            self._export_worker.progress.connect(self._cb_progress)
+        if self._cb_status:
+            self._export_worker.status.connect(self._cb_status)
+        self._export_worker.finished.connect(self._on_export_done)
+        self._export_worker.error.connect(self._on_error)
+        if self._cb_status:
+            self._cb_status(label)
+        self._export_worker.start()
+
+    def _on_export_done(self, result: Any) -> None:
+        if self._cb_progress:
+            self._cb_progress(0)
+        if self._cb_status:
+            self._cb_status(f"Saved: {result}")
+        QMessageBox.information(self, "Export complete", f"Wrote:\n{result}")
 
     def _on_confirm_clicked(self) -> None:
         if self._cb_confirm:

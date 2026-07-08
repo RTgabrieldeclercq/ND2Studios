@@ -150,7 +150,14 @@ class ParamEditor(QWidget):
             w = self._widgets.get(spec.name)
             if w is None:
                 continue
-            visible = all(current_choices.get(k) == v for k, v in spec.visible_when.items())
+            # A visible_when value may be a single choice or a list/tuple/set of
+            # choices (the row shows when the current choice is any of them), so
+            # one knob can be shared by several methods (e.g. the gap budget used
+            # by both the fingerprint and mask-overlap linkers).
+            def _match(cur, want):
+                return cur in want if isinstance(want, (list, tuple, set)) else cur == want
+            visible = all(_match(current_choices.get(k), v)
+                          for k, v in spec.visible_when.items())
             self._layout.setRowVisible(w, visible)
 
     def _emit_changed(self):

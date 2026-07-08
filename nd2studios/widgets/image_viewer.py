@@ -571,13 +571,18 @@ class ImageCanvas(QLabel):
             end_iy, end_ix = self._crop_drag_end
             wx0, wy0 = self.image_to_widget(start_iy, start_ix)
             wx1, wy1 = self.image_to_widget(end_iy, end_ix)
-            pen = QPen(QColor(255, 220, 0), 1.5, Qt.PenStyle.DashLine)
-            painter.setPen(pen)
-            painter.setBrush(QBrush(QColor(255, 220, 0, 40)))
-            painter.drawRect(QRectF(
+            crop_rect = QRectF(
                 min(wx0, wx1), min(wy0, wy1),
                 abs(wx1 - wx0), abs(wy1 - wy0),
-            ))
+            )
+            # High-visibility crop rectangle: a dark halo under a bright
+            # magenta line reads clearly over both light and dark image content.
+            painter.setBrush(QBrush(QColor(255, 45, 100, 55)))
+            painter.setPen(QPen(QColor(0, 0, 0, 200), 4.0, Qt.PenStyle.SolidLine))
+            painter.drawRect(crop_rect)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(255, 45, 100), 2.0, Qt.PenStyle.DashLine))
+            painter.drawRect(crop_rect)
         # In-progress draw-mode preview — cyan dashed to distinguish from crop.
         if self._draw_mode is not None and self._draw_dragging:
             pen = QPen(QColor(0, 220, 255), 1.5, Qt.PenStyle.DashLine)

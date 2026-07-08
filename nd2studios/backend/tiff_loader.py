@@ -216,6 +216,66 @@ def read_imagej_tiff_metadata(filepath: str) -> dict:
         }
 
 
+def read_ome_tiff_metadata(filepath: str) -> dict:
+    """Read metadata from an OME-TIFF (e.g. the V1.54 stitcher output).
+
+    Returns the same key set as :func:`read_imagej_tiff_metadata`
+    (n_channels/n_timepoints/n_zslices/channel_names/pixel_size_um/…), reading
+    from the level-0 series so pyramidal (sub-resolution) IFDs are ignored.
+    Returns {} for non-OME TIFFs so callers fall back to the ImageJ / flat path.
+    """
+    with tifffile.TiffFile(filepath) as tif:
+        if not getattr(tif, "is_ome", False):
+            return {}
+        series = tif.series[0]
+        axes = series.axes                      # e.g. "TZCYX"
+        shape = series.shape
+        dmap = dict(zip(axes, shape))
+        n_t = int(dmap.get("T", 1))
+        n_z = int(dmap.get("Z", 1))
+        n_c = int(dmap.get("C", 1))
+        h = int(dmap.get("Y", shape[-2]))
+        w = int(dmap.get("X", shape[-1]))
+        dtype = str(series.dtype)
+
+        names: List[str] = []
+        pixel_size_um: Optional[float] = None
+        try:
+            import ome_types
+            ome = ome_types.from_xml(tif.ome_metadata)
+            img = ome.images[0]
+            psx = img.pixels.physical_size_x
+            if psx:
+                pixel_size_um = float(psx)
+            for i, ch in enumerate(img.pixels.channels):
+                names.append(str(ch.name) if ch.name else f"Ch{i}")
+        except Exception:
+            names = []
+        if len(names) < n_c:
+            names += [f"Ch{i}" for i in range(len(names), n_c)]
+
+        # Fallback pixel size from the resolution tag if OME lacked PhysicalSize.
+        if pixel_size_um is None:
+            x_res = series.levels[0].pages[0].tags.get("XResolution") \
+                if hasattr(series, "levels") else tif.pages[0].tags.get("XResolution")
+            if x_res is not None:
+                val = x_res.value
+                if isinstance(val, tuple) and len(val) == 2 and val[0]:
+                    pixel_size_um = float(val[1]) / float(val[0])
+
+        return {
+            "n_channels": n_c,
+            "n_timepoints": n_t,
+            "n_zslices": n_z,
+            "channel_names": names[:n_c],
+            "pixel_size_um": pixel_size_um,
+            "n_pages_total": n_t * n_z * n_c,
+            "page_shape": (h, w),
+            "dtype": dtype,
+            "is_ome": True,
+        }
+
+
 def load_imagej_tiff_channels(
     filepath: str,
     ij_info: dict,
@@ -390,6 +450,22 @@ def read_tiff_meta_fast(filepath: str) -> Dict[str, Any]:
             "channel_names": list(ij.get("channel_names") or ["Ch0"]),
             "pixel_size_um": float(ij.get("pixel_size_um") or 1.0),
         }
+    ome = read_ome_tiff_metadata(filepath)
+    if ome:
+        oh, ow = ome["page_shape"]
+        return {
+            "filepath": filepath,
+            "n_timepoints": int(ome.get("n_timepoints", 1)),
+            "n_zslices": int(ome.get("n_zslices", 1)),
+            "n_channels": int(ome.get("n_channels", 1)),
+            "n_multipoints": 1,
+            "height": int(oh),
+            "width": int(ow),
+            "dtype": str(ome.get("dtype", info["dtype"])),
+            "channel_names": list(ome.get("channel_names") or ["Ch0"]),
+            "pixel_size_um": float(ome.get("pixel_size_um") or 1.0),
+            "is_ome": True,
+        }
     # Flat or non-ImageJ TIFF: treat as a (T, H, W) single-channel stack
     # where T == n_pages. Z and M are 1.
     # RGB TIFFs (page_shape = (H, W, 3)) are split into 3 channels so the
@@ -446,6 +522,7 @@ class _SingleFileTIFFView:
         self.channel_names = list(meta["channel_names"])
         self.pixel_size_um = float(meta["pixel_size_um"])
         self.z_step_um = 1.0
+        self._is_ome = bool(meta.get("is_ome", False))
         self._channels: Optional[Dict[str, LazyTIFFChannel]] = None
         # Direct page-reading handle for ImageJ multi-Z access — kept
         # open across get_frame calls; closed in close().
@@ -460,6 +537,18 @@ class _SingleFileTIFFView:
             # honors Z by stacking + projecting across n_z planes with
             # stride = n_c.
             self._channels = load_imagej_tiff_channels(self.filepath, ij)
+        elif self._is_ome and self.n_channels > 1:
+            # OME-TIFF level-0 pages share the ImageJ TZCYX page order
+            # (C fastest), so the same per-channel proxy layout applies.
+            ome_info = {
+                "n_channels": self.n_channels,
+                "n_zslices": self.n_zslices,
+                "n_timepoints": self.n_timepoints,
+                "page_shape": (self.height, self.width),
+                "dtype": str(self.dtype),
+                "channel_names": self.channel_names,
+            }
+            self._channels = load_imagej_tiff_channels(self.filepath, ome_info)
         elif ij and ij.get("n_zslices", 1) > 1:
             info = get_tiff_info(self.filepath)
             h, w = info["page_shape"][-2], info["page_shape"][-1]
@@ -470,6 +559,19 @@ class _SingleFileTIFFView:
                 n_pages_per_t=int(ij["n_zslices"]),
                 page_within_t=0,
                 n_z=int(ij["n_zslices"]),
+                z_projection="max",
+            )
+            self._channels = {self.channel_names[0]: lazy}
+        elif self._is_ome and self.n_zslices > 1:
+            # Single-channel multi-Z OME — project Z (like the ImageJ branch)
+            # instead of falling to the flat path that would expose Z as T.
+            lazy = LazyTIFFChannel(
+                self.filepath,
+                t_start=0, t_end=int(self.n_timepoints),
+                height=self.height, width=self.width, dtype=self.dtype,
+                n_pages_per_t=int(self.n_zslices),
+                page_within_t=0,
+                n_z=int(self.n_zslices),
                 z_projection="max",
             )
             self._channels = {self.channel_names[0]: lazy}
@@ -526,11 +628,22 @@ class _SingleFileTIFFView:
             arr = arr.squeeze()
         return arr
 
+    def _level0_pages(self):
+        """Full-resolution page list (skips pyramidal sub-resolutions for OME)."""
+        tif = self._ensure_tiff()
+        if self._is_ome:
+            try:
+                lvl = tif.series[0].levels
+                return lvl[0].pages if lvl else tif.series[0].pages
+            except Exception:
+                return tif.pages
+        return tif.pages
+
     def _read_imagej_frame(self, c: int, t: int, z: int, z_mode: str,
                            z_start: Optional[int],
                            z_end: Optional[int]) -> np.ndarray:
-        """Read a (H, W) frame from an ImageJ TZCYX hyperstack by page index."""
-        tif = self._ensure_tiff()
+        """Read a (H, W) frame from a TZCYX hyperstack (ImageJ or OME) by index."""
+        pages = self._level0_pages()
         n_c = max(1, int(self.n_channels))
         n_z = max(1, int(self.n_zslices))
         n_t = max(1, int(self.n_timepoints))
@@ -542,11 +655,11 @@ class _SingleFileTIFFView:
 
         if z_mode == "none":
             z_i = max(0, min(int(z), n_z - 1))
-            return tif.pages[page(z_i)].asarray()
+            return pages[page(z_i)].asarray()
 
         zs = 0 if z_start is None else max(0, int(z_start))
         ze = n_z if z_end is None else max(zs, min(int(z_end), n_z))
-        planes = [tif.pages[page(zi)].asarray() for zi in range(zs, ze)]
+        planes = [pages[page(zi)].asarray() for zi in range(zs, ze)]
         if not planes:
             return np.zeros((self.height, self.width), dtype=self.dtype)
         stack = np.stack(planes, axis=0)

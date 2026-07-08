@@ -135,10 +135,18 @@ class EnhancedDataset:
         recipe: List[Tuple[str, Dict[str, Any]]],
         normalized: bool,
         pixel_size_um: float = 1.0,
+        recipe_by_channel: Optional[Dict[str, List[Tuple[str, Dict[str, Any]]]]] = None,
     ):
         self._raw = raw_channels
         self._recipe = [(n, dict(p)) for (n, p) in recipe]
         self._normalized = bool(normalized)
+        # V1.48: per-channel recipes (channel-wire pipeline). When set, each
+        # channel uses its own recipe; a channel absent / empty ⇒ raw (unwired
+        # channels stay raw). Overrides the single ``recipe``.
+        self._recipe_by_channel: Optional[Dict[str, List[Tuple[str, Dict[str, Any]]]]] = (
+            {k: [(n, dict(p)) for (n, p) in v] for k, v in recipe_by_channel.items()}
+            if recipe_by_channel is not None else None
+        )
         self._materialized: Dict[str, np.ndarray] = {}
         # Addendum Phase 6: ``materialize_all`` now fans out across
         # channels via :class:`ThreadPoolExecutor`. The recipe plugins
@@ -169,6 +177,13 @@ class EnhancedDataset:
 
     # ── materialization ──────────────────────────────────────────────
 
+    def _recipe_for(self, name: str) -> List[Tuple[str, Dict[str, Any]]]:
+        """The recipe for channel ``name`` — its per-channel recipe when set
+        (absent ⇒ raw), else the single recipe (legacy)."""
+        if self._recipe_by_channel is not None:
+            return self._recipe_by_channel.get(name) or []
+        return self._recipe
+
     def materialize_channel(
         self,
         name: str,
@@ -196,7 +211,11 @@ class EnhancedDataset:
         else:
             current = np.asarray(raw)
 
-        if self._normalized:
+        # V1.48: per-channel recipe. An unwired channel (no recipe) stays fully
+        # raw — no normalize, no steps.
+        recipe = self._recipe_for(name)
+
+        if recipe and self._normalized:
             try:
                 from nd2studios.backend.normalization import normalize_timeseries
 
@@ -205,8 +224,8 @@ class EnhancedDataset:
                 # Best-effort, like RecipeWorker.
                 pass
 
-        n_steps = max(1, len(self._recipe))
-        for idx, (plugin_name, params) in enumerate(self._recipe):
+        n_steps = max(1, len(recipe))
+        for idx, (plugin_name, params) in enumerate(recipe):
             plugin_cls = PluginBase.get_plugin("enhancement", plugin_name)
             if plugin_cls is None:
                 continue

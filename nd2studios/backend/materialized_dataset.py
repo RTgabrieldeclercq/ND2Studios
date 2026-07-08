@@ -130,6 +130,19 @@ class MaterializedDataset:
         # mean
         return stack.mean(axis=0).astype(self.dtype)
 
+    def get_volume(self, c: int, m: int = 0, t: int = 0,
+                   z_start: Optional[int] = None,
+                   z_end: Optional[int] = None) -> np.ndarray:
+        """Return the full ``(Z, H, W)`` volume for ``(c, m, t)`` over
+        ``[z_start, z_end)`` (default all Z). Preserves the Z axis (unlike
+        :meth:`get_frame`) — the read path DVC uses for true 3-D correlation."""
+        name = self.channel_names[int(c)]
+        blk = np.asarray(self.channels[name][int(m), int(t)])   # (Z, H, W)
+        n_z = blk.shape[0]
+        zs = 0 if z_start is None else max(0, min(int(z_start), n_z - 1))
+        ze = n_z if z_end is None else max(zs + 1, min(int(z_end), n_z))
+        return blk[zs:ze]
+
     def channel_array(self, name: str, m: Optional[int] = None) -> np.ndarray:
         """Return (T, Z, H, W) for one channel at fixed M, or (M, T, Z, H, W) if m is None."""
         arr = self.channels[name]

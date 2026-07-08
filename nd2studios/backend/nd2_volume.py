@@ -171,6 +171,28 @@ class LazyND2Volume:
         # mean
         return z_stack.mean(axis=0).astype(self.dtype)
 
+    def get_volume(self, c: int, m: int = 0, t: int = 0,
+                   z_start: Optional[int] = None,
+                   z_end: Optional[int] = None) -> np.ndarray:
+        """Return the full ``(Z, H, W)`` volume for ``(c, m, t)``.
+
+        Unlike :meth:`get_frame` (which always collapses Z to a single ``(H, W)``
+        plane or projection), this preserves the Z axis over ``[z_start, z_end)``
+        (default: all Z) — the read path Digital Volume Correlation needs for true
+        3-D correlation. Read in a single dask slice. For a single-Z dataset the
+        result is ``(1, H, W)``.
+        """
+        self._ensure_open()
+        n_z = int(self.n_zslices)
+        zs = 0 if z_start is None else max(0, min(int(z_start), n_z - 1))
+        ze = n_z if z_end is None else max(zs + 1, min(int(z_end), n_z))
+        arr = np.asarray(self._dask[self._index_for(c, m, t, slice(zs, ze))])
+        if arr.ndim > 3:
+            arr = arr.squeeze()
+        if arr.ndim == 2:
+            arr = arr[None, ...]
+        return arr
+
     def to_lazy_channel(self, c: int, m: int = 0,
                         z_mode: str = "max",
                         z_index: int = 0,

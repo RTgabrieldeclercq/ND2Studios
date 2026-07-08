@@ -106,6 +106,7 @@ class Settings:
     ACCENT_RED = "#ff5555"      # danger
     ACCENT_YELLOW = "#f1fa8c"
     ACCENT_GOLD = "#ffc83d"     # "previewed" highlight (Pipelines node board)
+    ACCENT_WHITE = "#ffffff"    # Checkpoint node (freeze/cache marker)
     BORDER_COLOR = "#44475a"
 
     # ── Page list ──────────────────────────────────────────────────

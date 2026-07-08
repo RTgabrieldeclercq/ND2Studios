@@ -45,8 +45,13 @@ METHOD_CENTROID = "Centroid (nearest-neighbor)"
 METHOD_SERIALTRACK = "SerialTrack (topology PTV)"
 METHOD_CT_TOPOLOGY = "Cell-Tracker: Topology (Hungarian)"
 METHOD_CT_FINGERPRINT = "Cell-Tracker: Spatial Fingerprint"
+#   * METHOD_CT_OVERLAP — links segmented objects by mask IoU (Jaqaman LAP with
+#     birth/death), the robust default for dense, slowly-moving nuclei; consumes
+#     the per-(channel, m) StarDist label masks passed via ``label_masks``.
+METHOD_CT_OVERLAP = "Cell-Tracker: Mask Overlap (IoU)"
 TRACKING_METHODS: List[str] = [
     METHOD_CENTROID, METHOD_SERIALTRACK, METHOD_CT_TOPOLOGY, METHOD_CT_FINGERPRINT,
+    METHOD_CT_OVERLAP,
 ]
 
 
@@ -74,6 +79,8 @@ def link_objects(
     ct_topo_weight: float = 0.3,
     ct_area_weight: float = 0.3,
     ct_max_gap: int = 3,
+    ct_min_iou: float = 0.1,
+    label_masks: Optional[Dict[Tuple[str, int], "np.ndarray"]] = None,
     progress_cb: Optional[ProgressCB] = None,
 ) -> List[Dict[str, Any]]:
     """Assign track_id, track_length, and track_validation to every row.
@@ -156,7 +163,16 @@ def link_objects(
         only by ``METHOD_CT_FINGERPRINT``.
     ct_max_gap:
         CellTracker fingerprint gap-filling budget — frames a track may vanish
-        and still re-link.  Used only by ``METHOD_CT_FINGERPRINT``.
+        and still re-link.  Used by ``METHOD_CT_FINGERPRINT`` and
+        ``METHOD_CT_OVERLAP``.
+    ct_min_iou:
+        Minimum mask intersection-over-union to link two detections.  Used only
+        by ``METHOD_CT_OVERLAP``.
+    label_masks:
+        Optional ``{(segmentation_channel, m_position): (T, H, W) int label
+        image}`` consumed by ``METHOD_CT_OVERLAP`` for mask-IoU linking.  When a
+        group's masks are absent the overlap method falls back to the fingerprint
+        linker so it still produces tracks.
 
     Returns
     -------
@@ -210,7 +226,7 @@ def link_objects(
     )
     _t_start = time.perf_counter()
 
-    for gi, group_rows in enumerate(groups.values()):
+    for gi, (group_key, group_rows) in enumerate(groups.items()):
         # Map each linker's own 0..1 progress into this group's slice of the
         # overall bar, so multi-group runs still advance smoothly and a
         # single-group run (the common case) passes progress straight through.
@@ -218,7 +234,13 @@ def link_objects(
             if progress_cb is not None:
                 progress_cb((_gi + max(0.0, min(1.0, frac))) / n_groups, msg)
 
-        if method == METHOD_SERIALTRACK:
+        if method == METHOD_CT_OVERLAP:
+            _link_group_overlap(
+                group_rows, group_key, max_displacement_px,
+                ct_min_iou, ct_max_gap, label_masks,
+                _next_track_id, progress_cb=_group_cb,
+            )
+        elif method == METHOD_SERIALTRACK:
             _link_group_serialtrack(
                 group_rows, max_displacement_px, st_mode, st_n_neighbors,
                 _next_track_id,
@@ -272,6 +294,7 @@ def link_objects_with_params(
     rows: List[Dict[str, Any]],
     params: Dict[str, Any],
     pixel_size_um: Optional[float] = None,
+    label_masks: Optional[Dict[Tuple[str, int], "np.ndarray"]] = None,
     progress_cb: Optional[ProgressCB] = None,
 ) -> List[Dict[str, Any]]:
     """Run :func:`link_objects` from a "Track Objects" node param dict.
@@ -321,6 +344,8 @@ def link_objects_with_params(
         ct_topo_weight=float(params.get("ct_topo_weight", 0.3)),
         ct_area_weight=float(params.get("ct_area_weight", 0.3)),
         ct_max_gap=int(params.get("ct_max_gap", 3)),
+        ct_min_iou=float(params.get("ct_min_iou", 0.1)),
+        label_masks=label_masks,
         progress_cb=progress_cb,
     )
 
@@ -617,6 +642,85 @@ def _link_group_celltracker(
 
     # Remap local (per-call) track ids to the shared global counter, skipping the
     # -1 "unassigned" sentinel, then write onto the originating rows.
+    local_to_global: Dict[int, int] = {}
+    for rec in tracked.itertuples(index=False):
+        local = int(getattr(rec, "track_id"))
+        if local < 0:
+            continue
+        if local not in local_to_global:
+            local_to_global[local] = next_id[0]
+            next_id[0] += 1
+        row = row_by_key.get((int(rec.frame), int(rec.label)))
+        if row is not None:
+            row["track_id"] = local_to_global[local]
+
+
+def _link_group_overlap(
+    group_rows: List[Dict[str, Any]],
+    group_key: Tuple[str, int],
+    max_displacement_px: float,
+    ct_min_iou: float,
+    ct_max_gap: int,
+    label_masks: Optional[Dict[Tuple[str, int], Any]],
+    next_id: List[int],
+    progress_cb: Optional[ProgressCB] = None,
+) -> None:
+    """Link one (channel, m_position) group by StarDist mask overlap (IoU).
+
+    Bridges ND2Studios' row-dicts to CellTracker's DataFrame convention (as
+    ``_link_group_celltracker``), then runs ``track_overlap`` on this group's
+    ``(T, H, W)`` label image, looked up from ``label_masks[group_key]``. When
+    the masks are unavailable the linker falls back to the fingerprint linker
+    (position + area + birth/death) so the method still yields tracks rather than
+    erroring. Local (per-call) ids are remapped onto the shared ``next_id``
+    counter so ids never collide across groups.
+
+    pandas / CellTracker are imported lazily so a missing optional dependency
+    surfaces only for this method and is caught by the node handlers.
+    """
+    import pandas as pd
+
+    from nd2studios.backend.celltracker.tracking import (
+        track_fingerprint, track_overlap,
+    )
+
+    records: List[Dict[str, Any]] = []
+    row_by_key: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for r in group_rows:
+        fr = int(r.get("frame", 0))
+        lbl = int(r.get("label_id", 0))
+        records.append({
+            "frame": fr, "label": lbl,
+            "centroid_y": _cy(r), "centroid_x": _cx(r), "area": _area(r),
+        })
+        row_by_key[(fr, lbl)] = r
+
+    df = pd.DataFrame(records)
+    if df.empty or df["frame"].nunique() < 2:
+        return
+
+    masks = None
+    if label_masks:
+        masks = label_masks.get(group_key)
+        if masks is None and len(label_masks) == 1:
+            # Single-group run keyed slightly differently — use the only masks.
+            masks = next(iter(label_masks.values()))
+
+    if masks is None:
+        log.warning(
+            "CT overlap: no label masks for group %r — falling back to the "
+            "Spatial Fingerprint linker.", group_key,
+        )
+        tracked = track_fingerprint(
+            df, max_dist=float(max_displacement_px), area_weight=0.3,
+            max_gap=max(0, int(ct_max_gap)), progress_cb=progress_cb,
+        )
+    else:
+        tracked = track_overlap(
+            df, np.asarray(masks), min_iou=float(ct_min_iou),
+            max_gap=max(1, int(ct_max_gap)), progress_cb=progress_cb,
+        )
+
     local_to_global: Dict[int, int] = {}
     for rec in tracked.itertuples(index=False):
         local = int(getattr(rec, "track_id"))

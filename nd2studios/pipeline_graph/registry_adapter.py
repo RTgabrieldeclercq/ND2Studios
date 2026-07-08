@@ -54,6 +54,33 @@ SPECIAL_CT_FIELDS_OP_KEY = "special:ct_fields"
 # column at object centroids (with an optional per-track temporal fill) onto a grid.
 # Categorised under Results alongside the migrated CellTracker Spatial Field Maps.
 SPECIAL_INTERP_MAP_OP_KEY = "special:interp_map"
+# Digital Volume Correlation (V1.51) — ALDVC displacement/strain field between a
+# reference and a deformed timepoint of the wired channel. A Special node (like
+# Track Objects) with an IMAGE input so it gets a rainbow channel port; it runs
+# the DVC engine off-thread and opens the DVC viewer tab. Reads full (Z,H,W)
+# volumes for true 3D DVC (2D DIC when there is no Z).
+SPECIAL_DVC_OP_KEY = "special:dvc"
+# Image registration (V1.56) — align a (T,H,W) series onto a reference frame
+# (temporal drift correction, rigid/affine). Like DVC, a Special node with an
+# IMAGE input (rainbow channel wiring): the transform is estimated on the wired
+# reference channel and applied to all channels (register once, apply to all),
+# then results (before/after + drift plot) open in the Registration viewer tab.
+SPECIAL_REGISTER_OP_KEY = "special:register"
+# Checkpoint (V1.53) — a white pass-through node that freezes everything computed
+# upstream (analysis label masks, measurement rows, tracks) on a Run. A later Run
+# whose upstream graph is unchanged resumes *from* the checkpoint with the frozen
+# data restored, so the expensive upstream work (segmentation / tracking) never
+# re-runs — the user iterates on the downstream pipeline instantly. Ports are
+# wildcard (ANY) so it accepts any upstream and passes it through.
+SPECIAL_CHECKPOINT_OP_KEY = "special:checkpoint"
+# Channel source nodes (V1.48) — one per loaded channel + an "All" node, rendered
+# under the Input node. Each emits a CHANNEL payload wired (rainbow port) into a
+# process to say "run on this channel". ``channel:__all__`` emits every channel.
+CHANNEL_PREFIX = "channel:"
+CHANNEL_ALL_OP_KEY = "channel:__all__"
+# Port names for the rainbow channel-flow ports appended to process nodes.
+RAINBOW_IN_NAME = "ch_in"
+RAINBOW_OUT_NAME = "ch_out"
 
 
 @dataclass
@@ -104,6 +131,67 @@ def processing_output_spec() -> NodeSpec:
         input_types=[PortType.IMAGE],
         output_types=[],
     )
+
+
+# ── Channel source nodes (V1.48) ─────────────────────────────────────────────
+
+def channel_source_spec(channel_name: str) -> NodeSpec:
+    """A single-channel source node (rendered under the Input node).
+
+    Emits a ``CHANNEL`` payload; wiring it into a process's rainbow port means
+    that process (and everything downstream) runs on this channel.
+    """
+    return NodeSpec(
+        op_key=f"{CHANNEL_PREFIX}{channel_name}",
+        title=channel_name,
+        description=f"Channel '{channel_name}' — wire into a process's rainbow "
+                    "port to run that process on this channel.",
+        stage=Stage.PROCESSING,          # stage is cosmetic for channel nodes
+        role=NodeRole.ACTION,            # a source (no structural input)
+        input_types=[],
+        output_types=[PortType.CHANNEL],
+        category=NodeCategory.CHANNEL,
+        shape_kind=ShapeKind.PILL,
+        output_names=["channel"],
+    )
+
+
+def channel_all_spec() -> NodeSpec:
+    """The "All" channel source node — emits every loaded channel at once."""
+    return NodeSpec(
+        op_key=CHANNEL_ALL_OP_KEY,
+        title="All",
+        description="All channels — wire into a process's rainbow port to run "
+                    "that process on every channel.",
+        stage=Stage.PROCESSING,
+        role=NodeRole.ACTION,
+        input_types=[],
+        output_types=[PortType.CHANNEL],
+        category=NodeCategory.CHANNEL,
+        shape_kind=ShapeKind.PILL,
+        output_names=["channel"],
+    )
+
+
+def channel_name_for_op_key(op_key: str) -> str:
+    """``"channel:GFP"`` -> ``"GFP"``; ``"channel:__all__"`` -> ``""`` (all)."""
+    if op_key == CHANNEL_ALL_OP_KEY:
+        return ""
+    if op_key.startswith(CHANNEL_PREFIX):
+        return op_key[len(CHANNEL_PREFIX):]
+    return op_key
+
+
+def is_channel_source_op(op_key: str) -> bool:
+    return op_key.startswith(CHANNEL_PREFIX)
+
+
+def spec_takes_channels(op_key: str, role: NodeRole, input_types: List[PortType]) -> bool:
+    """True for a process node that operates on image channels (enhancement or
+    analysis) — the nodes that get rainbow channel-flow ports (V1.48)."""
+    return (role is NodeRole.ACTION
+            and not is_channel_source_op(op_key)
+            and PortType.IMAGE in list(input_types or []))
 
 
 def enhancement_specs() -> List[NodeSpec]:
@@ -330,6 +418,14 @@ _SPECIAL_OPS = [
      "Halt the run and drop the whole page back to editor mode so you can "
      "modify the downstream pipeline before continuing.",
      ShapeKind.HEXAGON, [PortType.ANY]),
+    (SPECIAL_CHECKPOINT_OP_KEY, "Checkpoint",
+     "Freeze everything computed upstream (segmentation / analysis masks, "
+     "measurements, tracks) when the run reaches this node. A later Run whose "
+     "upstream graph is unchanged resumes from here with the frozen data "
+     "restored — the expensive upstream work never re-runs, so you can iterate "
+     "on the downstream pipeline instantly. Edit anything upstream and the "
+     "checkpoint re-freezes automatically on the next full Run.",
+     ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.CHECKPOINT),
     (SPECIAL_CT_METRICS_OP_KEY, "Cell-Tracker Metrics",
      "Augment tracked objects with per-cell spatial metrics (neighbor distance, "
      "cell density, local divergence / curl), motion (speed + velocity_x/y) and "
@@ -350,6 +446,29 @@ _SPECIAL_OPS = [
      "object centroids onto a grid. Carries saved spatial-map template(s) that "
      "auto-load when the node runs.",
      ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.RESULTS),
+    # 7th element overrides the input port type: DVC takes an IMAGE (rainbow
+    # channel wiring), unlike the other specials which pass ANY through.
+    (SPECIAL_DVC_OP_KEY, "DVC (ALDVC)",
+     "Augmented-Lagrangian Digital Volume Correlation: measure the dense "
+     "displacement + strain field between a reference and a deformed timepoint "
+     "of the wired channel. Reads full Z-volumes for true 3D DVC (2D DIC when "
+     "there is no Z). Set the reference / deformed frames + subset size in the "
+     "node settings; results open in the DVC viewer tab.",
+     ShapeKind.HEXAGON, [], NodeCategory.SPECIAL, [PortType.IMAGE]),
+    # Registration (V1.56) — like DVC, takes an IMAGE (rainbow channel wiring):
+    # estimate the drift/rigid transform on the wired reference channel, apply to
+    # all channels. Unlike DVC (a terminal viewer), registration is a *transform*
+    # in the pipeline: it emits an ANY output so it wires UPSTREAM of analysis /
+    # tracking, and its correction is applied to every channel that downstream
+    # nodes read (so analyses run on drift-free images).
+    (SPECIAL_REGISTER_OP_KEY, "Registration",
+     "Align a (T,H,W) series onto a reference frame (temporal drift correction; "
+     "translation / rigid / affine). The transform is estimated on the wired "
+     "reference channel and applied to every channel (register once, apply to all) "
+     "so colocalization is preserved. Wire it upstream of analysis / tracking nodes "
+     "— they then run on the drift-corrected image. Results (before/after + a "
+     "drift-vs-time plot) open in the Registration viewer tab.",
+     ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.SPECIAL, [PortType.IMAGE]),
 ]
 
 
@@ -360,6 +479,7 @@ def special_specs() -> List[NodeSpec]:
     for entry in _SPECIAL_OPS:
         op_key, title, desc, shape, out_types = entry[:5]
         category = entry[5] if len(entry) > 5 else NodeCategory.SPECIAL
+        in_types = entry[6] if len(entry) > 6 else [PortType.ANY]
         specs.append(
             NodeSpec(
                 op_key=op_key,
@@ -367,7 +487,7 @@ def special_specs() -> List[NodeSpec]:
                 description=desc,
                 stage=Stage.RESULTS,
                 role=NodeRole.ACTION,
-                input_types=[PortType.ANY],
+                input_types=in_types,
                 output_types=out_types,
                 category=category,
                 shape_kind=shape,
@@ -406,7 +526,12 @@ def param_specs_for(op_key: str) -> List[ParamSpec]:
     if op_key.startswith(ANALYSIS_PREFIX):
         pcls = AnalysisPipeline.get_pipeline(analysis_pipeline_name_for_op_key(op_key))
         if pcls is not None:
-            return pcls().get_params()
+            # V1.48: the segmentation / counterstain channel is chosen by wiring a
+            # channel node into the process's rainbow port, not by a param — so
+            # hide those selectors from the node popup. The pipeline's run() still
+            # reads params["channel_name"]; the page injects it per wired channel.
+            return [s for s in pcls().get_params()
+                    if s.name not in ("channel_name", "counterstain_channel")]
     if op_key.startswith(RESULTS_PREFIX):
         # Results ops aren't plugin-backed; their only knob is which committed
         # analysis result to operate on. Choices are injected at pop-up time.
@@ -449,6 +574,119 @@ def param_specs_for(op_key: str) -> List[ParamSpec]:
                         "routes each object-frame independently.",
             ),
         ]
+    if op_key == SPECIAL_CHECKPOINT_OP_KEY:
+        # Checkpoint (V1.53): the only knob is whether the frozen data is kept in
+        # session RAM (default) or also persisted to a companion cache on pipeline
+        # save so it survives restarts. A per-node choice: disk persistence
+        # materializes every per-M label mask, which can be large, so it's opt-in.
+        return [
+            ParamSpec(
+                name="persist_to_disk", label="Persist frozen data to disk",
+                param_type="bool", default=False,
+                tooltip="Off: the frozen data lives only in this session's memory "
+                        "(fastest, no disk writes). On: saving the pipeline also "
+                        "writes this checkpoint's masks / rows / tracks to a "
+                        "companion '<pipeline>.checkpoints/' cache, so a later "
+                        "session can resume from it without re-running the upstream "
+                        "work. Persisting materializes every per-multipoint label "
+                        "mask, which can be large.",
+            ),
+        ]
+    if op_key == SPECIAL_DVC_OP_KEY:
+        # DVC node params: how to walk the timelapse (tracking mode + reference),
+        # multipoint scope, Z-range / XY-downsample for huge stacks, + the ALDVC
+        # engine knobs from ALDVCMethod.get_params() (the single source of truth).
+        # The channel is chosen by wiring a channel pill into the rainbow port
+        # (like analysis nodes), not by a param. DVC computes a field for **every**
+        # frame (a playable series in the DVC tab), so there is no single
+        # "deformed frame" — the deformed frames are all frames.
+        from nd2studios.backend.dvc.method import ALDVCMethod
+        specs = [
+            ParamSpec(
+                name="tracking_mode", label="Tracking mode", param_type="choice",
+                default="cumulative", choices=["cumulative", "incremental"],
+                tooltip="How ALDVC walks the timelapse. 'Cumulative' correlates "
+                        "the fixed reference frame against every frame (total "
+                        "deformation from reference). 'Incremental' correlates each "
+                        "frame against the previous one (frame-to-frame change) — "
+                        "more robust for large accumulating motion.",
+            ),
+            ParamSpec(
+                name="ref_frame", label="Reference frame (T)", param_type="int",
+                default=0, min_val=0, max_val=100000, step=1,
+                visible_when={"tracking_mode": "cumulative"},
+                tooltip="The fixed undeformed reference timepoint (cumulative mode).",
+            ),
+            ParamSpec(
+                name="all_multipoints", label="All multipoints", param_type="bool",
+                default=False,
+                tooltip="Run the DVC series for every multipoint (switch between "
+                        "them in the DVC tab). Off = only the currently viewed M.",
+            ),
+            ParamSpec(
+                name="z_start", label="Z start", param_type="int",
+                default=0, min_val=0, max_val=100000, step=1,
+                tooltip="First Z-slice (0-based) of the sub-volume to correlate "
+                        "(3D only). Limit Z to keep a deep stack tractable.",
+            ),
+            ParamSpec(
+                name="z_end", label="Z end (0 = all)", param_type="int",
+                default=0, min_val=0, max_val=100000, step=1,
+                tooltip="Last Z-slice, exclusive (3D only). 0 = to the end.",
+            ),
+            ParamSpec(
+                name="downsample", label="XY downsample", param_type="int",
+                default=1, min_val=1, max_val=16, step=1,
+                tooltip="Block-average the volume by this factor in X and Y before "
+                        "correlating — essential to make large (e.g. 4k²) stacks "
+                        "tractable. Displacements are reported in physical units "
+                        "(the voxel size is scaled accordingly).",
+            ),
+        ]
+        specs.extend(ALDVCMethod().get_params())
+        return specs
+    if op_key == SPECIAL_REGISTER_OP_KEY:
+        # Registration node params: multipoint scope + apply-to-all toggle, then
+        # the RigidRegistration engine knobs (model / reference / upsample / …),
+        # which are the single source of truth. The reference channel is chosen by
+        # wiring a channel pill into the rainbow port (like analysis/DVC nodes).
+        from nd2studios.backend.registration.method import RigidRegistration
+        specs = [
+            ParamSpec(
+                name="apply_to_all_channels", label="Apply to all channels",
+                param_type="bool", default=True,
+                tooltip="Estimate the transform on the wired reference channel and "
+                        "apply the SAME transform to every channel (preserves "
+                        "colocalization). Off = only the wired channel(s).",
+            ),
+            ParamSpec(
+                name="all_multipoints", label="All multipoints", param_type="bool",
+                default=False,
+                tooltip="Register every multipoint (switch between them in the "
+                        "Registration tab). Off = only the currently viewed M.",
+            ),
+            ParamSpec(
+                name="crop_to_common", label="Crop to common region",
+                param_type="bool", default=False,
+                visible_when={"model": "translation"},
+                tooltip="After registration, crop every frame (all multipoints) to "
+                        "the largest rectangle that is real (non-padded) data in ALL "
+                        "registered frames — so frames are equal-size, recentred, and "
+                        "free of the black drift borders. Applies everywhere "
+                        "downstream (analysis / viewer / export). Translation only.",
+            ),
+        ]
+        specs.extend(RigidRegistration().get_params())
+        # ROI (V1.60): estimate the transform on a chosen sub-region (a static
+        # landmark), apply it full-frame — locks onto a stable structure when
+        # moving cells / artifacts would corrupt whole-frame correlation. Captured
+        # via the popup's "Pick ROI…" button (draws on the viewer); stored as a
+        # serializable spec. Hidden so it survives the popup's full-params rewrite.
+        specs.append(
+            ParamSpec(name="roi", label="ROI", param_type="hidden", default=None,
+                      tooltip="Region the transform is estimated on (whole frame if "
+                              "unset). Set it with 'Pick ROI…'."))
+        return specs
     if op_key == SPECIAL_REVIEW_OP_KEY:
         return [
             ParamSpec(
@@ -469,7 +707,8 @@ def param_specs_for(op_key: str) -> List[ParamSpec]:
         # backend stay in sync.
         from nd2studios.backend.object_tracker import (
             METHOD_CENTROID, METHOD_SERIALTRACK,
-            METHOD_CT_TOPOLOGY, METHOD_CT_FINGERPRINT, TRACKING_METHODS,
+            METHOD_CT_TOPOLOGY, METHOD_CT_FINGERPRINT, METHOD_CT_OVERLAP,
+            TRACKING_METHODS,
         )
         return [
             ParamSpec(
@@ -483,7 +722,10 @@ def param_specs_for(op_key: str) -> List[ParamSpec]:
                         "'Cell-Tracker: Topology' blends a rotation-invariant "
                         "neighbor descriptor with distance; 'Cell-Tracker: Spatial "
                         "Fingerprint' combines position + area and fills short "
-                        "detection gaps.",
+                        "detection gaps. 'Cell-Tracker: Mask Overlap (IoU)' links "
+                        "by how much each object's segmentation mask overlaps the "
+                        "next frame — the most robust choice for dense, "
+                        "slowly-moving nuclei (recommended for StarDist masks).",
             ),
             ParamSpec(
                 name="max_distance", label="Max distance", param_type="float",
@@ -638,9 +880,21 @@ def param_specs_for(op_key: str) -> List[ParamSpec]:
             ParamSpec(
                 name="ct_max_gap", label="Max frame gap", param_type="int",
                 default=3, min_val=0, max_val=1000, step=1,
-                visible_when={"method": METHOD_CT_FINGERPRINT},
+                visible_when={"method": [METHOD_CT_FINGERPRINT, METHOD_CT_OVERLAP]},
                 tooltip="Frames a track may vanish (missed detection) and still "
-                        "re-link afterwards in the fingerprint linker.",
+                        "re-link afterwards (fingerprint and mask-overlap linkers). "
+                        "For overlap this keeps the last mask as the target while "
+                        "a detection is briefly missing.",
+            ),
+            ParamSpec(
+                name="ct_min_iou", label="Min overlap (IoU)", param_type="float",
+                default=0.1, min_val=0.0, max_val=1.0, step=0.05,
+                visible_when={"method": METHOD_CT_OVERLAP},
+                tooltip="Minimum mask intersection-over-union (0–1) to link an "
+                        "object to the next frame. Objects overlapping less than "
+                        "this start a new track instead of being force-linked. "
+                        "Lower it (e.g. 0.05) if masks jitter or the field drifts; "
+                        "run drift correction first for large frame-to-frame shifts.",
             ),
         ]
     if op_key == SPECIAL_CT_METRICS_OP_KEY:
@@ -760,6 +1014,15 @@ def build_node(
              type=t, is_input=False)
         for i, t in enumerate(spec.output_types)
     ]
+    # V1.48: process nodes (enhancement / analysis) get rainbow channel-flow
+    # ports — one free CHANNEL input (more spawn as channels are wired) on the
+    # left edge, and a CHANNEL output on the right that re-emits the node's
+    # channel set so channels can be threaded on downstream ("both sides").
+    if spec_takes_channels(spec.op_key, spec.role, spec.input_types):
+        inputs.append(Port(id=new_id("p"), name=RAINBOW_IN_NAME,
+                           type=PortType.CHANNEL, is_input=True))
+        outputs.append(Port(id=new_id("p"), name=RAINBOW_OUT_NAME,
+                            type=PortType.CHANNEL, is_input=False))
     return Node(
         id=new_id("node"),
         stage=spec.stage,

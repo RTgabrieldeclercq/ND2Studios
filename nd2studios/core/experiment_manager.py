@@ -47,6 +47,13 @@ class ND2StudiosRecord:
     # exported separately as a portable .nd2s_recipe.json.
     recipe: List[Tuple[str, Dict[str, Any]]] = field(default_factory=list)
     recipe_normalized: bool = False
+    # V1.48: per-channel recipes from the channel-wire Processing graph
+    # ({channel_name: recipe}). When set, ``processed_view`` / the base-image
+    # volume apply each channel's own recipe and leave unwired channels raw.
+    # None ⇒ legacy single ``recipe`` applies to every channel. In-session only
+    # (recomputed from the graph — not serialized).
+    recipe_by_channel: Optional[Dict[str, List[Tuple[str, Dict[str, Any]]]]] = field(
+        default=None, repr=False)
 
     # ND2 metadata snapshot (serializable subset of ND2Metadata)
     nd2_metadata: Dict[str, Any] = field(default_factory=dict)

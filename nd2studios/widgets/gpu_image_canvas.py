@@ -161,14 +161,20 @@ class _ToolOverlayItem(QGraphicsItem):
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         c = self._canvas
-        # Crop selection (yellow dashed).
+        # Crop selection — high-visibility: dark halo under a bright magenta
+        # dashed line so it reads over any image content.
         if c._crop_drag_start is not None and c._crop_drag_end is not None:
             (sy, sx), (ey, ex) = c._crop_drag_start, c._crop_drag_end
             rect = QRectF(min(sx, ex), min(sy, ey), abs(ex - sx), abs(ey - sy))
-            pen = QPen(QColor(255, 220, 0), 0.0, Qt.PenStyle.DashLine)
+            halo = QPen(QColor(0, 0, 0, 200), 4.0, Qt.PenStyle.SolidLine)
+            halo.setCosmetic(True)
+            painter.setPen(halo)
+            painter.setBrush(QBrush(QColor(255, 45, 100, 55)))
+            painter.drawRect(rect)
+            pen = QPen(QColor(255, 45, 100), 2.0, Qt.PenStyle.DashLine)
             pen.setCosmetic(True)
             painter.setPen(pen)
-            painter.setBrush(QBrush(QColor(255, 220, 0, 40)))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect)
 
         # In-progress draw preview (cyan dashed).

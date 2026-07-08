@@ -23,6 +23,7 @@ from enum import IntEnum
 import numpy as np
 from scipy.spatial import cKDTree, QhullError
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator, RBFInterpolator
+from scipy.ndimage import gaussian_filter
 from scipy.sparse import eye as speye, diags as spdiags, kron as spkron, csc_matrix
 from scipy.sparse.linalg import spsolve
 import logging
@@ -160,6 +161,92 @@ def scatter_to_grid_multi(
     for d in range(ndim):
         grids, fg = scatter_to_grid(
             coords, disp[:, d], grid_step, smoothness, grids
+        )
+        components.append(fg)
+    return grids, np.array(components)  # shape (D, *grid_shape)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Bounded scatter → Grid  (Cell-Tracker model, no extrapolation)
+#  Mirrors CellTracker/backend/fields.py: linear inside the convex
+#  hull, ZERO outside it, then an optional Gaussian blur.  Used for
+#  the PTV / post-processing field products, where the grid IS the
+#  output and is evaluated everywhere — including the empty corners
+#  and gaps that the RBF thin-plate-spline path blows up on.
+# ═══════════════════════════════════════════════════════════════
+
+def scatter_to_grid_bounded(
+    coords: np.ndarray,
+    values: np.ndarray,
+    grid_step: np.ndarray,
+    smoothing_sigma: float = 0.0,
+    grid_coords: Optional[Tuple[np.ndarray, ...]] = None,
+) -> Tuple[Tuple[np.ndarray, ...], np.ndarray]:
+    """Interpolate scattered data onto a grid **without extrapolating**.
+
+    This is the original Cell-Tracker approach (``CellTracker/backend/fields.py``):
+    piecewise-linear interpolation inside the convex hull of the points, filled
+    with ``0`` outside it (``griddata`` / ``LinearNDInterpolator`` return NaN
+    there), followed by an optional Gaussian blur of ``smoothing_sigma`` grid
+    cells.  Unlike :func:`scatter_to_grid`'s ``thin_plate_spline`` RBF branch,
+    the output can never exceed the range of ``values`` — so it does not blow up
+    in the empty corners / inter-cluster gaps of the bounding-box grid.
+
+    Parameters
+    ----------
+    coords : (N, D) — scattered point positions
+    values : (N,)   — scalar field values at those points
+    grid_step : (D,) — grid spacing per dimension
+    smoothing_sigma : float — Gaussian blur sigma in *grid cells* (0 = none)
+    grid_coords : optional pre-built meshgrid arrays
+    """
+    ndim = coords.shape[1]
+    gs = np.asarray(grid_step, dtype=np.float64)
+
+    if grid_coords is not None:
+        grids = grid_coords
+    else:
+        axes = []
+        for d in range(ndim):
+            lo, hi = coords[:, d].min(), coords[:, d].max()
+            axes.append(np.arange(lo, hi + gs[d], gs[d]))
+        grids = tuple(np.meshgrid(*axes, indexing="ij"))
+
+    query_pts = np.column_stack([g.ravel() for g in grids])
+
+    if len(coords) < ndim + 1:
+        log.warning("scatter_to_grid_bounded: only %d points (need %d) — returning zeros",
+                     len(coords), ndim + 1)
+        return grids, np.zeros(grids[0].shape, dtype=np.float64)
+
+    # Linear interpolation inside the hull; 0 outside it (fill_value=0.0 in
+    # _linear_or_nearest_interpolate). No extrapolation, ever.
+    f_grid = _linear_or_nearest_interpolate(coords, values, query_pts).reshape(
+        grids[0].shape)
+
+    if smoothing_sigma and smoothing_sigma > 0:
+        f_grid = gaussian_filter(f_grid, sigma=float(smoothing_sigma))
+    return grids, f_grid
+
+
+def scatter_to_grid_multi_bounded(
+    coords: np.ndarray,
+    disp: np.ndarray,
+    grid_step: np.ndarray,
+    smoothing_sigma: float = 0.0,
+    grid_coords: Optional[Tuple[np.ndarray, ...]] = None,
+) -> Tuple[Tuple[np.ndarray, ...], np.ndarray]:
+    """Multi-component :func:`scatter_to_grid_bounded` (Cell-Tracker model).
+
+    Returns ``(grids, disp_grid)`` with ``disp_grid`` of shape
+    ``(D, *grid_shape)`` — bounded, never extrapolated.
+    """
+    ndim = coords.shape[1]
+    grids = grid_coords
+    components = []
+    for d in range(ndim):
+        grids, fg = scatter_to_grid_bounded(
+            coords, disp[:, d], grid_step, smoothing_sigma, grids
         )
         components.append(fg)
     return grids, np.array(components)  # shape (D, *grid_shape)

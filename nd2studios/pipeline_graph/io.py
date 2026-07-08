@@ -19,8 +19,10 @@ from nd2studios.pipeline_graph.registry_adapter import (
 
 # V2 (V1.45 merge): Analysis + Results share one slice; results action nodes now
 # live in the analysis slice. V3 (V1.45): the "Validate Tracked Objects" special
-# node became the "Track Objects" linker. Older docs are migrated on load.
-PIPELINE_VERSION = 3
+# node became the "Track Objects" linker. V4 (V1.49): edges gained a ``kind``
+# ("structural"/"loop") + ``params`` for loop connectors; older edges default to
+# structural on load (no data migration needed). Older docs are migrated on load.
+PIPELINE_VERSION = 4
 PIPELINE_KIND = "nd2studios.pipeline"
 PIPELINE_EXTENSION = ".nd2s_pipeline.json"
 

@@ -278,10 +278,38 @@ def _eval_count_change(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> bool:
     return _cmp(float(delta), op, val)
 
 
-def _eval_track_displacement(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> bool:
-    how = str(p.get("aggregate", "mean"))
-    op = str(p.get("comparator", ">"))
+def _eval_nondup_object_count(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> bool:
+    """Object count after de-duplication (V1.49 loop stop condition).
+
+    The loop applies its overlap de-dup to ``rows`` *before* calling the
+    evaluator, so here this is simply a total-count comparison — expressing
+    "iterate until ≥ N non-duplicate objects are found"."""
+    op = str(p.get("comparator", ">="))
     val = _num(p.get("value", 0.0)) or 0.0
+    return _cmp(float(len(rows or [])), op, val)
+
+
+def _eval_tracking_coverage(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> bool:
+    """Tracking coverage (V1.49): ratio ≥ X% over ≥ K continuous frames.
+
+    Backed by :func:`loop.tracking_ratio`. ``n_frames`` (0 = infer from the data)
+    is the denominator (e.g. 33). Passes when the fraction of frames containing a
+    tracked object is ≥ ``ratio``% **and** the longest run of consecutive tracked
+    frames is ≥ ``min_continuous_frames``."""
+    from nd2studios.pipeline_graph.loop import tracking_ratio
+    ratio_pct = _num(p.get("ratio", 90.0)) or 0.0
+    min_run = int(_num(p.get("min_continuous_frames", 20)) or 0)
+    n_frames = int(_num(p.get("n_frames", 0)) or 0)
+    ratio, longest = tracking_ratio(rows or [], n_frames)
+    return (ratio * 100.0) >= ratio_pct and longest >= min_run
+
+
+def _track_points(rows: List[Dict[str, Any]]) -> Dict[Any, List]:
+    """Group ``rows`` by ``track_id`` into frame-ordered ``(frame, x, y, row)``
+    point lists. Positions use ``centroid_*_um`` (falling back to ``centroid_*_px``
+    per row) so displacements are physical when µm centroids are present. Rows
+    without a track id or usable centroid are skipped. Each list is sorted by
+    frame so consecutive entries are frame-to-frame steps."""
     tracks: Dict[Any, List] = {}
     for r in rows:
         tid = r.get("track_id")
@@ -293,19 +321,110 @@ def _eval_track_displacement(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> b
             y, x = _num(r.get("centroid_y_px")), _num(r.get("centroid_x_px"))
         if y is None or x is None:
             continue
-        tracks.setdefault(tid, []).append((int(r.get("frame", 0) or 0), x, y))
-    disps: List[float] = []
+        tracks.setdefault(tid, []).append((int(r.get("frame", 0) or 0), x, y, r))
     for pts in tracks.values():
-        if len(pts) < 2:
-            continue
-        pts.sort()
-        _, x0, y0 = pts[0]
-        _, x1, y1 = pts[-1]
-        disps.append(((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5)
+        pts.sort(key=lambda t: t[0])
+    return tracks
+
+
+def _basis_kind(p: Dict[str, Any]) -> str:
+    """Normalize the ``basis`` param to ``"net"`` / ``"cumulative"`` / ``"per_frame"``."""
+    b = str(p.get("basis", "net")).lower()
+    if "cumul" in b:
+        return "cumulative"
+    if "per-frame" in b or "per frame" in b or "step" in b:
+        return "per_frame"
+    return "net"
+
+
+def _reject_frame_only(p: Dict[str, Any]) -> bool:
+    """True when the block should drop only the outlier frame (not the object)."""
+    return "frame" in str(p.get("outlier", "")).lower()
+
+
+def _step(a: List, b: List) -> float:
+    """Euclidean distance between two ``(frame, x, y, row)`` points."""
+    return ((b[1] - a[1]) ** 2 + (b[2] - a[2]) ** 2) ** 0.5
+
+
+def _track_metric_value(pts: List, basis: str) -> Optional[float]:
+    """Per-track scalar displacement by ``basis`` (needs ≥ 2 points).
+
+    * ``"net"`` — straight-line distance first → last.
+    * ``"cumulative"`` — total path length = Σ frame-to-frame steps.
+    * ``"per_frame"`` — the largest single frame-to-frame step (so ``max > value``
+      is exactly "any step > value").
+    """
+    if len(pts) < 2:
+        return None
+    if basis == "net":
+        return _step(pts[0], pts[-1])
+    steps = [_step(pts[i - 1], pts[i]) for i in range(1, len(pts))]
+    if not steps:
+        return None
+    return sum(steps) if basis == "cumulative" else max(steps)
+
+
+def _eval_track_displacement(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> bool:
+    how = str(p.get("aggregate", "mean"))
+    op = str(p.get("comparator", ">"))
+    val = _num(p.get("value", 0.0)) or 0.0
+    basis = _basis_kind(p)
+    disps = [v for v in
+             (_track_metric_value(pts, basis) for pts in _track_points(rows).values())
+             if v is not None]
     if not disps:
         return False
     agg = _aggregate(disps, how if how in ("mean", "median", "min", "max") else "mean")
     return agg is not None and _cmp(agg, op, val)
+
+
+def _outlier_frame_row_ids(p: Dict[str, Any], rows: List[Dict[str, Any]]) -> set:
+    """``id()`` of each outlier frame row for a per-frame "reject frame only" block.
+
+    Each frame's step is measured from the last **retained** frame (not the raw
+    previous frame), so a single spike — a point that jumps out and back, where
+    both the out- and return-steps exceed the threshold — is healed by dropping
+    only the spike apex: after the apex is rejected the return frame is a normal
+    step from the pre-spike position and is kept. A frame whose step from the last
+    kept position satisfies the block comparator vs ``value`` is the outlier."""
+    op = str(p.get("comparator", ">"))
+    val = _num(p.get("value", 0.0)) or 0.0
+    out: set = set()
+    for pts in _track_points(rows).values():
+        if len(pts) < 2:
+            continue
+        last_kept = pts[0]
+        for i in range(1, len(pts)):
+            if _cmp(_step(last_kept, pts[i]), op, val):
+                out.add(id(pts[i][3]))   # outlier — drop, keep last_kept as anchor
+            else:
+                last_kept = pts[i]
+    return out
+
+
+def scrub_outlier_frames(cond: Condition,
+                         rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove outlier frame rows requested by per-frame "reject frame only" blocks.
+
+    For every ``track_displacement`` block with ``basis = Per-frame step`` and
+    ``outlier = Reject frame only``, the frame rows whose incoming step exceeds the
+    threshold are dropped, so the outlier frame is removed while the track survives
+    on its remaining (in-range) frames. Rows are compared by identity, so callers
+    keep the same row objects. Returns ``rows`` unchanged if nothing matched.
+
+    This is inherently object-lens cleaning; see :func:`partition_rows`."""
+    rows = rows or []
+    drop_ids: set = set()
+    for blk in cond.blocks:
+        if blk.kind != "track_displacement":
+            continue
+        if _basis_kind(blk.params) != "per_frame" or not _reject_frame_only(blk.params):
+            continue
+        drop_ids |= _outlier_frame_row_ids(blk.params, rows)
+    if not drop_ids:
+        return list(rows)
+    return [r for r in rows if id(r) not in drop_ids]
 
 
 # ── block catalog (UI schema + evaluator) ─────────────────────────────────────
@@ -462,18 +581,48 @@ BLOCK_KINDS: Dict[str, Dict[str, Any]] = {
             _p("value", "Value", "float", 0.0),
         ],
     },
+    "nondup_object_count": {
+        "family": "Object population",
+        "label": "Non-duplicate object count (loop)",
+        "eval": _eval_nondup_object_count,
+        "summary": lambda p: (
+            f"non-duplicate objects {p.get('comparator','>=')} {p.get('value',0)}"),
+        "params": [
+            _p("comparator", "Is", "choice", ">=", CMP),
+            _p("value", "Value", "float", 0.0),
+        ],
+    },
+    "tracking_coverage": {
+        "family": "Timelapse / tracking",
+        "label": "Tracking coverage (loop)",
+        "eval": _eval_tracking_coverage,
+        "summary": lambda p: (
+            f"tracked ≥ {p.get('ratio',90)}% over ≥ "
+            f"{p.get('min_continuous_frames',20)} continuous frames"),
+        "params": [
+            _p("ratio", "Coverage %", "float", 90.0),
+            _p("min_continuous_frames", "Min continuous frames", "int", 20),
+            _p("n_frames", "Total frames (0 = auto)", "int", 0),
+        ],
+    },
     "track_displacement": {
         "family": "Timelapse / tracking",
         "label": "Track displacement / motility",
         "eval": _eval_track_displacement,
         "summary": lambda p: (
-            f"{p.get('aggregate','mean')} track displacement "
-            f"{p.get('comparator','>')} {p.get('value',0)}"),
+            f"{p.get('aggregate','mean')} {_basis_kind(p).replace('_', '-')} track "
+            f"displacement {p.get('comparator','>')} {p.get('value',0)}"
+            + (" (drop outlier frame)"
+               if _basis_kind(p) == "per_frame" and _reject_frame_only(p) else "")),
         "params": [
+            _p("basis", "Measure", "choice", "Net (first→last)",
+               ["Net (first→last)", "Cumulative path", "Per-frame step"]),
             _p("aggregate", "Across tracks", "choice", "mean",
                ["mean", "median", "min", "max"]),
             _p("comparator", "Is", "choice", ">", CMP),
             _p("value", "Value (um)", "float", 0.0),
+            _p("outlier", "Per-frame exceed", "choice", "Reject object",
+               ["Reject object", "Reject frame only"]),
         ],
     },
 }
@@ -575,10 +724,15 @@ def partition_rows(
     metric block's ``any`` / ``all`` / ``mean`` aggregate naturally means "across
     the cell's frames" (e.g. ``any speed_um > 20`` flags the whole track). With no
     blocks every row passes. Order within each branch is preserved.
+
+    Before routing, per-frame "reject frame only" outlier frames are scrubbed via
+    :func:`scrub_outlier_frames`, so those rows land in **neither** branch (the
+    outlier frame is dropped while its track survives on its remaining frames).
     """
     rows = rows or []
     if not cond.blocks:
         return list(rows), []
+    rows = scrub_outlier_frames(cond, rows)
     pass_rows: List[Dict[str, Any]] = []
     fail_rows: List[Dict[str, Any]] = []
     for group in _partition_groups(rows, group_by):

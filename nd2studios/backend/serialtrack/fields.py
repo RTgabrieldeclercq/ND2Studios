@@ -25,7 +25,7 @@ from scipy.spatial import cKDTree
 from dataclasses import dataclass, field as dc_field
 import logging
 
-from .regularization import scatter_to_grid_multi
+from .regularization import scatter_to_grid_multi, scatter_to_grid_multi_bounded
 
 log = logging.getLogger("serialtrack.fields")
 
@@ -253,12 +253,22 @@ def compute_gridded_strain(
     Replaces the postprocessing sections of
     ``run_Serial_MPT_3D_hardpar_accum.m``.
 
+    Uses the **bounded** (Cell-Tracker) scatter-to-grid: linear interpolation
+    inside the convex hull of the tracked particles, zero outside it, then an
+    optional Gaussian blur. This is the field-*output* path (the grid is what we
+    plot), so it must never extrapolate — the RBF ``thin_plate_spline`` path used
+    by the tracking global-step solvers grows unbounded (``r²·log r``) in the
+    empty corners / inter-cluster gaps of the bounding-box grid, producing giant
+    field vectors from tiny per-particle displacements. ``smoothness`` is
+    therefore interpreted here as a **Gaussian smoothing sigma in grid cells**
+    (matching Cell-Tracker's ``sigma``), not an RBF regularisation weight.
+
     Returns both the gridded displacement field and strain field.
     """
     ndim = coords.shape[1]
     ps = np.ones(ndim) if pixel_steps is None else np.asarray(pixel_steps)
 
-    grids, disp_grid = scatter_to_grid_multi(
+    grids, disp_grid = scatter_to_grid_multi_bounded(
         coords, disp, grid_step, smoothness
     )
 
