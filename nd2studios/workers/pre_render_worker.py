@@ -93,6 +93,12 @@ class PreRenderWorker(QThread):
 
     def _render(self) -> None:
         volume = self._volume
+        # V1.66 — a streaming/lazy dataset has no in-RAM ``channels`` dict to
+        # pre-compose; skip the bulk RGB pre-render and let the viewer read
+        # (cached + prefetched) frames on demand instead.
+        if not isinstance(getattr(volume, "channels", None), dict):
+            self._emit_finished_once()
+            return
         n_m = volume.n_multipoints
         n_t = volume.n_timepoints
 

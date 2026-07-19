@@ -36,6 +36,7 @@ from nd2studios.backend.exporters.movie_exporter import (
     MovieOptions, _draw_overlays,
 )
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled
 from nd2studios.widgets.image_viewer import ImageCanvas, ZoomToolbar
 
 
@@ -50,7 +51,7 @@ class _LabeledSlider(QWidget):
         row.setSpacing(8)
 
         self.lbl = QLabel(title)
-        self.lbl.setMinimumWidth(80)
+        self.lbl.setMinimumWidth(scaled(80))
         row.addWidget(self.lbl)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
@@ -60,7 +61,7 @@ class _LabeledSlider(QWidget):
 
         self._suffix = suffix
         self.val = QLabel(self._format(default))
-        self.val.setMinimumWidth(48)
+        self.val.setMinimumWidth(scaled(48))
         self.val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.val.setStyleSheet(f"color: {Settings.FG_SECONDARY};")
         row.addWidget(self.val)
@@ -111,7 +112,7 @@ class ExportPreviewDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.resize(1000, 720)
+        self.resize(scaled(1000), scaled(720))
 
         self._channels = channels
         self._colors = colors
@@ -171,7 +172,7 @@ class ExportPreviewDialog(QDialog):
         t_row.setSpacing(6)
         self.btn_play = QPushButton("▶ Play")
         self.btn_play.setCheckable(True)
-        self.btn_play.setFixedWidth(78)
+        self.btn_play.setFixedWidth(scaled(78))
         self.btn_play.setEnabled(self._n_t > 1)
         self.btn_play.toggled.connect(self._on_play_toggled)
         t_row.addWidget(self.btn_play)
@@ -209,8 +210,8 @@ class ExportPreviewDialog(QDialog):
 
         # Right: adjustment sliders.
         right = QWidget()
-        right.setMinimumWidth(280)
-        right.setMaximumWidth(360)
+        right.setMinimumWidth(scaled(280))
+        right.setMaximumWidth(scaled(360))
         rl = QVBoxLayout(right)
         rl.setContentsMargins(4, 4, 4, 4)
         rl.setSpacing(8)
@@ -248,7 +249,7 @@ class ExportPreviewDialog(QDialog):
             "to the export."
         )
         info.setWordWrap(True)
-        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         rl.addWidget(info)
 
         split.addWidget(right)

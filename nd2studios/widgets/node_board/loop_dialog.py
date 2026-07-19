@@ -27,7 +27,7 @@ from nd2studios.pipeline_graph.loop import (
     RULE_BEST, RULE_KEEP_ALL, RULE_LAST, RULE_UNION_DEDUP,
     default_loop_config, expand_axis, iteration_plan,
 )
-from nd2studios.widgets.icon_button import scaled
+from nd2studios.widgets.icon_button import scaled, scale_qss
 from nd2studios.widgets.node_board.condition_builder_dialog import (
     ConditionBuilderDialog,
 )
@@ -60,10 +60,10 @@ class _AxisRow(QFrame):
         self._dialog = dialog
         self.setObjectName("loopAxisRow")
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setStyleSheet(
+        self.setStyleSheet(scale_qss(
             f"#loopAxisRow{{background:{Settings.BG_SECONDARY};"
             f"border:1px solid {Settings.BORDER_COLOR};border-radius:6px;}}"
-        )
+        ))
         row = QHBoxLayout(self)
         row.setContentsMargins(8, 6, 8, 6)
         row.setSpacing(6)
@@ -115,7 +115,7 @@ class _AxisRow(QFrame):
 
     def _lbl(self, text: str) -> QLabel:
         w = QLabel(text)
-        w.setStyleSheet(f"color:{Settings.FG_SECONDARY};font:8pt;")
+        w.setStyleSheet(scale_qss(f"color:{Settings.FG_SECONDARY};font:8pt;"))
         return w
 
     def _spin(self, value: Any) -> QDoubleSpinBox:
@@ -222,7 +222,7 @@ class LoopSettingsDialog(QDialog):
 
         if region_label:
             hdr = QLabel(f"Loop region: {region_label}")
-            hdr.setStyleSheet(f"color:{Settings.FG_SECONDARY};font:9pt;")
+            hdr.setStyleSheet(scale_qss(f"color:{Settings.FG_SECONDARY};font:9pt;"))
             outer.addWidget(hdr)
 
         # Iteration group
@@ -263,7 +263,7 @@ class LoopSettingsDialog(QDialog):
         add_bar.addWidget(self._add_axis_btn)
         add_bar.addStretch(1)
         self._count_lbl = QLabel("")
-        self._count_lbl.setStyleSheet(f"color:{Settings.ACCENT_GOLD};font:bold 9pt;")
+        self._count_lbl.setStyleSheet(scale_qss(f"color:{Settings.ACCENT_GOLD};font:bold 9pt;"))
         add_bar.addWidget(self._count_lbl)
         axes_v.addLayout(add_bar)
 
@@ -285,7 +285,7 @@ class LoopSettingsDialog(QDialog):
         stop_h = QHBoxLayout(self._stop_box)
         self._stop_readout = QLabel("")
         self._stop_readout.setWordWrap(True)
-        self._stop_readout.setStyleSheet(f"color:{Settings.FG_PRIMARY};font:9pt;")
+        self._stop_readout.setStyleSheet(scale_qss(f"color:{Settings.FG_PRIMARY};font:9pt;"))
         stop_h.addWidget(self._stop_readout, 1)
         self._edit_stop_btn = QPushButton("Edit condition…")
         self._edit_stop_btn.clicked.connect(self._edit_stop)

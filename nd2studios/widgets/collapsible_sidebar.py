@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled
 
 
 class CollapsibleSidebar(QFrame):
@@ -45,8 +46,8 @@ class CollapsibleSidebar(QFrame):
         self._anim_min: Optional[QPropertyAnimation] = None
         self._anim_max: Optional[QPropertyAnimation] = None
 
-        self.setMinimumWidth(self._expanded_width)
-        self.setMaximumWidth(self._expanded_width)
+        self.setMinimumWidth(scaled(self._expanded_width))
+        self.setMaximumWidth(scaled(self._expanded_width))
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -56,21 +57,21 @@ class CollapsibleSidebar(QFrame):
         # the toggle hugs the edge nearest the viewer (right edge for a left
         # panel, left edge for a right panel).
         top_bar = QFrame()
-        top_bar.setFixedHeight(28)
+        top_bar.setFixedHeight(scaled(28))
         tl = QHBoxLayout(top_bar)
         tl.setContentsMargins(8, 0, 4, 0)
         tl.setSpacing(4)
         self._title = QLabel(title)
-        self._title.setStyleSheet(
-            f"color: {Settings.ACCENT_PURPLE}; font: bold 9pt 'Helvetica Neue';")
+        self._title.setStyleSheet(scale_qss(
+            f"color: {Settings.ACCENT_PURPLE}; font: bold 9pt 'Helvetica Neue';"))
         self._toggle = QPushButton()
-        self._toggle.setFixedSize(20, 20)
+        self._toggle.setFixedSize(scaled(20), scaled(20))
         self._toggle.setToolTip("Collapse / expand this panel")
-        self._toggle.setStyleSheet(
+        self._toggle.setStyleSheet(scale_qss(
             "QPushButton { background: transparent; "
             f"color: {Settings.FG_SECONDARY}; border: none; padding: 0; font: 10pt; }}"
             "QPushButton:hover { color: " + Settings.FG_PRIMARY + "; }"
-        )
+        ))
         self._toggle.clicked.connect(self.toggle)
         if side == "left":
             tl.addWidget(self._title)
@@ -99,7 +100,7 @@ class CollapsibleSidebar(QFrame):
             return
         self._expanded = value
         start = self.width()
-        end = self._expanded_width if value else self.COLLAPSED_WIDTH
+        end = scaled(self._expanded_width if value else self.COLLAPSED_WIDTH)
         self._content.setVisible(value)
         self._title.setVisible(value)
 

@@ -63,6 +63,32 @@ class Settings:
     BUILD_PYRAMIDS = True
     PYRAMID_ENV_DISABLE = "ND2_DISABLE_PYRAMIDS"
 
+    # ── Streaming (overarching viewing setup, V1.66) ────────────────
+    # When True, every file opens via the on-demand StreamingDataset (memory-map
+    # / lazy reads + bounded cache + prefetch) for uniformly instant, smooth
+    # viewing. Eager full-RAM loading is opt-in via FORCED_LOAD_STRATEGY
+    # ("eager_full") for workflows that want zero per-frame latency on a small
+    # resident file.
+    STREAM_ALWAYS = True
+
+    # ── Deep-Z display preview (V1.66) ──────────────────────────────
+    # For a streamed deep Z-stack, the viewer projects a bounded number of
+    # evenly-spaced Z planes for a faster (approximate) DISPLAY frame; the
+    # recipe / export / DVC paths always read the exact full projection.
+    # 0 = OFF (exact display). Default 32 keeps deep-stack scrubbing smooth
+    # while data stays exact; set 0 for exact display of very deep projections.
+    DISPLAY_PREVIEW_Z_PLANES = 32
+
+    # ── 3-D viewer render bounds (V1.66) ────────────────────────────
+    # The PyVista volume renderer NEVER hands VTK a full-resolution deep stack
+    # (that exhausts GPU/host memory and crashes). It downsamples to a GPU-safe
+    # size: XY strided so the larger spatial axis is <= VIEW3D_XY_MAX, Z
+    # subsampled to <= VIEW3D_Z_MAX planes, capped at VIEW3D_MAX_VOXELS per
+    # channel. Lower these if the 3-D view is slow or unstable on a weak GPU.
+    VIEW3D_XY_MAX = 512
+    VIEW3D_Z_MAX = 128
+    VIEW3D_MAX_VOXELS = 48_000_000
+
     # ── Resource-aware load strategy (V1.41) ────────────────────────
     # EAGER_MAX_FRACTION: cap on the share of available RAM that the
     # eager-materialization path is allowed to consume. The remaining

@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 from nd2studios.core.plugin_registry import ParamSpec
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.common import ParamEditor
-from nd2studios.widgets.icon_button import icon_button, scaled
+from nd2studios.widgets.icon_button import icon_button, scaled, scale_qss
 
 
 class ParamPopup(QWidget):
@@ -53,9 +53,9 @@ class ParamPopup(QWidget):
 
         header = QHBoxLayout()
         self._title = QLabel("Parameters")
-        self._title.setStyleSheet(
+        self._title.setStyleSheet(scale_qss(
             f"color: {Settings.FG_PRIMARY}; font: bold 10pt;"
-        )
+        ))
         header.addWidget(self._title, stretch=1)
         close_btn = icon_button("fa5s.times", "Close", icon_px=12)
         close_btn.setFlat(True)
@@ -80,7 +80,7 @@ class ParamPopup(QWidget):
         layout.addWidget(scroll)
 
         self._empty = QLabel("This node has no parameters.")
-        self._empty.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self._empty.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         self._empty.setVisible(False)
         layout.addWidget(self._empty)
 

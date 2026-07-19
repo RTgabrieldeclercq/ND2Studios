@@ -24,7 +24,7 @@ from nd2studios.pipeline_graph.conditions import (
     block_label, block_param_schema, describe_condition, families,
     is_object_lens_only, make_block, metric_choices,
 )
-from nd2studios.widgets.icon_button import scaled
+from nd2studios.widgets.icon_button import scaled, scale_qss
 
 
 class _BlockRow(QFrame):
@@ -38,10 +38,10 @@ class _BlockRow(QFrame):
         self._dialog = dialog
         self.setObjectName("conditionBlockRow")
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setStyleSheet(
+        self.setStyleSheet(scale_qss(
             f"#conditionBlockRow{{background:{Settings.BG_SECONDARY};"
             f"border:1px solid {Settings.BORDER_COLOR};border-radius:6px;}}"
-        )
+        ))
         row = QHBoxLayout(self)
         row.setContentsMargins(8, 6, 8, 6)
         row.setSpacing(8)
@@ -51,24 +51,24 @@ class _BlockRow(QFrame):
         self._not_btn.setChecked(bool(block.negate))
         self._not_btn.setFixedWidth(scaled(46))
         self._not_btn.setToolTip("Negate this block")
-        self._not_btn.setStyleSheet(
+        self._not_btn.setStyleSheet(scale_qss(
             "QPushButton{border:1px solid %s;border-radius:4px;padding:2px;"
             "color:%s;font:bold 8pt;}"
             "QPushButton:checked{background:%s;color:%s;border-color:%s;}"
             % (Settings.BORDER_COLOR, Settings.FG_SECONDARY,
                Settings.ACCENT_RED, Settings.BG_PRIMARY, Settings.ACCENT_RED)
-        )
+        ))
         self._not_btn.toggled.connect(self._on_negate)
         row.addWidget(self._not_btn)
 
         title = QLabel(block_label(block.kind))
-        title.setStyleSheet(f"color:{Settings.ACCENT_PURPLE};font:bold 9pt;")
+        title.setStyleSheet(scale_qss(f"color:{Settings.ACCENT_PURPLE};font:bold 9pt;"))
         title.setMinimumWidth(scaled(150))
         row.addWidget(title)
 
         for pspec in block_param_schema(block.kind):
             lab = QLabel(pspec["label"])
-            lab.setStyleSheet(f"color:{Settings.FG_SECONDARY};font:8.5pt;")
+            lab.setStyleSheet(scale_qss(f"color:{Settings.FG_SECONDARY};font:8.5pt;"))
             row.addWidget(lab)
             row.addWidget(self._make_editor(pspec))
         row.addStretch(1)
@@ -79,13 +79,13 @@ class _BlockRow(QFrame):
         rm.setObjectName("conditionRemoveBtn")
         rm.setToolTip("Remove this condition block")
         rm.setFixedSize(scaled(24), scaled(24))
-        rm.setStyleSheet(
+        rm.setStyleSheet(scale_qss(
             "QPushButton{border:1px solid %s;border-radius:4px;"
             "color:%s;font:bold 11pt;background:transparent;}"
             "QPushButton:hover{background:%s;color:%s;border-color:%s;}"
             % (Settings.BORDER_COLOR, Settings.FG_SECONDARY,
                Settings.ACCENT_RED, Settings.BG_PRIMARY, Settings.ACCENT_RED)
-        )
+        ))
         rm.clicked.connect(lambda: self._dialog.remove_row(self))
         row.addWidget(rm)
 
@@ -202,10 +202,10 @@ class ConditionBuilderDialog(QDialog):
 
         self._readout = QLabel("")
         self._readout.setWordWrap(True)
-        self._readout.setStyleSheet(
+        self._readout.setStyleSheet(scale_qss(
             f"color:{Settings.FG_PRIMARY};background:{Settings.BG_PRIMARY};"
             f"border:1px solid {Settings.BORDER_COLOR};border-radius:6px;"
-            "padding:6px 8px;font:9pt;")
+            "padding:6px 8px;font:9pt;"))
         outer.addWidget(self._readout)
 
         buttons = QDialogButtonBox(

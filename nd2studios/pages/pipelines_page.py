@@ -42,7 +42,7 @@ import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -98,18 +98,33 @@ from nd2studios.pipeline_graph import (
     SPECIAL_CT_METRICS_OP_KEY,
     SPECIAL_DISMISS_OP_KEY,
     SPECIAL_DVC_OP_KEY,
+    SPECIAL_DVC_CHECKPOINT_OP_KEY,
+    SPECIAL_DIC_OP_KEY,
+    SPECIAL_DIC_ROI_OP_KEY,
+    SPECIAL_DIC_REFINE_OP_KEY,
+    SPECIAL_EXCLUDE_OP_KEY,
     SPECIAL_EXPORT_OP_KEY,
     SPECIAL_INTERP_MAP_OP_KEY,
+    SPECIAL_MASK3D_OP_KEY,
+    SPECIAL_PRISM_OP_KEY,
+    SPECIAL_BEAD_DETECT_OP_KEY,
+    SPECIAL_GRANULE_CLUSTER_OP_KEY,
+    SPECIAL_GRANULE_TESSELLATE_OP_KEY,
+    SPECIAL_GRANULE_MASK_OP_KEY,
+    SPECIAL_GRANULE_BOUNDARY_OP_KEY,
     SPECIAL_CHECKPOINT_OP_KEY,
+    SPECIAL_CROP_OP_KEY,
     SPECIAL_PAUSE_OP_KEY,
     SPECIAL_REGISTER_OP_KEY,
     SPECIAL_REVIEW_OP_KEY,
+    SPECIAL_SAVE_DATA_OP_KEY,
     SPECIAL_SEND_RESULTS_OP_KEY,
     SPECIAL_TRACK_OP_KEY,
     SPECIAL_VALIDATE_OP_KEY,
     Condition,
     GROUP_ROW,
     LENS_OBJECT,
+    SCOPE_OBJECTS,
     CHANNEL_ALL_OP_KEY,
     CHANNEL_PREFIX,
     CroppedVolume,
@@ -128,7 +143,9 @@ from nd2studios.pipeline_graph import (
     channel_recipes,
     channel_sets,
     channel_source_spec,
+    display_channel_sets,
     describe_condition,
+    dvc_checkpoint_spec,
     enhancement_specs,
     evaluate_condition,
     has_channel_wiring,
@@ -146,10 +163,13 @@ from nd2studios.pipeline_graph import (
     save_pipeline,
     topological_order,
 )
-from nd2studios.pipeline_graph.model import LOOP_KIND, NodeCategory, NodeRole
-from nd2studios.widgets.icon_button import bind_toggle_icon, icon_button, make_icon, scaled
+from nd2studios.pipeline_graph.model import (
+    LOOP_KIND, NodeCategory, NodeRole, edge_view_only,
+)
+from nd2studios.widgets.icon_button import bind_toggle_icon, icon_button, make_icon, scale_qss, scaled
 from nd2studios.widgets.image_viewer import CHANNEL_COLORS
 from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
+from nd2studios.widgets.viewer3d import PyVista3DViewer
 from nd2studios.widgets.popout_window import PopOutWindow
 from nd2studios.widgets.node_board import (
     AddNodeDialog, ConditionBuilderDialog, MeasurementSelectDialog, NodeScene,
@@ -171,7 +191,9 @@ _RUN_MEASURE_KEY = "pipeline_run_measure"             # Run: per-M measurement i
 _RUN_TRACK_KEY = "pipeline_run_track"                 # Run: per-M default tracking (off the GUI thread)
 _RUN_TRACKOBJ_KEY = "pipeline_run_trackobj"           # Run: Track Objects node (off the GUI thread)
 _RUN_DVC_KEY = "pipeline_run_dvc"                     # Run: DVC (ALDVC) node (off the GUI thread)
+_RUN_DIC_KEY = "pipeline_run_dic"                     # Run: DIC (pyALDIC) 2D node (off the GUI thread)
 _RUN_REGISTER_KEY = "pipeline_run_register"           # Run: Registration node (off the GUI thread)
+_RUN_GRANULE_KEY = "pipeline_run_granule"             # Run: granule-chain node (off the GUI thread)
 _RUN_RESULTS_KEY = "pipeline_run_results"             # Run: explicit measurement node (legacy)
 _RUN_LOOPCOMBINE_KEY = "pipeline_run_loopcombine"     # Run: loop union-dedup combine (off the GUI thread)
 _PV_SCREEN_KEY = "pipeline_preview_walk"              # Preview walk: screen+measure selected planes
@@ -189,7 +211,15 @@ _STAGE_LABEL = {
 
 
 class _BoardView(QGraphicsView):
-    """Graphics view with wheel-zoom and rubber-band selection."""
+    """Graphics view with wheel-zoom, click-drag panning, and marquee select.
+
+    V1.61: a plain left-drag on **empty canvas** pans the view (hand cursor) —
+    the natural gesture for navigating a large graph. Holding **Ctrl or Shift**
+    while dragging empty canvas keeps the old rubber-band marquee select. A
+    press on a node / port / wire falls through to the scene unchanged (move a
+    node, start a wire, cut, loop). Panning is suppressed while a scene tool
+    (scissors / loop) is armed so those drags keep their meaning.
+    """
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -200,10 +230,61 @@ class _BoardView(QGraphicsView):
         )
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._panning = False
+        self._pan_last = QPoint()
+
+    def _tool_active(self) -> bool:
+        """True when a scene tool owns left-drag (cut / loop) — no panning then."""
+        sc = self.scene()
+        return bool(getattr(sc, "_cut_mode", False)
+                    or getattr(sc, "_loop_mode", False))
 
     def wheelEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
         self.scale(factor, factor)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        mods = event.modifiers()
+        marquee = bool(mods & (Qt.KeyboardModifier.ControlModifier
+                               | Qt.KeyboardModifier.ShiftModifier))
+        if (event.button() == Qt.MouseButton.LeftButton
+                and not self._tool_active()
+                and not marquee
+                and self.itemAt(event.pos()) is None):
+            # Empty canvas, no modifier → pan. (Ctrl/Shift-drag → marquee.)
+            # Clicking empty canvas also closes any open inline rename editor
+            # (commit-on-click-away): dropping the scene focus fires the line
+            # edit's editingFinished. A press on a node/port routes through the
+            # scene and defocuses normally.
+            sc = self.scene()
+            if sc is not None:
+                sc.clearFocus()
+            self._panning = True
+            self._pan_last = event.pos()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._panning:
+            delta = event.pos() - self._pan_last
+            self._pan_last = event.pos()
+            hbar = self.horizontalScrollBar()
+            vbar = self.verticalScrollBar()
+            hbar.setValue(hbar.value() - delta.x())
+            vbar.setValue(vbar.value() - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._panning and event.button() == Qt.MouseButton.LeftButton:
+            self._panning = False
+            self.viewport().unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class _ProcessingPreviewJob(AnalysisJob):
@@ -532,7 +613,9 @@ class _DVCJob(AnalysisJob):
     """
 
     def __init__(self, key: str, vol, c_idx, m_list, frames, ref_frame, mode,
-                 z_start, z_end, downsample, voxel_size_um, params) -> None:
+                 z_start, z_end, downsample, voxel_size_um, params,
+                 rect=None, transforms_by_m=None, interp_order=1,
+                 object_regions=None, exclude_by_m=None) -> None:
         super().__init__(key)
         self._vol = vol
         self._c = int(c_idx)
@@ -545,21 +628,136 @@ class _DVCJob(AnalysisJob):
         self._down = max(1, int(downsample))
         self._voxel = voxel_size_um
         self._params = params
+        # V1.59: apply the same drift correction + crop the rest of the pipeline
+        # sees, so DVC correlates the registered, cropped region (not raw drift).
+        self._rect = tuple(int(v) for v in rect) if rect is not None else None
+        self._transforms = dict(transforms_by_m or {})
+        self._interp_order = int(interp_order or 1)
+        # V1.68 — per-object scope: a list of ObjectRegion. When set, DVC runs once
+        # per object on that object's crop (rect ∩ object bbox, + its Z-range) and
+        # returns per-object results (each in its own crop frame, so the object's
+        # field, backdrop and cropped mask stay aligned — one surface + MDM each).
+        self._object_regions = list(object_regions) if object_regions else None
+        # V1.75 — per-M (Z,H,W) bool exclusion volumes published by an Exclude node;
+        # zeroed in _read_volume so DVC ignores those voxels.
+        self._exclude = dict(exclude_by_m or {})
 
     def _read_volume(self, m: int, t: int):
         import numpy as _np
         v = _np.asarray(self._vol.get_volume(
             self._c, m=int(m), t=int(t), z_start=self._z0, z_end=self._z1))
+        # V1.59: drift-correct on the full frame (apply the frame-t 2D transform to
+        # every Z-slice), THEN crop — a registered crop, matching every other
+        # downstream reader (register → crop).
+        tf = self._transforms.get(int(m))
+        if tf:
+            from nd2studios.backend.registration import estimate as _est
+            try:
+                if v.ndim == 3:
+                    v = _np.stack(
+                        [_est.apply_frame(v[z], tf, int(t),
+                                          interp_order=self._interp_order)
+                         for z in range(v.shape[0])], axis=0)
+                else:
+                    v = _est.apply_frame(v, tf, int(t),
+                                         interp_order=self._interp_order)
+            except Exception:  # noqa: BLE001 — never break DVC on a bad transform
+                pass
+        if self._rect is not None:
+            x, y, w, h = self._rect
+            v = v[..., y:y + h, x:x + w]
+        # V1.75 — an Exclude node zeroes the ignored voxels here, so DVC never
+        # correlates them (no texture → the field is discarded in that region).
+        # Sliced to the same Z window + rect as the volume so it stays aligned,
+        # including the per-object crop (self._z0/_z1/_rect are set per object).
+        exv = self._exclude.get(int(m)) if self._exclude else None
+        if exv is not None:
+            exv = _np.asarray(exv).astype(bool)
+            if exv.ndim == 2:
+                exv = exv[None, ...]
+            z_end = self._z1 if self._z1 is not None else exv.shape[0]
+            exv = exv[self._z0:z_end]
+            if self._rect is not None:
+                x, y, w, h = self._rect
+                exv = exv[..., y:y + h, x:x + w]
+            if exv.shape == v.shape:
+                v = _np.where(exv, 0, v)
+            elif (v.ndim == 2 and exv.ndim == 3 and exv.shape[0] == 1
+                  and exv.shape[1:] == v.shape):
+                v = _np.where(exv[0], 0, v)
         if v.ndim == 3 and v.shape[0] == 1:         # singleton Z → 2D DIC
             v = v[0]
         return _bin_xy(v, self._down)
 
     def run(self, progress: ProgressReporter):
-        import numpy as _np
         from nd2studios.backend.dvc.method import ALDVCMethod
+        method = ALDVCMethod()
+        if not self._object_regions:
+            return self._run_series_all_m(method, progress)
+        # ── per-object scope (V1.68) ──────────────────────────────────────────
+        # Run DVC once per object on its own crop (rect ∩ object bbox + Z-range),
+        # each in its own crop frame so its field / backdrop / cropped mask align.
+        base_rect = self._rect
+        base_z0, base_z1 = self._z0, self._z1
+        rx = int(base_rect[0]) if base_rect else 0
+        ry = int(base_rect[1]) if base_rect else 0
+        rx1 = (rx + int(base_rect[2])) if base_rect else None
+        ry1 = (ry + int(base_rect[3])) if base_rect else None
+        objects_out: Dict[int, Any] = {}
+        masks_out: Dict[int, Any] = {}
+        # V1.74 — each object's crop origin (full-frame raw voxel (z0, y0, x0)), so
+        # the "All granules" composite can offset each surface (built in its own
+        # crop-local frame) back to its true relative position.
+        origins_out: Dict[int, Any] = {}
+        try:
+            for region in self._object_regions:
+                self.token.check()
+                oz0, oz1, oy0, oy1, ox0, ox1 = (int(v) for v in region.bbox)
+                ax0, ay0 = max(ox0, rx), max(oy0, ry)
+                ax1 = ox1 if rx1 is None else min(ox1, rx1)
+                ay1 = oy1 if ry1 is None else min(oy1, ry1)
+                if ax1 <= ax0 or ay1 <= ay0:
+                    continue
+                self._rect = (ax0, ay0, ax1 - ax0, ay1 - ay0)
+                z_scoped = bool(getattr(region, "z_scoped", False))
+                zc0, zc1 = None, None
+                if z_scoped:
+                    self._z0 = max(oz0, base_z0)
+                    self._z1 = (min(oz1, base_z1) if base_z1 is not None else oz1)
+                    zc0, zc1 = self._z0, self._z1   # field's actual Z window
+                oid = int(region.object_id)
+                objects_out[oid] = self._run_series_all_m(
+                    method, progress, label=f"object {oid}")
+                masks_out[oid] = self._object_crop_mask(
+                    region, ax0, ay0, ax1, ay1, zc0, zc1)
+                # Crop origin (z0, y0, x0) in full-frame raw voxels: the mask's local
+                # (0,0,0) maps here. z0 = the field's Z window start when Z-scoped.
+                origins_out[oid] = (int(zc0) if z_scoped else int(oz0),
+                                    int(ay0), int(ax0))
+                self._rect, self._z0, self._z1 = base_rect, base_z0, base_z1
+        finally:
+            self._rect, self._z0, self._z1 = base_rect, base_z0, base_z1
+        return {"objects": objects_out, "object_masks": masks_out,
+                "object_origins": origins_out}
+
+    def _object_crop_mask(self, region, ax0, ay0, ax1, ay1, z0=None, z1=None):
+        """The object's own mask cropped to the (rect ∩ bbox) footprint used for
+        its DVC crop, so it aligns with the object's field in µm — including Z when
+        the node's Z-range (``z0:z1``, absolute) is narrower than the object bbox."""
+        import numpy as _np
+        oz0, _oz1, oy0, _oy1, ox0, _ox1 = (int(v) for v in region.bbox)
+        m = _np.asarray(region.mask).astype(bool)
+        if m.ndim == 3:
+            if z0 is not None and z1 is not None:
+                m = m[int(z0) - oz0:int(z1) - oz0]   # match the field's Z window
+            return _np.ascontiguousarray(
+                m[:, ay0 - oy0:ay1 - oy0, ax0 - ox0:ax1 - ox0])
+        return _np.ascontiguousarray(m[ay0 - oy0:ay1 - oy0, ax0 - ox0:ax1 - ox0])
+
+    def _run_series_all_m(self, method, progress, label: str = ""):
+        import numpy as _np
         from nd2studios.backend.dvc.mesh import build_grid
         from nd2studios.backend.dvc.tracking import build_accumulated_results
-        method = ALDVCMethod()
         newfft = bool(self._params.get("newFFTSearch", False))
         strain_type = str(self._params.get("strain_type", "infinitesimal"))
         subset = int(self._params.get("subset_size", 16))
@@ -584,7 +782,9 @@ class _DVCJob(AnalysisJob):
                 dvol = self._read_volume(m, t)
                 vshape = dvol.shape
                 base = done / total
-                progress.update(base, f"Correlating M{int(m) + 1} T{int(t) + 1}…")
+                _lbl = f"{label} · " if label else ""
+                progress.update(base,
+                                f"{_lbl}Correlating M{int(m) + 1} T{int(t) + 1}…")
 
                 def _cb(pct: int, _b=base, _tot=total, _m=int(m), _t=int(t)) -> None:
                     self.token.check()
@@ -615,6 +815,156 @@ class _DVCJob(AnalysisJob):
                                "increment": {t: r for t, r in incr}}
             else:
                 out[int(m)] = {"primary": primary, "increment": {}}
+        return out
+
+
+class _DICJob(AnalysisJob):
+    """Run the pyALDIC 2D AL-DIC field **series** over a timelapse, off the GUI thread.
+
+    The 2D sibling of :class:`_DVCJob`: for each multipoint it reads one 2D frame
+    per timepoint (the wired channel, projected + registered + cropped exactly like
+    every other reader), assembles the ordered image list, and hands the whole
+    series to :func:`nd2studios.backend.dic.engine.run_pyaldic_series` (which lets
+    ``al-dic`` handle accumulative vs incremental tracking natively). The drawn ROI
+    (mesh domain) and refinement brush arrive as per-M side artifacts. Returns the
+    same ``{m: {"primary": {t:(DVCResult, backdrop)}, "increment": {t:DVCResult}}}``
+    shape the DVC finish/panel path consumes."""
+
+    def __init__(self, key: str, vol, c_idx, m_list, n_t, ref_frame, mode,
+                 down, voxel_size_um, params, rect=None, transforms_by_m=None,
+                 interp_order=1, exclude_by_m=None, roi_by_m=None,
+                 refine_by_m=None) -> None:
+        super().__init__(key)
+        self._vol = vol
+        self._c = int(c_idx)
+        self._m_list = list(m_list)
+        self._n_t = int(n_t)
+        self._ref_frame = int(ref_frame)
+        self._mode = str(mode)
+        self._down = max(1, int(down))
+        self._voxel = voxel_size_um
+        self._params = params
+        self._rect = tuple(int(v) for v in rect) if rect is not None else None
+        self._transforms = dict(transforms_by_m or {})
+        self._interp_order = int(interp_order or 1)
+        self._exclude = dict(exclude_by_m or {})
+        self._roi_by_m = dict(roi_by_m or {})
+        self._refine_by_m = dict(refine_by_m or {})
+
+    def _read_frame(self, m: int, t: int):
+        """One 2D frame (register per-Z → crop → exclude → project to 2D → bin)."""
+        import numpy as _np
+        v = _np.asarray(self._vol.get_volume(self._c, m=int(m), t=int(t)))
+        tf = self._transforms.get(int(m))
+        if tf:
+            from nd2studios.backend.registration import estimate as _est
+            try:
+                if v.ndim == 3:
+                    v = _np.stack(
+                        [_est.apply_frame(v[z], tf, int(t),
+                                          interp_order=self._interp_order)
+                         for z in range(v.shape[0])], axis=0)
+                else:
+                    v = _est.apply_frame(v, tf, int(t),
+                                         interp_order=self._interp_order)
+            except Exception:  # noqa: BLE001 — never break DIC on a bad transform
+                pass
+        if self._rect is not None:
+            x, y, w, h = self._rect
+            v = v[..., y:y + h, x:x + w]
+        exv = self._exclude.get(int(m)) if self._exclude else None
+        if exv is not None:
+            exv = _np.asarray(exv).astype(bool)
+            if exv.ndim == 3:
+                exv = exv.any(axis=0)             # collapse Z (DIC is 2D)
+            if self._rect is not None and exv.shape != v.shape[-2:]:
+                x, y, w, h = self._rect
+                exv = exv[y:y + h, x:x + w]
+            if exv.shape == v.shape[-2:]:
+                if v.ndim == 3:
+                    v = _np.where(exv[None, ...], 0, v)
+                else:
+                    v = _np.where(exv, 0, v)
+        if v.ndim == 3:                          # project Z to a single 2D image
+            v = v.max(axis=0)
+        return _bin_xy(v, self._down)
+
+    def _prep_mask(self, m: int, target_hw):
+        """The drawn ROI for M ``m`` resized to the correlated frame shape, or None."""
+        import numpy as _np
+        arr = self._roi_by_m.get(int(m))
+        if arr is None:
+            return None
+        arr = _np.asarray(arr).astype(bool)
+        if arr.shape == tuple(target_hw):
+            return arr
+        from skimage.transform import resize as _resize
+        return _resize(arr.astype(float), tuple(target_hw), order=0,
+                       preserve_range=True) > 0.5
+
+    def _prep_refine(self, m: int, target_hw):
+        """The refinement spec for M ``m`` with its brush resized to the frame, or None."""
+        import numpy as _np
+        spec = self._refine_by_m.get(int(m))
+        if not spec:
+            return None
+        out = {"criteria": dict(spec.get("criteria", {})),
+               "min_element_size": int(spec.get("min_element_size", 8) or 8)}
+        brush = spec.get("brush")
+        if brush is not None:
+            brush = _np.asarray(brush).astype(bool)
+            if brush.shape != tuple(target_hw):
+                from skimage.transform import resize as _resize
+                brush = _resize(brush.astype(float), tuple(target_hw), order=0,
+                                preserve_range=True) > 0.5
+            out["brush"] = brush
+        return out
+
+    def run(self, progress: ProgressReporter):
+        from nd2studios.backend.dic.engine import run_pyaldic_series
+        out: Dict[int, Dict[str, Any]] = {}
+        total = max(1, len(self._m_list))
+        for mi, m in enumerate(self._m_list):
+            self.token.check()
+            base = mi / total
+            progress.update(base, f"DIC M{int(m) + 1}: reading frames…")
+            if self._mode == "incremental":
+                order_t = list(range(self._n_t))
+                reference_mode = "incremental"
+                defs_t = order_t[1:]
+            else:
+                others = [t for t in range(self._n_t) if t != self._ref_frame]
+                order_t = [self._ref_frame] + others
+                reference_mode = "accumulative"
+                defs_t = others
+            images = [self._read_frame(m, t) for t in order_t]
+            if len(images) < 2:
+                out[int(m)] = {"primary": {}, "increment": {}}
+                continue
+            target_hw = images[0].shape[:2]
+            roi = self._prep_mask(m, target_hw)
+            masks = ([roi.astype(float) for _ in images] if roi is not None else None)
+            refine = self._prep_refine(m, target_hw)
+
+            def _cb(pct: int, _b=base, _tot=total, _m=int(m)) -> None:
+                self.token.check()
+                progress.update(min(1.0, _b + (float(pct) / 100.0) / _tot),
+                                f"DIC M{_m + 1}: correlating…")
+
+            series = run_pyaldic_series(
+                images, masks, self._params, self._voxel,
+                reference_mode=reference_mode, refinement=refine,
+                progress_cb=_cb, cancelled_cb=self.token.is_cancelled)
+            primary: Dict[int, Any] = {}
+            incr: Dict[int, Any] = {}
+            for i, entry in enumerate(series):
+                if i >= len(defs_t):
+                    break
+                t = int(defs_t[i])
+                bg = images[i + 1]                 # the deformed frame's image
+                primary[t] = (entry["primary"], np.asarray(bg))
+                incr[t] = entry["increment"]
+            out[int(m)] = {"primary": primary, "increment": incr}
         return out
 
 
@@ -701,6 +1051,210 @@ class _RegisterJob(AnalysisJob):
         return out
 
 
+class _GranuleJob(AnalysisJob):
+    """Run one V1.70 granule-chain node's heavy compute off the GUI thread.
+
+    ``kind`` selects the backend op; ``payload`` carries its already-resolved inputs
+    (cheap page-side lookups done on the GUI thread). Returns
+    ``{"store": {m:{t:…}}, "rows": [...]?, "status": str}`` which ``_finish_granule``
+    publishes to ``record._granule_*_by_m``. The **detect** kind reads volumes here
+    (like :class:`_DVCJob`) — applying the same per-Z registration and effective crop
+    the rest of the pipeline uses — so bead detection (numba blob finding + the
+    registration warp + first-call JIT) never blocks the Qt event loop.
+    """
+
+    def __init__(self, key: str, kind: str, payload: Dict[str, Any]) -> None:
+        super().__init__(key)
+        self._kind = str(kind)
+        self._p = dict(payload)
+
+    def _read_registered_cropped(self, vol, c_idx, m, t, transforms, interp_order,
+                                 rect, exclude=None):
+        """Registered, crop-confined ``(Z,H,W)`` read + the ``(off_y, off_x)`` the
+        crop removed (so detected coords can be pushed back to full-frame). Mirrors
+        :meth:`_DVCJob._read_volume` (register full frame per-Z → crop).
+
+        V1.75: when ``exclude`` (``{m: (Z,H,W) bool}``, published by an Exclude node)
+        covers this multipoint, those voxels are zeroed *after* the crop so bead
+        detection never finds beads inside the masked-out region."""
+        import numpy as _np
+        v = _np.asarray(vol.get_volume(int(c_idx), m=int(m), t=int(t)))
+        tf = (transforms or {}).get(int(m))
+        if tf:
+            from nd2studios.backend.registration import estimate as _est
+            try:
+                if v.ndim == 3:
+                    v = _np.stack(
+                        [_est.apply_frame(v[z], tf, int(t), interp_order=interp_order)
+                         for z in range(v.shape[0])], axis=0)
+                else:
+                    v = _est.apply_frame(v, tf, int(t), interp_order=interp_order)
+            except Exception:  # noqa: BLE001 — never break on a bad transform
+                pass
+        if v.ndim == 2:
+            v = v[None, ...]
+        exv = None
+        if exclude:
+            exv = exclude.get(int(m))
+            if exv is not None:
+                exv = _np.asarray(exv).astype(bool)
+                if exv.ndim == 2:
+                    exv = exv[None, ...]
+        off_y = off_x = 0
+        if rect is not None:
+            x, y, w, h = (int(a) for a in rect)
+            y0, y1 = max(0, y), min(v.shape[1], y + h)
+            x0, x1 = max(0, x), min(v.shape[2], x + w)
+            if y1 > y0 and x1 > x0:
+                v = v[:, y0:y1, x0:x1]
+                off_y, off_x = y0, x0
+                if exv is not None and exv.ndim == 3:
+                    exv = exv[:, y0:min(exv.shape[1], y1),
+                              x0:min(exv.shape[2], x1)]
+        # V1.75: zero the excluded voxels so bead detection ignores that region.
+        if exv is not None and exv.ndim == 3 and exv.shape[-2:] == v.shape[-2:]:
+            if exv.shape[0] == v.shape[0]:
+                v = _np.where(exv, 0, v)
+            else:                      # Z mismatch → project the footprint over Z
+                v = _np.where(exv.any(axis=0)[None, ...], 0, v)
+        return v, off_y, off_x
+
+    def run(self, progress: ProgressReporter):
+        import numpy as _np
+        from nd2studios.backend.analysis import granule_types as gt
+        p = self._p
+        voxel = p.get("voxel", (1.0, 1.0, 1.0))
+        params = p.get("params", {})
+
+        if self._kind == "detect":
+            from nd2studios.backend.analysis.bead_detect import detect_beads
+            vol = p["vol"]; c_idx = p["c_idx"]; m_list = list(p["m_list"])
+            t = int(p["t"]); transforms = p.get("transforms")
+            interp = int(p.get("interp_order", 1)); rect = p.get("rect")
+            store: Dict[int, Dict[int, Any]] = {}
+            rows: List[Dict[str, Any]] = []
+            n_total = 0
+            for i, m in enumerate(m_list):
+                self.token.check()
+                progress.update(i / max(1, len(m_list)),
+                                f"Detecting beads (M{int(m) + 1})")
+                v, oy, ox = self._read_registered_cropped(
+                    vol, c_idx, m, t, transforms, interp, rect,
+                    exclude=p.get("exclude"))
+                pts, _r = detect_beads(v, voxel, params)
+                pts = _np.asarray(pts, dtype=float).reshape(-1, 3)
+                if pts.shape[0] and (oy or ox):
+                    pts[:, 1] += oy      # y → full-frame
+                    pts[:, 2] += ox      # x → full-frame
+                store.setdefault(int(m), {})[t] = pts
+                rows.extend(gt.make_point_rows(pts, int(m), t, voxel))
+                n_total += int(pts.shape[0])
+            progress.update(1.0, "Done")
+            return {"store": store, "rows": rows,
+                    "status": f"detected {n_total} bead(s) across "
+                              f"{len(store)} multipoint(s) at T{t}"}
+
+        if self._kind == "cluster":
+            from nd2studios.backend.analysis.granule_cluster import cluster_granules
+            items = [(m, t, pts) for m, bt in p["points_by_m"].items()
+                     for t, pts in (bt or {}).items()]
+            store, rows, n_gr = {}, [], 0
+            for i, (m, t, pts) in enumerate(items):
+                self.token.check()
+                progress.update(i / max(1, len(items)),
+                                f"Clustering (M{int(m) + 1} T{int(t)})")
+                pts = _np.asarray(pts, dtype=float)
+                if pts.shape[0] == 0:
+                    continue
+                labels, info = cluster_granules(pts, voxel, params)
+                labels = _np.asarray(labels)
+                store.setdefault(int(m), {})[int(t)] = labels
+                if isinstance(info, dict):
+                    n_gr = max(n_gr, int(info.get("k", 0) or 0))
+                rows.extend(gt.make_point_rows(pts, int(m), int(t), voxel,
+                                               labels=labels))
+            progress.update(1.0, "Done")
+            return {"store": store, "rows": rows,
+                    "status": f"assigned beads to ~{n_gr} granule(s) per frame (GMM+BIC)"}
+
+        if self._kind == "tessellate":
+            from nd2studios.backend.analysis.granule_tessellate import (
+                tessellate_granules)
+            points_by_m = p["points_by_m"]
+            items = [(m, t, lb) for m, bt in p["labels_by_m"].items()
+                     for t, lb in (bt or {}).items()]
+            store, n_final = {}, 0
+            for i, (m, t, labels) in enumerate(items):
+                self.token.check()
+                progress.update(i / max(1, len(items)),
+                                f"Tessellating (M{int(m) + 1} T{int(t)})")
+                src = (points_by_m.get(m, {}) or {}).get(t)
+                if src is None:
+                    continue
+                pts = _np.asarray(src, dtype=float)
+                if pts.size == 0:
+                    continue
+                tess = tessellate_granules(pts, _np.asarray(labels), voxel, params)
+                store.setdefault(int(m), {})[int(t)] = tess
+                n_final = max(n_final, len(getattr(tess, "boundaries", {}) or {}))
+            progress.update(1.0, "Done")
+            mode = str(params.get("tess_mode", "alpha_shape"))
+            return {"store": store,
+                    "status": f"{n_final} granule boundary(ies) ({mode}, density-merged)"}
+
+        if self._kind == "mask":
+            from nd2studios.backend.analysis.granule_mask import build_granule_masks
+            shape_zhw = p["shape_zhw"]
+            items = [(m, t, tess) for m, bt in p["tess_by_m"].items()
+                     for t, tess in (bt or {}).items()]
+            store, n_masks = {}, 0
+            for i, (m, t, tess) in enumerate(items):
+                self.token.check()
+                progress.update(i / max(1, len(items)),
+                                f"Voxelizing masks (M{int(m) + 1} T{int(t)})")
+                masks_by_id, combined = build_granule_masks(
+                    tess, shape_zhw, voxel, params)
+                entry: Dict[Any, Any] = {
+                    int(gid): _np.asarray(mm, dtype=bool)
+                    for gid, mm in (masks_by_id or {}).items()}
+                entry[gt.COMBINED_LABELS_KEY] = _np.asarray(combined)
+                store.setdefault(int(m), {})[int(t)] = entry
+                n_masks += max(0, len(entry) - 1)
+            progress.update(1.0, "Done")
+            z, h, w = (int(shape_zhw[0]), int(shape_zhw[1]), int(shape_zhw[2]))
+            return {"store": store,
+                    "status": f"built {n_masks} granule mask(s) ({z}×{h}×{w})"}
+
+        if self._kind == "boundary":
+            from nd2studios.backend.analysis.granule_boundary import (
+                extract_boundary_bands)
+            items = [(m, t, e) for m, bt in p["masks_by_m"].items()
+                     for t, e in (bt or {}).items()]
+            store, n_bands = {}, 0
+            for i, (m, t, entry) in enumerate(items):
+                self.token.check()
+                progress.update(i / max(1, len(items)),
+                                f"Boundary bands (M{int(m) + 1} T{int(t)})")
+                combined = (entry.get(gt.COMBINED_LABELS_KEY)
+                            if isinstance(entry, dict) else None)
+                if combined is None:
+                    continue
+                bands, band_combined = extract_boundary_bands(
+                    entry, _np.asarray(combined), voxel, params)
+                out: Dict[Any, Any] = {
+                    int(gid): _np.asarray(bb, dtype=bool)
+                    for gid, bb in (bands or {}).items()}
+                out[gt.COMBINED_LABELS_KEY] = _np.asarray(band_combined)
+                store.setdefault(int(m), {})[int(t)] = out
+                n_bands += max(0, len(out) - 1)
+            progress.update(1.0, "Done")
+            n_vox = int(params.get("band_voxels", 3) or 3)
+            return {"store": store,
+                    "status": f"extracted {n_bands} boundary band(s) (N={n_vox})"}
+
+        return {"store": {}, "status": "unknown granule op"}
+
+
 class _ResultsScreenMeasureJob(AnalysisJob):
     """Screen + measure the selected preview plane(s) for the results table.
 
@@ -776,13 +1330,16 @@ class PipelinesPage(QWidget):
             self._runner.job_frame.connect(self._on_run_frame)
 
         self._doc = PipelineDoc.empty()
-        self._stage = Stage.PROCESSING
+        self._stage = Stage.PROCESSING  # V1.61 merge: default context; base shown via _show_base_image
         # V1.45 merge: Analysis + Results share one sub-tab/scene (Stage.ANALYSIS
         # holds analysis + results + logic + special nodes). Two sub-tabs total.
         self._enabled_stages = {Stage.PROCESSING, Stage.ANALYSIS}
         self._stages = (Stage.PROCESSING, Stage.ANALYSIS)
         self._scenes: Dict[Stage, NodeScene] = {}
         self._selected_node_id: str = ""
+        # V1.62 (R3): the input node feeding the previewed chain — `_active_record`
+        # resolves through it so a file's chain uses that file's data.
+        self._focused_input_id: str = ""
         # The "previewed" node per stage — golden outline + drives the viewer.
         # Sticky: only a double-click changes it; selecting / clicking off does
         # not.
@@ -812,7 +1369,10 @@ class PipelinesPage(QWidget):
         # The base image is cached; switching just recomputes the overlay layer.
         self._overlay_tab_keys = [
             "image", "segmentation", "tracks", "vectors_cells", "vectors_field",
-            "spatial", "serialtrack", "dvc", "registration",
+            "spatial", "serialtrack", "dvc", "dic", "registration",
+            # V1.73 — one overlay mode per granule node (gated on its store).
+            "granule_beads", "granule_clusters", "granule_tess",
+            "granule_mask", "granule_boundary",
         ]
         self._overlay_mode: str = "segmentation"
         # Track-colour overlay cache (built once per tracked result; Phase 5).
@@ -930,21 +1490,28 @@ class PipelinesPage(QWidget):
         board_layout = QVBoxLayout(board)
         board_layout.setContentsMargins(0, 0, 0, 0)
         board_layout.setSpacing(6)
-        board_layout.addWidget(self._build_subtab_selector())
+        # V1.61 merge: the Processing + Analysis sub-tabs are combined into ONE
+        # scene. The sub-tab selector is built but hidden — its buttons still back
+        # `_select_stage`'s bookkeeping (`_subtab_btns`) and `self._stage` now
+        # tracks the previewed node's kind rather than a visible tab.
+        self._subtab_bar = self._build_subtab_selector()
+        self._subtab_bar.setVisible(False)
         board_layout.addWidget(self._build_control_bar())
 
         self._view = _BoardView()
         self._view.setObjectName("nodeBoardView")
-        for stage in self._stages:
-            self._scenes[stage] = self._build_scene(stage)
+        # One scene backed by the merged slice; both stage keys alias to it so the
+        # per-stage code paths (preview / apply / run) keep working.
+        merged_scene = self._build_scene(Stage.ANALYSIS)
+        self._scenes = {Stage.PROCESSING: merged_scene, Stage.ANALYSIS: merged_scene}
         board_layout.addWidget(self._view, stretch=1)
 
         # "Coming soon" overlay for deferred sub-tabs.
         self._coming_soon = QLabel("Coming soon", self._view)
         self._coming_soon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._coming_soon.setStyleSheet(
+        self._coming_soon.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 14pt; background: transparent;"
-        )
+        ))
         self._coming_soon.setVisible(False)
 
         # ── Right: viewer (+ Results CSV table) ──────────────────────────
@@ -1008,7 +1575,9 @@ class PipelinesPage(QWidget):
         self._overlay_tabbar.setDrawBase(False)
         for label in ("Image", "Segmentation", "Tracks",
                       "Vectors: cells", "Vectors: field", "Spatial Maps",
-                      "SerialTrack", "DVC", "Registration"):
+                      "SerialTrack", "DVC", "DIC", "Registration",
+                      "Beads", "Clusters", "Tessellation",
+                      "Granule Mask", "Boundary"):
             self._overlay_tabbar.addTab(label)
         self._overlay_tabbar.setCurrentIndex(
             self._overlay_tab_keys.index(self._overlay_mode))
@@ -1024,7 +1593,7 @@ class PipelinesPage(QWidget):
         # saved loop's iterations ("Combined" + each "#k …"). Hidden until a loop
         # ran with "Save all iterations".
         self._iter_label = QLabel("Iteration:")
-        self._iter_label.setStyleSheet(f"color:{Settings.FG_SECONDARY};font:8pt;")
+        self._iter_label.setStyleSheet(scale_qss(f"color:{Settings.FG_SECONDARY};font:8pt;"))
         self._iter_label.setVisible(False)
         self._iter_combo = QComboBox()
         self._iter_combo.setObjectName("loopIterCombo")
@@ -1062,9 +1631,15 @@ class PipelinesPage(QWidget):
         tab_row.addWidget(self._btn_preview_crop)
         self._lbl_preview_crop = QLabel("")
         self._lbl_preview_crop.setObjectName("previewCropLabel")
-        self._lbl_preview_crop.setStyleSheet(
-            f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self._lbl_preview_crop.setStyleSheet(scale_qss(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         tab_row.addWidget(self._lbl_preview_crop)
+        self._btn_view3d = icon_button(
+            "fa5s.cube", "3D — toggle a volumetric view of the preview",
+            object_name="pipelineToolBtn", icon_px=14, checkable=True,
+        )
+        self._btn_view3d.toggled.connect(self._toggle_view3d)
+        tab_row.addWidget(self._btn_view3d)
         self._btn_viewer_popout = icon_button(
             "fa5s.expand", "Maximize the image viewer in a separate window",
             object_name="pipelineToolBtn", icon_px=14,
@@ -1072,11 +1647,24 @@ class PipelinesPage(QWidget):
         self._btn_viewer_popout.clicked.connect(lambda: self._toggle_popout("viewer"))
         tab_row.addWidget(self._btn_viewer_popout)
         vc.addLayout(tab_row)
-        # The viewer area is a stack: the image viewer (overlay tabs paint over it)
-        # and the Spatial Maps panel (its own canvas + sidebar). The "Spatial Maps"
-        # overlay tab swaps the stack to the panel; the others swap back.
-        self._viewer_stack = QStackedWidget()
-        self._viewer_stack.addWidget(self.viewer)            # index 0
+        # V1.61: the MultiAxisViewer is ALWAYS visible (never hidden or swapped
+        # out). The specialized result panels (Spatial Maps / SerialTrack / DVC /
+        # Registration) live in their own stack shown BELOW the viewer, in a
+        # vertical splitter, only while their overlay tab is active.
+        self._viewer_split = QSplitter(Qt.Orientation.Vertical)
+        self._viewer_split.setObjectName("pipelineViewerSplit")
+        self._viewer_split.setChildrenCollapsible(False)
+        # V1.65 — 2D/3D swap for the preview viewer. A QStackedWidget holds the
+        # 2-D MultiAxisViewer (index 0) and a lazily-built PyVista3DViewer. The
+        # ``self.viewer`` reference stays the 2-D viewer so every existing
+        # overlay / coords caller is unaffected; only the top pane widget swaps.
+        self._view3d_stack = QStackedWidget()
+        self._view3d_stack.addWidget(self.viewer)
+        self.viewer3d = None
+        self._viewer_split.addWidget(self._view3d_stack)
+        self._panel_stack = QStackedWidget()
+        self._panel_stack.setVisible(False)
+        self._viewer_split.addWidget(self._panel_stack)
         self._spatial_panel: Optional[SpatialMapsPanel] = None
         self._serialtrack_panel = None  # type: Optional[Any]
         self._dvc_panel = None  # type: Optional[Any]
@@ -1085,11 +1673,40 @@ class PipelinesPage(QWidget):
         self._dvc_series_by_m: Dict[int, Dict[int, Any]] = {}     # primary (cumulative)
         self._dvc_incr_by_m: Dict[int, Dict[int, Any]] = {}       # raw increments
         self._dvc_bg_by_mt: Dict[int, Dict[int, Any]] = {}
+        # 2D DIC (pyALDIC, V1.78) — the 2D sibling of DVC. Reuses the DVCPanel widget
+        # + DVCResult container, but keeps its own per-M field-series stores + "dic"
+        # overlay tab so DIC and DVC results coexist. Same {m:{t:DVCResult}} shape.
+        self._dic_panel = None  # type: Optional[Any]
+        self._dic_series_by_m: Dict[int, Dict[int, Any]] = {}     # cumulative
+        self._dic_incr_by_m: Dict[int, Dict[int, Any]] = {}       # raw increments
+        self._dic_bg_by_mt: Dict[int, Dict[int, Any]] = {}
+        self._run_dic_node = None  # type: Optional[Any]
+        self._run_dic_display_m: Optional[int] = None
+        # DIC mesh side-artifacts (mirrored on the record): the drawn ROI mesh domain
+        # and the adaptive-refinement spec, published by the DIC Mesh nodes on Run.
+        self._dic_roi_by_m: Dict[int, Any] = {}
+        self._dic_refine_by_m: Dict[int, Any] = {}
+        # V1.76 — DVC export / reload. When a portable ``.nd2dvc`` bundle is imported
+        # (or auto-loaded from a saved DVC Checkpoint node), ``_dvc_from_bundle`` flips
+        # the DVC-panel feed to ``_populate_dvc_panel_from_bundle`` (which reads the
+        # per-m metadata in ``_dvc_bundle_meta`` instead of a live record), and
+        # whole-frame masks come from ``_dvc_bundle_whole_masks_by_m`` (kept separate
+        # from the live ``_mask3d_by_m`` so a reload never clobbers a real run). A real
+        # DVC run clears the flag.
+        self._dvc_from_bundle: bool = False
+        self._dvc_bundle_meta: Dict[str, Any] = {}
+        self._dvc_bundle_whole_masks_by_m: Dict[int, Dict[int, Any]] = {}
+        self._dvc_bundle_path: str = ""
         # Registration (V1.56): per-multipoint result bundle keyed by M →
         # {channel, raw_ref, aligned {ch:(T,H,W)}, shifts, confidence, ...}.
         self._registration_panel = None  # type: Optional[Any]
         self._reg_by_m: Dict[int, Dict[str, Any]] = {}
-        vc.addWidget(self._viewer_stack, stretch=1)
+        # 3D Mask Drawing (V1.65): per-multipoint drawn object mask, rasterized on
+        # Run to {m: {t: (Z,H,W) bool}} so a downstream node (Phase 2 DVC-on-object
+        # render) can restrict / colour the field to the object. Mirrored onto the
+        # record (``record._mask3d_by_m``) for cross-Run reuse.
+        self._mask3d_by_m: Dict[int, Dict[int, Any]] = {}
+        vc.addWidget(self._viewer_split, stretch=1)
 
         self._results_table_panel = QWidget()
         tp = QVBoxLayout(self._results_table_panel)
@@ -1097,9 +1714,9 @@ class PipelinesPage(QWidget):
         tp.setSpacing(4)
         self._results_summary = QLabel("No measurements yet — preview a Results node.")
         self._results_summary.setObjectName("resultsSummary")
-        self._results_summary.setStyleSheet(
+        self._results_summary.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         tp.addWidget(self._results_summary)
         self._results_table = QTableView()
         self._results_table.setObjectName("resultsTable")
@@ -1145,6 +1762,111 @@ class PipelinesPage(QWidget):
         self._right_split.setStretchFactor(1, 1)
         col.addWidget(self._right_split, stretch=1)
         return container
+
+    # ── V1.65 — 2D/3D toggle for the preview viewer ──────────────────────────
+    def _ensure_view3d(self) -> PyVista3DViewer:
+        """Lazily construct the 3-D preview viewer and add it to the stack."""
+        if self.viewer3d is None:
+            self.viewer3d = PyVista3DViewer(self)
+            self._view3d_stack.addWidget(self.viewer3d)
+        return self.viewer3d
+
+    def _toggle_view3d(self, enabled: bool) -> None:
+        if enabled:
+            viewer3d = self._ensure_view3d()
+            self._view3d_stack.setCurrentWidget(viewer3d)   # show the canvas first…
+            self._feed_view3d()                              # …then build + render
+        else:
+            self._view3d_stack.setCurrentWidget(self.viewer)
+
+    def _feed_view3d(self) -> None:
+        """Push the active record's raw volume into the 3-D preview viewer."""
+        if self.viewer3d is None:
+            return
+        record = self._active_record()
+        if record is None:
+            return
+        volume = getattr(record, "_raw_volume", None)
+        state = self.viewer.channel_state() or getattr(record, "channel_display", {})
+        if volume is None:
+            self.viewer3d.set_channels({}, channel_display=state)
+            m0, t0, _z0 = self.viewer.coords()
+            self._feed_view3d_granule_overlay(record, int(m0), int(t0))
+            return
+        m, t, z = self.viewer.coords()
+        self.viewer3d.set_volume(
+            volume, channel_display=state,
+            z_mode=getattr(record, "z_view_mode", "max") or "max",
+            z_index=int(getattr(record, "z_view_index", 0)),
+            m=int(m), t=int(t), z=int(z),
+        )
+        self._feed_view3d_granule_overlay(record, int(m), int(t))
+
+    def _feed_view3d_granule_overlay(self, record, m: int, t: int) -> None:
+        """Push a :class:`GranuleScene` into the 3-D viewer for the active granule
+        overlay mode (crosshairs / colored points / edges / assembled mask /
+        new+previous boundary), or clear it when the current mode is not a granule
+        mode. The raw volume fed by :meth:`_feed_view3d` renders underneath."""
+        if self.viewer3d is None:
+            return
+        mode = self._overlay_mode
+        granule_modes = ("granule_beads", "granule_clusters", "granule_tess",
+                         "granule_mask", "granule_boundary")
+        if mode not in granule_modes:
+            return
+        try:
+            from nd2studios.backend.analysis import granule_types as gt
+            from nd2studios.backend.viz3d import overlays as ov
+        except Exception:  # noqa: BLE001
+            return
+        voxel = self._granule_voxel_size(record)
+        scene = None
+        try:
+            if mode in ("granule_beads", "granule_clusters", "granule_tess"):
+                pts = self._granule_entry(gt.GRANULE_POINTS_ATTR, m, t)
+                if pts is not None and np.asarray(pts).size:
+                    pts = np.asarray(pts, dtype=float).reshape(-1, 3)
+                    if mode == "granule_beads":
+                        scene = ov.granule_points_scene(pts, voxel,
+                                                        draw_as="crosshair")
+                    else:
+                        labels = self._granule_point_labels(m, t, pts.shape[0])
+                        edges = None
+                        if mode == "granule_tess":
+                            tess = self._granule_entry(gt.GRANULE_TESS_ATTR, m, t)
+                            tmode = (str(getattr(tess, "mode", "alpha_shape"))
+                                     if tess is not None else "alpha_shape")
+                            edges = ov.granule_centroid_edges(pts, tmode)
+                        scene = ov.granule_points_scene(pts, voxel, labels=labels,
+                                                        edges=edges, draw_as="dot")
+            elif mode == "granule_mask":
+                entry = self._granule_entry(gt.GRANULE_MASKS_ATTR, m, t)
+                if isinstance(entry, dict) and entry.get(gt.COMBINED_LABELS_KEY) is not None:
+                    scene = ov.granule_mask_scene(
+                        np.asarray(entry[gt.COMBINED_LABELS_KEY]), voxel)
+            elif mode == "granule_boundary":
+                band_entry = self._granule_entry(gt.GRANULE_BANDS_ATTR, m, t)
+                if isinstance(band_entry, dict) and band_entry.get(gt.COMBINED_LABELS_KEY) is not None:
+                    band = np.asarray(band_entry[gt.COMBINED_LABELS_KEY])
+                    mask_entry = self._granule_entry(gt.GRANULE_MASKS_ATTR, m, t)
+                    prev = (np.asarray(mask_entry[gt.COMBINED_LABELS_KEY])
+                            if isinstance(mask_entry, dict)
+                            and mask_entry.get(gt.COMBINED_LABELS_KEY) is not None
+                            else None)
+                    if prev is not None and prev.shape == band.shape:
+                        new = prev.copy()
+                        fill = (prev == 0) & (band > 0)
+                        new[fill] = band[fill]
+                    else:
+                        new = band
+                    scene = ov.granule_boundary_scene(new, prev, voxel)
+        except Exception as exc:  # noqa: BLE001 — never break the 3-D feed
+            _log.warning("Granule 3-D scene build failed (%s): %s", mode, exc)
+            scene = None
+        try:
+            self.viewer3d.set_overlay(scene)   # None clears a stale granule scene
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── Maximize / pop-out (V1.46.3) ─────────────────────────────────────────
     def _toggle_popout(self, kind: str) -> None:
@@ -1230,14 +1952,14 @@ class PipelinesPage(QWidget):
             btn.setCheckable(True)
             btn.setObjectName("subTabBtn")
             accent = _STAGE_ACCENT[stage]
-            btn.setStyleSheet(
+            btn.setStyleSheet(scale_qss(
                 "QPushButton#subTabBtn{padding:6px 14px;border:none;"
                 f"border-bottom:2px solid transparent;color:{Settings.FG_SECONDARY};"
                 "background:transparent;font:bold 10pt;}"
                 "QPushButton#subTabBtn:checked{"
                 f"color:{accent};border-bottom:2px solid {accent};}}"
                 f"QPushButton#subTabBtn:hover{{color:{accent};}}"
-            )
+            ))
             btn.clicked.connect(lambda _c=False, s=stage: self._select_stage(s))
             self._subtab_group.addButton(btn)
             self._subtab_btns[stage] = btn
@@ -1347,26 +2069,45 @@ class PipelinesPage(QWidget):
                                      object_name="pipelineToolBtn")
         self._btn_load.clicked.connect(self._on_load)
         layout.addWidget(self._btn_load)
+        # V1.76 — reload an exported DVC bundle (.nd2dvc) as a portable DVC Checkpoint
+        # input node + render it in the DVC viewer, with no ND2 loaded and no Run.
+        self._btn_import_dvc = icon_button(
+            "fa5s.file-import",
+            "Import DVC results — reload a portable .nd2dvc bundle as a DVC "
+            "Checkpoint node and render it in the DVC viewer (no Run needed).",
+            object_name="pipelineToolBtn")
+        self._btn_import_dvc.clicked.connect(self._import_dvc_bundle)
+        layout.addWidget(self._btn_import_dvc)
 
         self._hint = QLabel("Add nodes via the Add button or right-click • "
                             "double-click a node to preview it • double-click a "
                             "wire to disconnect")
-        self._hint.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        self._hint.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 8pt;"))
         layout.addWidget(self._hint)
         return bar
 
     def _build_scene(self, stage: Stage) -> NodeScene:
         scene = NodeScene(self._doc.slice_for(stage), _STAGE_ACCENT[stage])
-        if stage is Stage.PROCESSING:
+        if stage is Stage.ANALYSIS:
+            # V1.61 merge: ONE scene holds enhancement (processing) + analysis +
+            # results + if-else + special nodes, each colored by category. Both
+            # output kinds are addable (processing bridge under the Processing
+            # submenu; the analysis/export output via "Add output node"), and
+            # `_on_output_created` dispatches by the node's stage.
+            # V1.61: one connected chain -- enhancement + analysis + results +
+            # logic + special nodes. Output nodes live at the END of analysis
+            # workflows; no intermediate processing-output / analysis-input bridge.
+            # The DVC Checkpoint node (V1.76) is created only by the Import flow — an
+            # empty one from the Add dialog is meaningless — so drop it from the palette.
+            scene.action_specs = [
+                s for s in (list(enhancement_specs()) + list(merged_action_specs()))
+                if s.op_key != SPECIAL_DVC_CHECKPOINT_OP_KEY]
+            scene.output_spec = analysis_output_spec()
+            scene.on_output_created = self._on_output_created
+        elif stage is Stage.PROCESSING:
             scene.action_specs = enhancement_specs()
             scene.output_spec = processing_output_spec()
             scene.on_output_created = self._on_output_node_created
-        elif stage is Stage.ANALYSIS:
-            # Merged tab: analysis pipelines + results ops + if-else + specials,
-            # each colored by category. Output node still bridges to Export.
-            scene.action_specs = merged_action_specs()
-            scene.output_spec = analysis_output_spec()
-            scene.on_output_created = self._on_analysis_output_created
         else:
             scene.allow_add = False
         scene.selection_changed.connect(self._on_scene_selection)
@@ -1374,7 +2115,19 @@ class PipelinesPage(QWidget):
         scene.graph_changed.connect(self._on_graph_changed)
         scene.node_renamed.connect(self._on_node_renamed)
         scene.loop_edge_edit_requested.connect(self._on_loop_edge_edit)  # V1.49
+        scene.edge_scope_changed.connect(self._on_edge_scope_changed)    # V1.68
         return scene
+
+    def _on_edge_scope_changed(self, edge_id: str, scope: str) -> None:
+        """A per-edge Frame ↔ Objects scope lever was toggled (V1.68).
+
+        The scope is already persisted on ``Edge.params`` by the scene; here we
+        just surface it and let the standard dirty path recompute the preview. The
+        scoped per-object execution is read from the edge at DVC-run time
+        (:meth:`_dvc_edge_scope_is_objects`)."""
+        human = "per-object" if scope == SCOPE_OBJECTS else "whole-frame"
+        self._set_status(f"Analysis scope set to {human} on this connection.")
+        self._on_graph_changed()
 
     # ── sub-tab switching ──────────────────────────────────────────────────
     def _select_stage(self, stage: Stage) -> None:
@@ -1395,23 +2148,23 @@ class PipelinesPage(QWidget):
         self._view.setScene(self._scenes[stage])
         self._subtab_btns[stage].setChecked(True)
         accent = _STAGE_ACCENT[stage]
-        self._view.setStyleSheet(
+        self._view.setStyleSheet(scale_qss(
             f"#nodeBoardView{{border:1px solid {accent};border-radius:6px;"
             f"background:{Settings.BG_PRIMARY};}}"
-        )
+        ))
         deferred = stage not in self._enabled_stages
         self._coming_soon.setVisible(deferred)
         if deferred:
             self._coming_soon.setGeometry(self._view.rect())
         self._popup.hide()
-        # Apply commits a recipe on Processing; the merged Analysis tab uses Run.
-        is_proc = stage is Stage.PROCESSING
-        self._btn_apply.setVisible(is_proc)
-        self._btn_apply.setEnabled(is_proc and not deferred)
-        self._btn_run.setVisible(not is_proc and not deferred)
-        self._btn_run.setEnabled(not is_proc and not deferred and not self._run_active)
-        # Loop connector lives on the merged Analysis tab (where the graph runs).
-        self._btn_loop.setVisible(stage is Stage.ANALYSIS and not deferred)
+        # V1.61 merge: one tab — Apply (commit the processing recipe) and Run
+        # (unified: commit recipe → walk the analysis graph) are both always
+        # available, as is the Loop connector.
+        self._btn_apply.setVisible(True)
+        self._btn_apply.setEnabled(not deferred)
+        self._btn_run.setVisible(True)
+        self._btn_run.setEnabled(not deferred and not self._run_active)
+        self._btn_loop.setVisible(True)
         self._btn_add.setEnabled(not deferred and self._scenes[stage].allow_add)
         self._set_preview_progress(visible=False)
 
@@ -1421,10 +2174,11 @@ class PipelinesPage(QWidget):
         self._update_merged_view_mode()
 
         if not deferred:
-            self._ensure_input_node(stage)
+            self._ensure_input_node(Stage.PROCESSING)  # V1.61: one universal input
             self._update_preview_highlight()
-            if stage is Stage.ANALYSIS:
-                self._show_base_image()
+            # V1.61: always show the (processed) base so the viewer is never blank;
+            # overlays / pinned processing previews layer on top.
+            self._show_base_image()
             self._request_preview()
         # Center on the whole graph for this sub-tab (deferred so the view has
         # its final size after the scene swap / layout).
@@ -1522,6 +2276,14 @@ class PipelinesPage(QWidget):
             edit_label = "Spatial map templates…"
         elif node.op_key == SPECIAL_REGISTER_OP_KEY:
             edit_label = "Pick ROI…"
+        elif node.op_key == SPECIAL_MASK3D_OP_KEY:
+            edit_label = "Draw 3D mask…"
+        elif node.op_key == SPECIAL_DIC_ROI_OP_KEY:
+            edit_label = "Draw mesh region…"
+        elif node.op_key == SPECIAL_DIC_REFINE_OP_KEY:
+            edit_label = "Draw refinement brush…"
+        elif node.op_key == SPECIAL_CROP_OP_KEY:
+            edit_label = "Pick crop region…"
         self._popup.show_for(node.title, specs, node.params, global_pt,
                              edit_label=edit_label)
 
@@ -1549,10 +2311,19 @@ class PipelinesPage(QWidget):
         # viewer. Works for every node — results / logic / special nodes preview
         # the upstream analysis result (table + overlay); editing a node's
         # condition / metrics is via the param popup's "Edit…" button instead.
-        if self._stage not in self._enabled_stages:
-            return
-        node = self._current_slice().nodes.get(node_id)
+        node = self._doc.analysis.nodes.get(node_id)
         if node is None:
+            return
+        # V1.61 merge: the (invisible) stage now *follows the previewed node* —
+        # a processing (enhancement) node previews the processed image; anything
+        # else previews the analysis overlay / results. This drives the existing
+        # per-stage preview / overlay machinery without a visible sub-tab.
+        self._stage = self._node_group(node)
+        # V1.62 (R3): the active record follows the input feeding this chain.
+        _fin = self._input_node_for(node_id)
+        if _fin:
+            self._focused_input_id = _fin
+        if self._stage not in self._enabled_stages:
             return
         # In the Analysis tab a double-click is a fresh start: cancel any preview
         # analysis still computing and reset its scratch before previewing the
@@ -1565,6 +2336,9 @@ class PipelinesPage(QWidget):
         # results overlay + measurements-table mode (and back for analysis).
         self._update_merged_view_mode()
         if self._stage is Stage.ANALYSIS:
+            # V1.61: commit the processing graph's recipe first so the analysis
+            # base reads the current processed image (was done on sub-tab switch).
+            self._sync_committed_recipe_from_graph()
             # Re-assert the (cropped) base image so the freshly-previewed node's
             # overlay lands on a current base — the reset cleared the old overlay.
             self._show_base_image()
@@ -1588,6 +2362,12 @@ class PipelinesPage(QWidget):
             self._edit_spatial_templates(node)
         elif node.op_key == SPECIAL_REGISTER_OP_KEY:
             self._edit_registration_roi(node)
+        elif node.op_key == SPECIAL_MASK3D_OP_KEY:
+            self._edit_mask3d(node)
+        elif node.op_key in (SPECIAL_DIC_ROI_OP_KEY, SPECIAL_DIC_REFINE_OP_KEY):
+            self._edit_dic_region(node)
+        elif node.op_key == SPECIAL_CROP_OP_KEY:
+            self._edit_crop_region(node)
         elif node.op_key.startswith(RESULTS_PREFIX):
             self._edit_measurement_metrics(node)
 
@@ -1607,8 +2387,8 @@ class PipelinesPage(QWidget):
             item.setToolTip(
                 f"Templates: {', '.join(node.params['templates']) or '(none)'}")
         # If the panel is live, re-apply so the change is reflected immediately.
-        if (self._spatial_panel is not None
-                and self._viewer_stack.currentWidget() is self._spatial_panel):
+        if (self._spatial_panel is not None and not self._panel_stack.isHidden()
+                and self._panel_stack.currentWidget() is self._spatial_panel):
             self._spatial_panel.set_node_templates(node.params["templates"])
 
     # ── Registration ROI picker (V1.60) ────────────────────────────────────
@@ -1733,6 +2513,193 @@ class PipelinesPage(QWidget):
         if roi.get("kind") == "shapes":
             return f"{len(roi.get('shapes', []))} freeform shape(s)"
         return "whole frame"
+
+    # ── Crop node region picker (V1.71) ─────────────────────────────────────
+    def _edit_crop_region(self, node) -> None:
+        """Pick the manual Crop node's rectangle, reusing the page's crop dialog
+        (x/y/w/h fields, jog pad, live cropped preview). Stored as ``(x, y, w, h)``
+        raw-image pixels in the hidden ``rect`` param; applied to every downstream
+        node on the next Run (see :meth:`_run_crop`)."""
+        cur = node.params.get("rect")
+        if cur and len(cur) == 4:
+            x, y, w, h = (int(v) for v in cur)
+        else:
+            x = y = w = h = 0  # dialog seeds to the full frame when w/h are 0
+        rect = self._show_preview_crop_dialog(int(x), int(y), int(w), int(h))
+        if rect is None:
+            return
+        self._set_crop_region(node, list(rect))
+
+    def _set_crop_region(self, node, rect) -> None:
+        node.params["rect"] = rect
+        try:  # keep the popup's hidden slot in sync (it round-trips params)
+            self._popup.editor.set_values({"rect": rect})
+        except Exception:  # noqa: BLE001
+            pass
+        item = self._scenes[self._stage].node_item(node.id)
+        if item is not None and rect:
+            x, y, w, h = rect
+            item.setToolTip(f"Crop {w}×{h} px @({x},{y})")
+        if rect:
+            self._set_status(
+                f"Crop region set to {rect[2]}×{rect[3]} px "
+                f"@({rect[0]},{rect[1]}). Applies downstream on the next Run.")
+
+    # ── 3D Mask Drawing editor (V1.65) ──────────────────────────────────────
+    def _mask3d_processed_volume(self, record, c_idx: int, m: int, t: int):
+        """The **registered** ``(Z,H,W)`` volume for ``(channel c_idx, m, t)`` — the
+        raw stack with the pipeline's registration (per-Z drift correction) applied,
+        so the mask is drawn over the same drift-corrected object the DVC field is
+        computed on (DVC registers the volume the same way in ``_DVCJob._read_volume``).
+
+        Registration is a within-frame pixel shift — it preserves the frame size and
+        coordinate origin — so the drawn mask stays in the full/raw frame that the
+        rest of the pipeline (per-object scoping's ``region.bbox ∩ crop``, the mask
+        rasterization in :meth:`_run_mask3d_node`) uses. The registration **crop** is
+        deliberately *not* applied here: cropping would move the mask into the cropped
+        frame and mismatch that raw-frame convention."""
+        vol = getattr(record, "_raw_volume", None)
+        v = np.asarray(vol.get_volume(int(c_idx), m=int(m), t=int(t)))
+        tf = (getattr(record, "_registration_by_m", None) or {}).get(int(m))
+        if tf:
+            from nd2studios.backend.registration import estimate as _est
+            order = int(getattr(record, "_registration_interp_order", 1) or 1)
+            try:
+                if v.ndim == 3:
+                    v = np.stack([_est.apply_frame(v[z], tf, int(t), interp_order=order)
+                                  for z in range(v.shape[0])], axis=0)
+                else:
+                    v = _est.apply_frame(v, tf, int(t), interp_order=order)
+            except Exception:  # noqa: BLE001 — never break the editor on a bad transform
+                pass
+        if v.ndim == 2:
+            v = v[None, ...]
+        return v
+
+    def _edit_mask3d(self, node) -> None:
+        """Open the per-Z 3D mask editor over the wired channel's **processed**
+        ``(Z,H,W)`` volume (registration + crop applied, matching DVC) for the current
+        multipoint. All channels wired into the node are offered as a dropdown; the
+        drawn object mask is channel-independent (only the displayed background
+        changes). Shapes are stored in ``node.params['mask_shapes']`` keyed
+        ``{str(m):{str(t):{z_key:[shapes]}}}`` and rasterized on Run
+        (:meth:`_run_mask3d_node`)."""
+        record = self._active_record()
+        vol = getattr(record, "_raw_volume", None) if record is not None else None
+        if record is None or vol is None or not hasattr(vol, "get_volume"):
+            self._set_status(f"{node.title}: no file imported — draw after import.")
+            return
+        names = list(getattr(vol, "channel_names", []) or [])
+        if not names:
+            self._set_status(f"{node.title}: no channels to draw over.")
+            return
+        # The channel(s) wired into the node's rainbow port (else offer all).
+        _extra, seg = self._analysis_run_spec(node, names)
+        channels = [c for c in (seg or names) if c in names] or list(names)
+        name_to_idx = {n: names.index(n) for n in channels}
+        n_z = int(getattr(vol, "n_zslices", 1) or 1)
+        n_t = int(getattr(vol, "n_timepoints", 1) or 1)
+        n_m = max(1, self._record_n_multipoints(record))
+        cur_m, cur_t, _ = self.viewer.coords()
+        cur_m = max(0, min(int(cur_m), n_m - 1))
+        cur_t = max(0, min(int(cur_t), n_t - 1))
+        registered = bool((getattr(record, "_registration_by_m", None) or {}).get(cur_m))
+
+        def _get_volume(channel, t):
+            ci = name_to_idx.get(channel, name_to_idx[channels[0]])
+            return self._mask3d_processed_volume(record, ci, cur_m, int(t))
+
+        from nd2studios.widgets.node_board.mask3d_editor_dialog import (
+            Mask3DEditorDialog,
+        )
+        store = dict(node.params.get("mask_shapes") or {})
+        shapes_by_t = store.get(str(cur_m), {})
+        px = getattr(record, "pixel_size_um", None) if record is not None else None
+        dlg = Mask3DEditorDialog(
+            _get_volume, n_z=n_z, n_t=n_t, cur_t=cur_t, shapes_by_t=shapes_by_t,
+            mode=str(node.params.get("mode") or "Propagate across Z"),
+            propagate=str(node.params.get("propagate") or "Interpolate between planes"),
+            pixel_size=px, channels=channels, channel=channels[0],
+            processed=registered, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        store[str(cur_m)] = dlg.result_shapes()
+        node.params["mask_shapes"] = store
+        node.params["mode"] = dlg.result_mode()
+        node.params["propagate"] = dlg.result_propagate()
+        try:  # keep the popup's hidden slots in sync (it round-trips params)
+            self._popup.editor.set_values({
+                "mask_shapes": store, "mode": node.params["mode"],
+                "propagate": node.params["propagate"]})
+        except Exception:  # noqa: BLE001
+            pass
+        n_planes = sum(len([k for k in by.keys() if k != "all"])
+                       for by in store.get(str(cur_m), {}).values())
+        item = self._scenes[self._stage].node_item(node.id)
+        if item is not None:
+            item.setToolTip(
+                f"3D mask · M{cur_m + 1} · {n_planes} drawn plane(s)")
+        self._set_status(
+            f"{node.title}: mask drawn on M{cur_m + 1} "
+            f"({n_planes} plane(s)); Run to build the (Z,H,W) volume.")
+
+    def _edit_dic_region(self, node) -> None:
+        """Open the 2D DIC mesh-region / refinement-brush editor over the wired
+        channel's **processed** (registration + crop applied) frame for the current
+        multipoint. Shapes are stored per-M in ``node.params['roi_shapes']`` (Mesh
+        Region) or ``['brush_shapes']`` (Mesh Refinement) and rasterized on Run
+        (:meth:`_run_dic_region`)."""
+        record = self._active_record()
+        vol = getattr(record, "_raw_volume", None) if record is not None else None
+        if record is None or vol is None or not hasattr(vol, "get_volume"):
+            self._set_status(f"{node.title}: no file imported — draw after import.")
+            return
+        names = list(getattr(vol, "channel_names", []) or [])
+        if not names:
+            self._set_status(f"{node.title}: no channels to draw over.")
+            return
+        _extra, seg = self._analysis_run_spec(node, names)
+        channels = [c for c in (seg or names) if c in names] or list(names)
+        ci = names.index(channels[0])
+        n_t = int(getattr(vol, "n_timepoints", 1) or 1)
+        n_m = max(1, self._record_n_multipoints(record))
+        cur_m, cur_t, _ = self.viewer.coords()
+        cur_m = max(0, min(int(cur_m), n_m - 1))
+        cur_t = max(0, min(int(cur_t), n_t - 1))
+
+        def _get_frame(t):
+            v = np.asarray(self._mask3d_processed_volume(record, ci, cur_m, int(t)))
+            return v.max(axis=0) if v.ndim == 3 else v
+
+        from nd2studios.widgets.node_board.dic_mesh_editor_dialog import (
+            DICMeshEditorDialog, MODE_ROI, MODE_REFINE,
+        )
+        is_roi = node.op_key == SPECIAL_DIC_ROI_OP_KEY
+        key = "roi_shapes" if is_roi else "brush_shapes"
+        store = dict(node.params.get(key) or {})
+        shapes = list(store.get(str(cur_m), []) or [])
+        px = getattr(record, "pixel_size_um", None) if record is not None else None
+        mesh_step = int(node.params.get("mesh_preview_step", 16) or 16)
+        dlg = DICMeshEditorDialog(
+            _get_frame, n_t=n_t, cur_t=cur_t, shapes=shapes,
+            mode=(MODE_ROI if is_roi else MODE_REFINE), mesh_step=mesh_step,
+            pixel_size=px, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        store[str(cur_m)] = dlg.result_shapes()
+        node.params[key] = store
+        try:  # keep the popup's hidden slot in sync (it round-trips params)
+            self._popup.editor.set_values({key: store})
+        except Exception:  # noqa: BLE001
+            pass
+        n_actions = len(store.get(str(cur_m), []))
+        label = "mesh region" if is_roi else "refinement brush"
+        item = self._scenes[self._stage].node_item(node.id)
+        if item is not None:
+            item.setToolTip(f"{label} · M{cur_m + 1} · {n_actions} action(s)")
+        self._set_status(
+            f"{node.title}: {label} drawn on M{cur_m + 1} "
+            f"({n_actions} action(s)); wire it into a DIC node and Run.")
 
     def _preview_validate(self, node) -> None:
         """Review objects in preview mode, on the current M's screened T planes.
@@ -1939,6 +2906,11 @@ class PipelinesPage(QWidget):
         scene = self._scenes.get(self._stage)
         if scene is not None:
             scene.refresh_channel_visuals()
+            # V1.68: re-evaluate per-edge Frame/Object scope levers (a newly wired
+            # mask/track/analysis→downstream edge should show its lever).
+            refresh = getattr(scene, "refresh_scope_levers", None)
+            if callable(refresh):
+                refresh()
         self._request_preview()
 
     def _clear_preview_shading(self) -> None:
@@ -2009,6 +2981,51 @@ class PipelinesPage(QWidget):
         )
         self._doc.bridges[bridge.id] = bridge
         node.bridge_id = bridge.id
+
+    def _on_output_created(self, node) -> None:
+        """Dispatch a freshly-created OUTPUT node to the right bridge registrar
+        (V1.61 merged scene holds both processing and analysis output nodes)."""
+        if node.stage is Stage.PROCESSING:
+            self._on_output_node_created(node)
+        else:
+            self._on_analysis_output_created(node)
+
+    # ── merged-scene stage grouping (V1.61) ──────────────────────────────────
+    def _node_group(self, node) -> Stage:
+        """Which half of the merged scene a node belongs to: ``PROCESSING``
+        (enhancement recipe nodes) or ``ANALYSIS`` (analysis / results / logic /
+        special — everything the GraphRunner executes)."""
+        return Stage.PROCESSING if node.stage is Stage.PROCESSING else Stage.ANALYSIS
+
+    def _stage_output_nodes(self, stage: Stage) -> List:
+        """OUTPUT nodes in the merged slice belonging to ``stage``'s group."""
+        return [n for n in self._doc.analysis.nodes.values()
+                if n.role is NodeRole.OUTPUT and self._node_group(n) is stage]
+
+    def _stage_input_node(self, stage: Stage):
+        """The INPUT node in the merged slice for ``stage``'s group (the file
+        input for PROCESSING, the processed-image input for ANALYSIS)."""
+        return next((n for n in self._doc.analysis.nodes.values()
+                     if n.role is NodeRole.INPUT and self._node_group(n) is stage),
+                    None)
+
+    def _processing_tail_node(self):
+        """The tail of the processing chain: the deepest enhancement (PROCESSING
+        ACTION) node that does NOT feed another enhancement node -- i.e. the node
+        whose recipe is the full committed processing recipe (its chain back to the
+        universal input). ``None`` when there are no enhancement nodes."""
+        sl = self._doc.analysis
+        enh_ids = {n.id for n in sl.nodes.values()
+                   if n.role is NodeRole.ACTION and n.stage is Stage.PROCESSING}
+        if not enh_ids:
+            return None
+        for nid in reversed(topological_order(sl)):
+            if nid not in enh_ids:
+                continue
+            succ = [e.dst_node for e in sl.structural_outgoing(nid)]
+            if not any(x in enh_ids for x in succ):
+                return sl.nodes.get(nid)
+        return sl.nodes.get(next(iter(enh_ids)))
 
     def _on_node_renamed(self, node_id: str, title: str) -> None:
         """Keep an output node's bridge name in sync with its (edited) title, so
@@ -2221,19 +3238,25 @@ class PipelinesPage(QWidget):
                 self._start_preview_walk(target, interactive)
 
     def _preview_target(self, stage: Stage) -> str:
-        """Node to preview: the sticky previewed node, else the primary output,
-        else the first action node, else the input."""
+        """Node to preview for ``stage``'s group: the sticky previewed node, else
+        that group's primary output, else its first action node, else its input.
+        V1.61 merge: filtered to the stage group (the merged slice holds both
+        processing enhancement nodes and analysis nodes)."""
         sl = self._doc.slice_for(stage)
         pid = self._preview_node_ids.get(stage, "")
         if pid and pid in sl.nodes:
             return pid
-        outs = output_nodes(sl)
+        outs = self._stage_output_nodes(stage)
         if outs:
             return outs[0].id
+        if stage is Stage.PROCESSING:
+            tail = self._processing_tail_node()
+            if tail is not None:
+                return tail.id
         for node in sl.nodes.values():
-            if node.role is NodeRole.ACTION:
+            if node.role is NodeRole.ACTION and self._node_group(node) is stage:
                 return node.id
-        inp = input_node(sl)
+        inp = self._stage_input_node(stage)
         return inp.id if inp is not None else ""
 
     def _resolve_preview_run_target(self) -> str:
@@ -2251,7 +3274,7 @@ class PipelinesPage(QWidget):
         target = self._preview_target(Stage.ANALYSIS)
         if target and self._upstream_analysis_node(target) is not None:
             return target
-        outs = output_nodes(sl)
+        outs = self._stage_output_nodes(Stage.ANALYSIS)
         if outs:
             return outs[-1].id
         for nid in reversed(topological_order(sl)):
@@ -2310,18 +3333,21 @@ class PipelinesPage(QWidget):
         target = self._preview_target(Stage.PROCESSING)
         if not target:
             return
+        # V1.61 merge: processing nodes live in the merged slice; the chain back
+        # from a processing node stays within the processing component.
+        sl = self._doc.analysis
         try:
-            recipe = recipe_for_node(self._doc.processing, target)
+            recipe = recipe_for_node(sl, target)
         except ValueError:
             # Node not connected back to the input — nothing to show yet.
             return
         # V1.48: with channel wiring, preview per-channel (unwired channels stay
         # raw) up to the previewed node's chain.
         rbc = None
-        if has_channel_wiring(self._doc.processing):
+        if has_channel_wiring(sl):
             names = list((record._raw_channels or {}).keys())
             try:
-                rbc = channel_recipes(self._doc.processing, target, names)
+                rbc = channel_recipes(sl, target, names)
             except Exception:  # noqa: BLE001
                 rbc = None
         # Preview the plane(s) the user is on: the current frame, or — when a
@@ -2364,15 +3390,41 @@ class PipelinesPage(QWidget):
     def _crop_rect(self) -> Optional[Tuple[int, int, int, int]]:
         """The active crop ``(x, y, w, h)`` in raw-image pixels, or None.
 
-        Composes two rectangles (both in original-frame coords): the **preview
-        crop** (only on cropped Runs / outside a Run) and the **registration
+        Composes three rectangles (all in original-frame coords): the **preview
+        crop** (only on cropped Runs / outside a Run), the **registration
         common-region crop** (V1.60 — always active once a Registration node with
         "Crop to common region" has published it, even on a full Run, so every
-        downstream consumer sees the border-free registered image). When both are
-        set the effective crop is their intersection."""
+        downstream consumer sees the border-free registered image), and the
+        **manual Crop-node crop** (V1.71 — published by a `special:crop` node when
+        a Run reaches it, so every downstream node reads the cropped image). When
+        more than one is set the effective crop is their intersection."""
         preview = (None if (self._run_active and not self._run_cropped)
                    else self._preview_crop)
-        return self._intersect_crop_rects(preview, self._registration_crop_rect())
+        rect = self._intersect_crop_rects(preview, self._registration_crop_rect())
+        return self._intersect_crop_rects(rect, self._pipeline_crop_rect())
+
+    def _pipeline_crop_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        """The manual Crop-node rect ``(x, y, w, h)`` published on the record by
+        :meth:`_run_crop`, or None. Stored directly as ``(x, y, w, h)`` in
+        raw-image pixels (V1.71). Clamped to the record's raw frame so a persisted
+        rect can never slice an empty (zero-size) region — which would blank the
+        viewer / crash the LUT histogram — if the displayed geometry differs."""
+        rec = self._active_record()
+        c = getattr(rec, "_pipeline_crop", None) if rec is not None else None
+        if not c:
+            return None
+        x, y, w, h = (int(v) for v in c)
+        if w <= 0 or h <= 0:
+            return None
+        shape = self._raw_frame_shape(rec)
+        if shape is not None:
+            fh, fw = shape
+            if fh > 0 and fw > 0:
+                x = max(0, min(x, fw - 1))
+                y = max(0, min(y, fh - 1))
+                w = max(1, min(w, fw - x))
+                h = max(1, min(h, fh - y))
+        return (x, y, w, h)
 
     def _registration_crop_rect(self) -> Optional[Tuple[int, int, int, int]]:
         """The published registration common-region crop as ``(x, y, w, h)``, or
@@ -2401,6 +3453,30 @@ class PipelinesPage(QWidget):
         if x1 <= x0 or y1 <= y0:
             return b
         return (x0, y0, x1 - x0, y1 - y0)
+
+    def _effective_run_crop(self) -> Optional[Tuple[int, int, int, int]]:
+        """The crop that will actually scope the *next / current* Run: the preview
+        crop only when a cropped Run was chosen (``_run_cropped``), intersected with
+        the registration common-region crop. Unlike :meth:`_crop_rect` this is
+        stable **before** ``_run_active`` flips, so checkpoint selection at run start
+        sees the region the Run will use (V1.59)."""
+        preview = self._preview_crop if self._run_cropped else None
+        rect = self._intersect_crop_rects(preview, self._registration_crop_rect())
+        return self._intersect_crop_rects(rect, self._pipeline_crop_rect())
+
+    @staticmethod
+    def _crop_contains(outer, inner) -> bool:
+        """True if ``inner`` ``(x,y,w,h)`` lies fully within ``outer`` (both in
+        original-frame coords). ``outer=None`` means full frame (contains anything);
+        a concrete ``outer`` cannot contain a ``None`` (full-frame) request."""
+        if outer is None:
+            return True
+        if inner is None:
+            return False
+        ox, oy, ow, oh = outer
+        ix, iy, iw, ih = inner
+        return (ix >= ox and iy >= oy
+                and ix + iw <= ox + ow and iy + ih <= oy + oh)
 
     def _crop_frame(self, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
         """Slice a frame's XY to the preview crop if one is active.
@@ -2489,6 +3565,15 @@ class PipelinesPage(QWidget):
         any active crop and restore the full-frame preview."""
         if on:
             self._crop_selecting = True
+            # V1.61: the crop rubber-band lives on the image viewer. After a Run /
+            # analysis node switched the display to a specialized overlay panel
+            # (Registration / DVC / Spatial / SerialTrack) or a table-only results
+            # view, bring the image viewer back to the front so the crop stays
+            # accessible.
+            self._set_panel_visible("viewer", True)
+            if (getattr(self, "_panel_stack", None) is not None
+                    and not self._panel_stack.isHidden()):
+                self._select_overlay_tab("image")
             # With Preview off the viewer may have no image to draw on — show the
             # navigable base so the user can rubber-band a crop regardless.
             if (not self._btn_preview.isChecked()
@@ -2609,7 +3694,7 @@ class PipelinesPage(QWidget):
         outer = QVBoxLayout(dlg)
         info = QLabel(f"Image: {img_w} × {img_h} px  "
                       f"(X = columns from left, Y = rows from top)")
-        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         outer.addWidget(info)
 
         body = QHBoxLayout()
@@ -2691,11 +3776,11 @@ class PipelinesPage(QWidget):
         preview = QLabel()
         preview.setFixedSize(preview_px, preview_px)
         preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview.setStyleSheet(
-            f"background-color: {Settings.BG_SECONDARY}; border: 1px solid #555;")
+        preview.setStyleSheet(scale_qss(
+            f"background-color: {Settings.BG_SECONDARY}; border: 1px solid #555;"))
         right.addWidget(preview)
         dims_lbl = QLabel("")
-        dims_lbl.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        dims_lbl.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         dims_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right.addWidget(dims_lbl)
         right.addStretch(1)
@@ -3323,7 +4408,269 @@ class PipelinesPage(QWidget):
             return self._paint_vectors_overlay(rgb, t, m, gridded=False)
         if mode == "vectors_field":
             return self._paint_vectors_overlay(rgb, t, m, gridded=True)
+        if mode == "granule_beads":
+            return self._paint_granule_beads(rgb, t, m)
+        if mode == "granule_clusters":
+            return self._paint_granule_clusters(rgb, t, m)
+        if mode == "granule_tess":
+            return self._paint_granule_tess(rgb, t, m)
+        if mode == "granule_mask":
+            return self._paint_granule_mask(rgb, t, m)
+        if mode == "granule_boundary":
+            return self._paint_granule_boundary(rgb, t, m)
         return rgb
+
+    # ── Granule node 2-D overlays (V1.73) ────────────────────────────────────
+    def _granule_entry(self, attr: str, m: int, t: int):
+        """The ``(m, t)`` entry of a granule store, falling back to the sole ``t``
+        that exists (granules are defined on one reference timepoint per M)."""
+        store = self._granule_read_store(self._active_record(), attr)
+        bt = store.get(int(m)) if isinstance(store, dict) else None
+        if not bt:
+            return None
+        # NB: values may be numpy arrays — never use ``a or b`` (ambiguous truth).
+        v = bt.get(int(t))
+        if v is None:
+            try:
+                v = next(iter(bt.values()))   # the sole reference-frame t
+            except StopIteration:
+                return None
+        return v
+
+    def _granule_alpha(self) -> float:
+        style = self._overlay_style()
+        return (float(style.get("alpha", 0.45)) if style.get("enabled") else 0.45)
+
+    def _granule_display_points(self, pts_zyx, record):
+        """``(xy int (K,2), idx (K,))`` for points on the current plane, in DISPLAY
+        (crop-inverted) coords. Per-Z filter only when ``z_view_mode == "none"``;
+        otherwise the frame is a projection so all points are shown."""
+        pts = np.asarray(pts_zyx, dtype=float).reshape(-1, 3)
+        if pts.shape[0] == 0:
+            return np.zeros((0, 2), int), np.zeros((0,), int)
+        _m, _t, z = self.viewer.coords()
+        z_mode = getattr(record, "z_view_mode", "max") or "max"
+        if z_mode == "none":
+            idx = np.where(np.abs(pts[:, 0] - float(z)) <= 0.75)[0]
+        else:
+            idx = np.arange(pts.shape[0])
+        rect = self._crop_rect()
+        ox, oy = (int(rect[0]), int(rect[1])) if rect else (0, 0)
+        xy = np.empty((idx.shape[0], 2), int)
+        xy[:, 0] = np.round(pts[idx, 2] - ox).astype(int)   # x = x_vox - crop_x
+        xy[:, 1] = np.round(pts[idx, 1] - oy).astype(int)   # y = y_vox - crop_y
+        return xy, idx
+
+    def _granule_point_labels(self, m: int, t: int, n: int):
+        """Final granule label per point: tessellation ``point_labels`` when present
+        (post-merge ids), else the cluster store's GMM labels. ``None`` if neither
+        matches ``n`` points."""
+        from nd2studios.backend.analysis import granule_types as gt
+        tess = self._granule_entry(gt.GRANULE_TESS_ATTR, m, t)
+        pl = getattr(tess, "point_labels", None) if tess is not None else None
+        if pl is not None:
+            pl = np.asarray(pl)
+            if pl.shape[0] == n:
+                return pl.astype(int)
+        lab = self._granule_entry(gt.GRANULE_LABELS_ATTR, m, t)
+        if lab is not None:
+            lab = np.asarray(lab)
+            if lab.shape[0] == n:
+                return lab.astype(int)
+        return None
+
+    def _granule_plane_labels(self, vol, record):
+        """Slice a ``(Z,H,W)`` label volume to the current display plane (the Z slice
+        when ``z_view_mode == "none"``, else the max-id projection), cropped to the
+        displayed frame."""
+        vol = np.asarray(vol)
+        if vol.ndim == 2:
+            vol = vol[None, ...]
+        _m, _t, z = self.viewer.coords()
+        z_mode = getattr(record, "z_view_mode", "max") or "max"
+        if z_mode == "none":
+            zz = int(np.clip(int(round(z)), 0, vol.shape[0] - 1))
+            plane = vol[zz]
+        else:
+            plane = vol.max(axis=0)
+        rect = self._crop_rect()
+        if rect:
+            x, y, w, h = (int(v) for v in rect)
+            plane = plane[y:y + h, x:x + w]
+        return np.ascontiguousarray(plane)
+
+    def _blend_label_plane(self, rgb, lbl_z, *, alpha=0.45, outline=False,
+                           thickness=2):
+        """Blend a 2-D label plane onto ``rgb`` using :func:`granule_color` per id
+        (fills, or per-label inner-boundary outlines when ``outline``)."""
+        from nd2studios.backend.analysis.granule_types import granule_color
+        out = np.ascontiguousarray(rgb).astype(np.uint8)
+        lbl_z = np.asarray(lbl_z)
+        if lbl_z.shape != out.shape[:2]:
+            from skimage.transform import resize as _rs
+            lbl_z = _rs(lbl_z, out.shape[:2], order=0, preserve_range=True,
+                        anti_aliasing=False).astype(np.int32)
+        res = out.astype(np.float32)
+        for gid in (int(v) for v in np.unique(lbl_z) if int(v) > 0):
+            mm = (lbl_z == gid)
+            if outline:
+                from skimage.segmentation import find_boundaries
+                from nd2studios.pages.analysis_page import _thicken
+                mm = _thicken(find_boundaries(mm, mode="inner"), thickness)
+            if not mm.any():
+                continue
+            col = granule_color(gid)
+            for c in range(3):
+                res[mm, c] = (1 - alpha) * res[mm, c] + alpha * col[c]
+        return np.clip(res, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _draw_dashed_contour(out, contour, color, dash=4, gap=4, thickness=1):
+        """Draw an OpenCV contour as a dashed polyline (cv2 has no dashed primitive)."""
+        import cv2
+        pts = np.asarray(contour).reshape(-1, 2).astype(float)
+        if pts.shape[0] < 2:
+            return
+        acc = 0.0
+        for i in range(pts.shape[0]):
+            a = pts[i]
+            b = pts[(i + 1) % pts.shape[0]]
+            seg = float(np.hypot(*(b - a)))
+            if seg < 1e-6:
+                continue
+            d = (b - a) / seg
+            tt = 0.0
+            while tt < seg:
+                on = (int(acc // max(1, dash)) % 2 == 0)
+                t2 = min(tt + (dash if on else gap), seg)
+                if on:
+                    p0 = tuple((a + d * tt).astype(int))
+                    p1 = tuple((a + d * t2).astype(int))
+                    cv2.line(out, p0, p1, color, thickness, cv2.LINE_AA)
+                acc += (t2 - tt)
+                tt = t2
+
+    def _paint_granule_beads(self, rgb: np.ndarray, t: int, m: int) -> np.ndarray:
+        """Node 1 — a crosshair at each bead centroid on its plane."""
+        import cv2
+        from nd2studios.backend.analysis import granule_types as gt
+        record = self._active_record()
+        pts = self._granule_entry(gt.GRANULE_POINTS_ATTR, m, t)
+        if record is None or pts is None or np.asarray(pts).size == 0:
+            return rgb
+        out = np.ascontiguousarray(rgb).astype(np.uint8)
+        xy, _idx = self._granule_display_points(np.asarray(pts), record)
+        for (x, y) in xy:
+            cv2.drawMarker(out, (int(x), int(y)), (255, 255, 0),
+                           markerType=cv2.MARKER_CROSS, markerSize=11,
+                           thickness=1, line_type=cv2.LINE_AA)
+        return out
+
+    def _paint_granule_clusters(self, rgb: np.ndarray, t: int, m: int) -> np.ndarray:
+        """Node 2 — centroid dots colored by the granule they belong to."""
+        import cv2
+        from nd2studios.backend.analysis import granule_types as gt
+        record = self._active_record()
+        pts = self._granule_entry(gt.GRANULE_POINTS_ATTR, m, t)
+        if record is None or pts is None or np.asarray(pts).size == 0:
+            return rgb
+        pts = np.asarray(pts)
+        labels = self._granule_point_labels(m, t, pts.shape[0])
+        out = np.ascontiguousarray(rgb).astype(np.uint8)
+        xy, idx = self._granule_display_points(pts, record)
+        for k in range(xy.shape[0]):
+            gid = int(labels[idx[k]]) if labels is not None else 1
+            col = gt.granule_color(gid) if gid > 0 else gt.NOISE_COLOR
+            cv2.circle(out, (int(xy[k, 0]), int(xy[k, 1])), 3, col, -1, cv2.LINE_AA)
+        return out
+
+    def _paint_granule_tess(self, rgb: np.ndarray, t: int, m: int) -> np.ndarray:
+        """Node 3 — tessellation lines between all centroids + colored dots."""
+        import cv2
+        from nd2studios.backend.analysis import granule_types as gt
+        from nd2studios.backend.viz3d.overlays import granule_centroid_edges
+        record = self._active_record()
+        pts = self._granule_entry(gt.GRANULE_POINTS_ATTR, m, t)
+        if record is None or pts is None or np.asarray(pts).size == 0:
+            return rgb
+        pts = np.asarray(pts, dtype=float).reshape(-1, 3)
+        tess = self._granule_entry(gt.GRANULE_TESS_ATTR, m, t)
+        mode = str(getattr(tess, "mode", "alpha_shape")) if tess is not None else "alpha_shape"
+        out = np.ascontiguousarray(rgb).astype(np.uint8)
+        rect = self._crop_rect()
+        ox, oy = (int(rect[0]), int(rect[1])) if rect else (0, 0)
+        disp = np.column_stack([np.round(pts[:, 2] - ox),
+                                np.round(pts[:, 1] - oy)]).astype(int)
+        # Edges span Z, so draw the FULL network (projected), not z-filtered.
+        edges = granule_centroid_edges(pts, mode)
+        for i, j in edges:
+            cv2.line(out, tuple(disp[int(i)]), tuple(disp[int(j)]),
+                     (0, 255, 255), 1, cv2.LINE_AA)
+        # Dots colored by final label (z-filtered when z_mode=="none").
+        labels = self._granule_point_labels(m, t, pts.shape[0])
+        xy, idx = self._granule_display_points(pts, record)
+        for k in range(xy.shape[0]):
+            gid = int(labels[idx[k]]) if labels is not None else 1
+            col = gt.granule_color(gid) if gid > 0 else gt.NOISE_COLOR
+            cv2.circle(out, (int(xy[k, 0]), int(xy[k, 1])), 3, col, -1, cv2.LINE_AA)
+        return out
+
+    def _paint_granule_mask(self, rgb: np.ndarray, t: int, m: int) -> np.ndarray:
+        """Node 4 — per-plane per-granule mask, categorical color per granule id."""
+        from nd2studios.backend.analysis import granule_types as gt
+        record = self._active_record()
+        entry = self._granule_entry(gt.GRANULE_MASKS_ATTR, m, t)
+        if record is None or not isinstance(entry, dict):
+            return rgb
+        vol = entry.get(gt.COMBINED_LABELS_KEY)
+        if vol is None:
+            return rgb
+        lbl_z = self._granule_plane_labels(vol, record)
+        return self._blend_label_plane(rgb, lbl_z, alpha=self._granule_alpha())
+
+    def _paint_granule_boundary(self, rgb: np.ndarray, t: int, m: int) -> np.ndarray:
+        """Node 5 — SOLID new (mask∪band) boundary + DOTTED previous (node-4) mask
+        boundary, per granule, sharing the granule's categorical color."""
+        import cv2
+        from nd2studios.backend.analysis import granule_types as gt
+        record = self._active_record()
+        band_entry = self._granule_entry(gt.GRANULE_BANDS_ATTR, m, t)
+        if record is None or not isinstance(band_entry, dict):
+            return rgb
+        band_vol = band_entry.get(gt.COMBINED_LABELS_KEY)
+        if band_vol is None:
+            return rgb
+        mask_entry = self._granule_entry(gt.GRANULE_MASKS_ATTR, m, t)
+        prev_vol = (mask_entry.get(gt.COMBINED_LABELS_KEY)
+                    if isinstance(mask_entry, dict) else None)
+        out = np.ascontiguousarray(rgb).astype(np.uint8)
+        band_plane = self._granule_plane_labels(band_vol, record)
+        prev_plane = (self._granule_plane_labels(prev_vol, record)
+                      if prev_vol is not None else None)
+        # New = mask ∪ band (band is an outward shell; mask keeps priority on overlap).
+        if prev_plane is not None and prev_plane.shape == band_plane.shape:
+            new_plane = prev_plane.copy()
+            fill = (prev_plane == 0) & (band_plane > 0)
+            new_plane[fill] = band_plane[fill]
+        else:
+            new_plane = band_plane
+        ids = set(int(v) for v in np.unique(new_plane) if int(v) > 0)
+        if prev_plane is not None:
+            ids |= set(int(v) for v in np.unique(prev_plane) if int(v) > 0)
+        for gid in sorted(ids):
+            col = gt.granule_color(gid)
+            m_new = (new_plane == gid).astype(np.uint8)
+            cnts, _h = cv2.findContours(m_new, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(out, cnts, -1, col, 2, cv2.LINE_AA)   # solid new
+            if prev_plane is not None:
+                m_prev = (prev_plane == gid).astype(np.uint8)
+                pcnts, _hp = cv2.findContours(m_prev, cv2.RETR_EXTERNAL,
+                                              cv2.CHAIN_APPROX_SIMPLE)
+                for c in pcnts:
+                    self._draw_dashed_contour(out, c, col, dash=4, gap=4,
+                                              thickness=1)   # dotted previous
+        return out
 
     def _ensure_spatial_panel(self):
         """Lazily build the Spatial Maps panel and add it to the viewer stack."""
@@ -3333,7 +4680,7 @@ class PipelinesPage(QWidget):
             self._spatial_panel.m_change_requested.connect(
                 self._populate_spatial_panel)
             self._spatial_panel.status_message.connect(self._set_status)
-            self._viewer_stack.addWidget(self._spatial_panel)   # index 1
+            self._panel_stack.addWidget(self._spatial_panel)   # index 1
             # Match the current docked / popped-out state of the viewer.
             self._spatial_panel.set_compact(
                 self._popout_windows.get("viewer") is None)
@@ -3347,7 +4694,7 @@ class PipelinesPage(QWidget):
             self._serialtrack_panel.m_change_requested.connect(
                 self._populate_serialtrack_panel)
             self._serialtrack_panel.status_message.connect(self._set_status)
-            self._viewer_stack.addWidget(self._serialtrack_panel)
+            self._panel_stack.addWidget(self._serialtrack_panel)
         return self._serialtrack_panel
 
     def _populate_serialtrack_panel(self, m: Optional[int] = None) -> None:
@@ -3407,6 +4754,54 @@ class PipelinesPage(QWidget):
             f"SerialTrack: M{m + 1} · {n_rows} objects · shape {field_shape} · "
             f"{n_frames} frame(s) · {len(channels or {})} channel(s)")
 
+    def _ensure_dic_panel(self):
+        """Lazily build the DIC viewer panel (a reused DVCPanel) for 2D DIC results."""
+        if getattr(self, "_dic_panel", None) is None:
+            from nd2studios.widgets.dvc_panel import DVCPanel
+            self._dic_panel = DVCPanel(self)
+            self._dic_panel.m_change_requested.connect(self._populate_dic_panel)
+            self._dic_panel.status_message.connect(self._set_status)
+            self._panel_stack.addWidget(self._dic_panel)
+        return self._dic_panel
+
+    def _populate_dic_panel(self, m: Optional[int] = None) -> None:
+        """Feed the current multipoint's 2D DIC field series to the reused DVCPanel."""
+        panel = getattr(self, "_dic_panel", None)
+        if panel is None:
+            return
+        by_m = getattr(self, "_dic_series_by_m", {}) or {}
+        if m is None:
+            cm, _, _ = self.viewer.coords()
+            m = int(cm)
+        m = int(m)
+        if m not in by_m and by_m:
+            m = sorted(by_m)[0]
+        series = by_m.get(m, {})
+        increments = (getattr(self, "_dic_incr_by_m", {}) or {}).get(m, {})
+        bg_map = (getattr(self, "_dic_bg_by_mt", {}) or {}).get(m, {})
+        record = self._active_record()
+        n_mp = self._record_n_multipoints(record) if record is not None else 1
+        vol = getattr(record, "_raw_volume", None) if record is not None else None
+        n_t = int(getattr(vol, "n_timepoints", 0) or 0)
+        frames = sorted(series)
+        if n_t <= 0:
+            n_t = (max(frames) + 1) if frames else 1
+        eff_px = None
+        field_shape = None
+        if frames:
+            r0 = series[frames[0]]
+            if r0.voxel_size_um:
+                eff_px = float(r0.voxel_size_um[-1])
+            bg0 = bg_map.get(frames[0])
+            if bg0 is not None and np.asarray(bg0).ndim >= 2:
+                field_shape = tuple(int(v) for v in np.asarray(bg0).shape[-2:])
+        panel.set_data(series, bg_map, frames, pixel_size=eff_px,
+                       field_shape=field_shape, m=m, n_multipoints=n_mp,
+                       n_frames_total=n_t, increments=increments or None)
+        if frames:
+            self._set_status(
+                f"DIC: M{m + 1} · {len(frames)} field(s) across {n_t} frame(s)")
+
     def _ensure_dvc_panel(self):
         """Lazily build the DVC viewer panel and add it to the viewer stack."""
         if getattr(self, "_dvc_panel", None) is None:
@@ -3414,7 +4809,7 @@ class PipelinesPage(QWidget):
             self._dvc_panel = DVCPanel(self)
             self._dvc_panel.m_change_requested.connect(self._populate_dvc_panel)
             self._dvc_panel.status_message.connect(self._set_status)
-            self._viewer_stack.addWidget(self._dvc_panel)
+            self._panel_stack.addWidget(self._dvc_panel)
         return self._dvc_panel
 
     def _populate_dvc_panel(self, m: Optional[int] = None) -> None:
@@ -3432,6 +4827,11 @@ class PipelinesPage(QWidget):
         m = int(m)
         if m not in by_m and by_m:
             m = sorted(by_m)[0]
+        # V1.76 — a reloaded bundle has no live record to derive frame counts / pixel
+        # sizes / channel names from, so it feeds the panel from the saved metadata.
+        if getattr(self, "_dvc_from_bundle", False):
+            self._populate_dvc_panel_from_bundle(m)
+            return
         series = by_m.get(m, {})
         increments = (getattr(self, "_dvc_incr_by_m", {}) or {}).get(m, {})
         bg_map = (getattr(self, "_dvc_bg_by_mt", {}) or {}).get(m, {})
@@ -3453,12 +4853,572 @@ class PipelinesPage(QWidget):
             bg0 = bg_map.get(frames[0])
             if bg0 is not None and np.asarray(bg0).ndim >= 2:
                 field_shape = tuple(int(v) for v in np.asarray(bg0).shape[-2:])
+        # 3-D object view (Phase 2): the per-frame drawn mask for this M (from a
+        # 3D Mask Drawing node), plus the RAW voxel size so the mask aligns with the
+        # (possibly downsampled) DVC grid in physical µm.
+        # V1.68 — per-object DVC displays the object's own cropped mask (so the
+        # 3-D object surface is that one object); whole-frame uses the drawn mask.
+        obj_masks = getattr(self, "_dvc_display_mask_by_m", {}) or {}
+        if obj_masks.get(m):
+            masks = obj_masks.get(m, {})
+        else:
+            masks_by_m = (getattr(record, "_mask3d_by_m", None)
+                          or getattr(self, "_mask3d_by_m", {}) or {})
+            masks = masks_by_m.get(m, {}) if isinstance(masks_by_m, dict) else {}
+        raw_px = float(getattr(record, "pixel_size_um", 1.0) or 1.0) if record else 1.0
+        # Prefer the volume's real z-step (record.z_step_um can be a 1.0 default).
+        raw_zs = float(getattr(vol, "z_step_um", None)
+                       or getattr(record, "z_step_um", 1.0) or 1.0)
+        # V1.68 — surrounding-channel context provider (a different channel drawn
+        # around the object), per-frame timestamps for ⟨Θ⟩, and the mask node's
+        # surface-smoothing count, for the DVC-on-object surface / unwrap views.
+        ctx_channels = list(getattr(vol, "channel_names", []) or [])
+        context_provider = None
+        if vol is not None and hasattr(vol, "get_volume") and ctx_channels:
+            def context_provider(mm, tt, ci, _vol=vol):
+                try:
+                    return np.asarray(_vol.get_volume(c=int(ci), m=int(mm), t=int(tt)))
+                except Exception:  # noqa: BLE001
+                    return None
+        # V1.77 — a Prism converged a channel into this DVC node as a VIEW-ONLY overlay.
+        # Clip that channel's context volume to the granule shell (the band between the
+        # volume-mask boundary and the boundary-extraction boundary) and default the DVC
+        # panel's context selector to it, so the overlay appears with no manual picking.
+        prism_ov = ((getattr(record, "_prism_overlay_by_m", {}) or {}).get(m)
+                    if record is not None else None)
+        prism_default_ctx = None
+        prism_default_mode = None
+        if prism_ov is not None and context_provider is not None:
+            _ov_ci = prism_ov.get("channel_idx")
+            _ov_shell = prism_ov.get("shell")
+            _base_ctx = context_provider
+
+            def context_provider(mm, tt, ci, _b=_base_ctx, _ci=_ov_ci, _shell=_ov_shell):
+                v = _b(mm, tt, ci)
+                if (v is not None and _ci is not None and int(ci) == int(_ci)
+                        and _shell is not None):
+                    v = np.asarray(v)
+                    sh = np.asarray(_shell)
+                    if v.shape == sh.shape:            # clip the overlay to the shell
+                        v = np.where(sh, v, 0)
+                return v
+            if prism_ov.get("channel") in ctx_channels:
+                prism_default_ctx = prism_ov.get("channel")
+                prism_default_mode = self._prism_render_to_context_mode(
+                    prism_ov.get("render"))
+        frame_times = None
+        ft = getattr(record, "_frame_timestamps", None) if record is not None else None
+        if ft is not None:
+            try:
+                frame_times = [float(v) for v in np.asarray(ft).ravel()]
+            except Exception:  # noqa: BLE001
+                frame_times = None
+        smooth_iters = self._mask3d_surface_smooth()
+        # V1.74 — per-granule (per-object) bundles for this M, so the DVC panel can
+        # offer a granule selector + an "All granules" composite. The positional
+        # series/masks above stay the LARGEST object (the default single-surface
+        # view); ``objects`` carries every granule's field/backdrop/mask.
+        objects = (getattr(self, "_dvc_obj_full_by_m", {}) or {}).get(m) or None
         panel.set_data(series, bg_map, frames, pixel_size=eff_px,
                        field_shape=field_shape, m=m, n_multipoints=n_mp,
-                       n_frames_total=n_t, increments=increments or None)
+                       n_frames_total=n_t, increments=increments or None,
+                       masks=masks or None, mask_voxel_size=(raw_zs, raw_px, raw_px),
+                       context_provider=context_provider,
+                       context_channels=ctx_channels,
+                       frame_times_s=frame_times,
+                       surface_smooth_iterations=smooth_iters,
+                       objects=objects)
+        # V1.77 — auto-select the Prism's converged channel + render as the DVC context
+        # overlay the first time it is offered (respects a later user override).
+        if prism_default_ctx:
+            panel.set_context_default(prism_default_ctx, prism_default_mode)
         if frames:
             self._set_status(
                 f"DVC: M{m + 1} · {len(frames)} field(s) across {n_t} frame(s)")
+
+    @staticmethod
+    def _prism_render_to_context_mode(render: Optional[str]) -> str:
+        """Map a Prism ``overlay_render`` label to a DVC context-overlay mode key
+        (V1.77). The Prism's choices are the DVC ``_CONTEXT_MODES`` labels."""
+        return {
+            "Shell (iso)": "iso",
+            "Cloud (volume)": "volume",
+            "Cloud (MIP)": "mip",
+        }.get(str(render or ""), "iso")
+
+    def _mask3d_surface_smooth(self) -> int:
+        """Surface-smoothing iterations from the graph's 3D Mask Drawing node
+        (V1.68); default 10 if there is no such node."""
+        try:
+            for node in self._doc.analysis.nodes.values():
+                if node.op_key == SPECIAL_MASK3D_OP_KEY:
+                    return int(node.params.get("surface_smooth_iterations", 10))
+        except Exception:  # noqa: BLE001
+            pass
+        return 10
+
+    # ── DVC export / reload as a portable checkpoint (V1.76) ────────────────
+    # ── Output-node auto-save (V1.79) ───────────────────────────────────────
+    def _run_output(self, node) -> None:
+        """Run-time handler for an Output (sink) node.
+
+        If the node wired into this Output node is a **DVC** node, auto-save the full
+        DVC bundle (every multipoint / frame / object + the quantitative field data)
+        to a folder named after this Output node under ``<repo>/results/`` — the
+        "bake the export into the output node" behavior (V1.79). Every other Output
+        node stays the original pass-through. Always ends by finishing the node (here
+        or from the worker's done slot) so the Run walk advances."""
+        src = self._output_source_node(node)
+        is_dvc = src is not None and src.op_key == SPECIAL_DVC_OP_KEY
+        if not is_dvc or not (getattr(self, "_dvc_series_by_m", {}) or {}):
+            self._run_finish_node(node.id)
+            return
+        import json
+        from nd2studios.backend.dvc_export import DVC_BUNDLE_EXTENSION
+        try:
+            payload = self._gather_dvc_bundle_payload()
+            out_dir = self._output_node_dir(node)
+            os.makedirs(out_dir, exist_ok=True)
+            base = self._safe_output_name(node.title)
+            path = os.path.join(out_dir, base + DVC_BUNDLE_EXTENSION)
+            # Human-readable provenance sidecar alongside the bundle.
+            try:
+                with open(os.path.join(out_dir, "provenance.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump(payload.get("provenance", {}), f, indent=2)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"{node.title}: DVC auto-save setup failed: {exc}")
+            self._run_finish_node(node.id)
+            return
+        from nd2studios.workers.dvc_export_worker import DVCExportWorker
+        worker = DVCExportWorker(path, payload, parent=self)
+        worker.finished.connect(
+            lambda p, nid=node.id: self._on_run_output_saved(nid, p))
+        worker.error.connect(
+            lambda msg, nid=node.id: self._on_run_output_error(nid, msg))
+        worker.status.connect(self._set_status)
+        self._run_output_worker = worker
+        self._set_status(
+            f"{node.title}: saving DVC results → results/{os.path.basename(out_dir)}/…")
+        worker.start()
+
+    def _on_run_output_saved(self, nid: str, path) -> None:
+        self._set_status(f"DVC results saved → {path}")
+        self._run_finish_node(nid)
+
+    def _on_run_output_error(self, nid: str, msg: str) -> None:
+        first = msg.splitlines()[0] if msg else "unknown error"
+        self._set_status(f"DVC auto-save failed: {first}")
+        self._run_finish_node(nid)
+
+    def _output_source_node(self, node):
+        """The node wired into ``node``'s (structural) input — the one whose backend
+        data this Output node saves. Prefers a DVC source when several are wired."""
+        sl = self._doc.analysis
+        srcs = []
+        for e in sl.edges.values():
+            if getattr(e, "dst_node", None) == node.id:
+                s = sl.nodes.get(getattr(e, "src_node", None))
+                if s is not None:
+                    srcs.append(s)
+        for s in srcs:
+            if s.op_key == SPECIAL_DVC_OP_KEY:
+                return s
+        return srcs[0] if srcs else None
+
+    def _output_node_dir(self, node) -> str:
+        """Destination folder for an Output node's auto-saved data:
+        ``<repo>/results/<sanitized output-node title>/`` (the app's gitignored
+        output area — "in ND2Studios")."""
+        return os.path.join(Settings.PROJECT_DIR, "results",
+                            self._safe_output_name(node.title))
+
+    @staticmethod
+    def _safe_output_name(name: str) -> str:
+        """Filesystem-safe folder/file base from an Output node's title (e.g.
+        ``"Analysis #1"`` → ``"Analysis #1"``); falls back to ``"dvc_output"``."""
+        safe = "".join(c if (c.isalnum() or c in " -_#") else "_"
+                       for c in str(name or "")).strip()
+        return safe or "dvc_output"
+
+    def _gather_dvc_bundle_payload(self) -> Dict[str, Any]:
+        """Collect the page's per-m DVC stores + metadata + provenance into the
+        keyword payload :func:`save_dvc_bundle` expects (runs on the GUI thread; the
+        worker only does the numpy I/O)."""
+        def _mm(d):
+            return {int(m): v for m, v in (d or {}).items()}
+        series_by_m = _mm(self._dvc_series_by_m)
+        incr_by_m = _mm(self._dvc_incr_by_m)
+        bg_by_mt = _mm(self._dvc_bg_by_mt)
+        obj_full_by_m = _mm(getattr(self, "_dvc_obj_full_by_m", {}))
+        display_mask_by_m = _mm(getattr(self, "_dvc_display_mask_by_m", {}))
+        # Whole-frame drawn masks (3D Mask Drawing path) — only for m's WITHOUT a
+        # per-object display mask (an object run uses the display mask instead).
+        record = self._active_record()
+        if getattr(self, "_dvc_from_bundle", False):
+            src_masks = getattr(self, "_dvc_bundle_whole_masks_by_m", {}) or {}
+        else:
+            src_masks = ((getattr(record, "_mask3d_by_m", None)
+                          if record is not None else None)
+                         or getattr(self, "_mask3d_by_m", {}) or {})
+        whole_masks_by_m: Dict[int, Dict[int, Any]] = {}
+        for m, tm in (src_masks or {}).items():
+            if display_mask_by_m.get(int(m)):
+                continue
+            if tm:
+                whole_masks_by_m[int(m)] = {int(t): mk for t, mk in tm.items()}
+        all_ms = sorted(set(series_by_m) | set(incr_by_m) | set(bg_by_mt)
+                        | set(whole_masks_by_m) | set(obj_full_by_m)
+                        | set(display_mask_by_m))
+        n_mp = (self._record_n_multipoints(record) if record is not None
+                else ((max(all_ms) + 1) if all_ms else 1))
+        vol = getattr(record, "_raw_volume", None) if record is not None else None
+        ctx_channels = list(getattr(vol, "channel_names", []) or [])
+        meta = {
+            "n_multipoints": int(n_mp),
+            "context_channels": ctx_channels,
+            "by_m": {str(m): self._dvc_bundle_meta_for(m) for m in all_ms},
+        }
+        return dict(
+            series_by_m=series_by_m, incr_by_m=incr_by_m, bg_by_mt=bg_by_mt,
+            whole_masks_by_m=whole_masks_by_m, obj_full_by_m=obj_full_by_m,
+            display_mask_by_m=display_mask_by_m, meta=meta,
+            provenance=self._dvc_provenance(all_ms))
+
+    def _dvc_bundle_meta_for(self, m: int) -> Dict[str, Any]:
+        """Per-m viewer metadata for the bundle — what ``_populate_dvc_panel`` would
+        otherwise derive from the live record (frame count, effective XY pixel size,
+        field shape, raw voxel size, frame timestamps, mask smoothing). When
+        re-exporting an already-reloaded bundle, the stored metadata is reused."""
+        m = int(m)
+        if getattr(self, "_dvc_from_bundle", False):
+            by = (getattr(self, "_dvc_bundle_meta", {}) or {}).get("by_m", {}) or {}
+            stored = by.get(str(m)) or by.get(m)
+            if stored is not None:
+                return dict(stored)
+        record = self._active_record()
+        vol = getattr(record, "_raw_volume", None) if record is not None else None
+        series = (self._dvc_series_by_m or {}).get(m, {}) or {}
+        frames = sorted(series)
+        n_t = int(getattr(vol, "n_timepoints", 0) or 0)
+        if n_t <= 0:
+            n_t = (max(frames) + 1) if frames else 1
+        eff_px = None
+        field_shape = None
+        if frames:
+            r0 = series[frames[0]]
+            if getattr(r0, "voxel_size_um", None):
+                eff_px = float(r0.voxel_size_um[-1])
+            bg0 = (self._dvc_bg_by_mt or {}).get(m, {}).get(frames[0])
+            if bg0 is not None and np.asarray(bg0).ndim >= 2:
+                field_shape = [int(v) for v in np.asarray(bg0).shape[-2:]]
+        raw_px = (float(getattr(record, "pixel_size_um", 1.0) or 1.0)
+                  if record is not None else 1.0)
+        raw_zs = float(getattr(vol, "z_step_um", None)
+                       or (getattr(record, "z_step_um", 1.0)
+                           if record is not None else 1.0) or 1.0)
+        frame_times = None
+        ft = getattr(record, "_frame_timestamps", None) if record is not None else None
+        if ft is not None:
+            try:
+                frame_times = [float(v) for v in np.asarray(ft).ravel()]
+            except Exception:  # noqa: BLE001
+                frame_times = None
+        return {
+            "n_frames_total": int(n_t),
+            "pixel_size": eff_px,
+            "field_shape": field_shape,
+            "mask_voxel_size": [raw_zs, raw_px, raw_px],
+            "frame_times_s": frame_times,
+            "surface_smooth_iterations": int(self._mask3d_surface_smooth()),
+        }
+
+    def _dvc_provenance(self, all_ms=None) -> Dict[str, Any]:
+        """Read-only 'how this field was made' record stored in the bundle + shown on
+        the reloaded node's tooltip: source file, timestamp, the DVC node's settings
+        and its upstream node chain."""
+        from datetime import datetime
+        from nd2studios.backend.dvc_export import json_safe
+        record = self._active_record()
+        src = ""
+        if record is not None:
+            for attr in ("source_path", "file_path", "path"):
+                v = getattr(record, attr, None)
+                if v:
+                    src = os.path.basename(str(v))
+                    break
+            if not src:
+                src = str(getattr(record, "name", "") or "")
+        sl = self._doc.analysis
+        dvc_node = next((n for n in sl.nodes.values()
+                         if n.op_key == SPECIAL_DVC_OP_KEY), None)
+        dvc_params = dict(getattr(dvc_node, "params", {}) or {}) if dvc_node else {}
+        dvc_scalar = {k: v for k, v in dvc_params.items()
+                      if isinstance(v, (int, float, str, bool))}
+        upstream = self._dvc_provenance_upstream(sl, dvc_node.id) if dvc_node else []
+        ms = list(all_ms) if all_ms is not None else sorted(self._dvc_series_by_m or {})
+        n_obj = max((len(v) for v in
+                     (getattr(self, "_dvc_obj_full_by_m", {}) or {}).values()),
+                    default=0)
+        dim = 0
+        for mm in (self._dvc_series_by_m or {}).values():
+            for r in mm.values():
+                dim = int(getattr(r, "dim", 0))
+                break
+            if dim:
+                break
+        prov = {
+            "app_version": getattr(Settings, "APP_VERSION", ""),
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "source_file": src,
+            "dvc": dvc_scalar,
+            "upstream": upstream,
+            "summary": {
+                "n_multipoints": len(ms),
+                "n_frames": sum(len(v) for v in
+                                (self._dvc_series_by_m or {}).values()),
+                "n_objects": int(n_obj),
+                "dim": int(dim),
+            },
+        }
+        return json_safe(prov)
+
+    def _dvc_provenance_upstream(self, sl, node_id: str):
+        """Ancestor nodes feeding the DVC node → ``[{title, op_key, params}]`` (scalar
+        params only, so a mask node's huge shape list never bloats the record)."""
+        seen = set()
+        order = []
+        frontier = [node_id]
+        guard = 0
+        while frontier and guard < 500:
+            guard += 1
+            nid = frontier.pop(0)
+            for e in sl.edges.values():
+                if getattr(e, "dst_node", None) == nid and e.src_node not in seen:
+                    seen.add(e.src_node)
+                    frontier.append(e.src_node)
+                    n = sl.nodes.get(e.src_node)
+                    if n is not None:
+                        params = {k: v for k, v in (n.params or {}).items()
+                                  if isinstance(v, (int, float, str, bool))}
+                        order.append({"title": n.title, "op_key": n.op_key,
+                                      "params": params})
+        return order
+
+    def _import_dvc_bundle(self) -> None:
+        """Pick a ``.nd2dvc`` bundle and load it off-thread, then re-publish it to the
+        DVC viewer as a portable DVC Checkpoint input node (no Run)."""
+        from nd2studios.backend.dvc_export import DVC_BUNDLE_EXTENSION
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import DVC results", "", f"DVC bundle (*{DVC_BUNDLE_EXTENSION})")
+        if not path:
+            return
+        from nd2studios.workers.dvc_export_worker import DVCImportWorker
+        worker = DVCImportWorker(path, parent=self)
+        worker.finished.connect(
+            lambda bundle, p=path: self._on_dvc_import_finished(p, bundle))
+        worker.error.connect(self._on_dvc_import_error)
+        worker.status.connect(self._set_status)
+        self._dvc_import_worker = worker
+        self._set_status("Loading DVC results…")
+        worker.start()
+
+    def _on_dvc_import_error(self, msg: str) -> None:
+        first = msg.splitlines()[0] if msg else "unknown error"
+        self._set_status(f"DVC import failed: {first}")
+        QMessageBox.warning(self, "Import DVC results", first)
+
+    def _on_dvc_import_finished(self, path: str, bundle: Dict[str, Any]) -> None:
+        try:
+            self._apply_imported_dvc_bundle(path, bundle)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Import DVC results", str(exc))
+            self._set_status(f"DVC import failed: {exc}")
+            return
+        n = sum(len(v) for v in (bundle.get("series_by_m") or {}).values())
+        self._set_status(
+            f"DVC results reloaded ({n} field(s)) — added a DVC Checkpoint node.")
+
+    def _apply_imported_dvc_bundle(self, path: str, bundle: Dict[str, Any],
+                                   node=None, select_tab: bool = True) -> None:
+        """Populate the page's DVC stores + viewer from a loaded bundle. Creates a DVC
+        Checkpoint node when ``node`` is None (a fresh Import); an existing node (an
+        auto-load on pipeline open, or a Run) is passed through so no duplicate is
+        made."""
+        def _mm(d):
+            return {int(m): v for m, v in (d or {}).items()}
+        self._dvc_series_by_m = _mm(bundle.get("series_by_m"))
+        self._dvc_incr_by_m = _mm(bundle.get("incr_by_m"))
+        self._dvc_bg_by_mt = _mm(bundle.get("bg_by_mt"))
+        self._dvc_obj_full_by_m = _mm(bundle.get("obj_full_by_m"))
+        self._dvc_display_mask_by_m = _mm(bundle.get("display_mask_by_m"))
+        self._dvc_bundle_whole_masks_by_m = _mm(bundle.get("whole_masks_by_m"))
+        self._dvc_obj_by_m = {
+            m: {int(oid): b.get("series", {}) for oid, b in objs.items()}
+            for m, objs in self._dvc_obj_full_by_m.items()}
+        self._dvc_from_bundle = True
+        self._dvc_bundle_meta = bundle.get("meta") or {}
+        self._dvc_bundle_path = str(path)
+        if node is None:
+            try:
+                self._make_dvc_checkpoint_node(path, bundle.get("provenance") or {})
+            except Exception as exc:  # noqa: BLE001
+                self._set_status(f"DVC checkpoint node not created: {exc}")
+        self._ensure_dvc_panel()
+        self._update_overlay_tabs_available()
+        if select_tab:
+            self._select_overlay_tab("dvc")
+        show_m = sorted(self._dvc_series_by_m)[0] if self._dvc_series_by_m else 0
+        self._populate_dvc_panel(int(show_m))
+
+    def _make_dvc_checkpoint_node(self, path: str, provenance: Dict[str, Any]):
+        """Add the portable DVC Checkpoint input node to the analysis board (reusing
+        an existing node for the same bundle path), storing the bundle path +
+        provenance and a hover tooltip summarizing how the field was made."""
+        from nd2studios.backend.dvc_export import json_safe
+        sl = self._doc.analysis
+        for n in sl.nodes.values():
+            if (n.op_key == SPECIAL_DVC_CHECKPOINT_OP_KEY
+                    and (n.params or {}).get("bundle_path") == str(path)):
+                self._set_dvc_checkpoint_tooltip(n.id)
+                return n
+        scene = self._scenes.get(Stage.ANALYSIS)
+        if scene is None:
+            return None
+        try:
+            pos = self._new_node_pos()
+        except Exception:  # noqa: BLE001
+            pos = (0.0, 0.0)
+        node = scene.add_node_from_spec(dvc_checkpoint_spec(), pos)
+        node.params["bundle_path"] = str(path)
+        node.params["provenance"] = json_safe(provenance or {})
+        label = os.path.splitext(os.path.basename(str(path)))[0] or "DVC"
+        scene.rename_node(node.id, f"DVC ⟲ {label}")
+        self._set_dvc_checkpoint_tooltip(node.id)
+        return node
+
+    def _set_dvc_checkpoint_tooltip(self, node_id: str) -> None:
+        """Format a reloaded DVC Checkpoint node's provenance into its hover tooltip."""
+        scene = self._scenes.get(Stage.ANALYSIS)
+        node = self._doc.analysis.nodes.get(node_id)
+        if scene is None or node is None:
+            return
+        prov = (node.params or {}).get("provenance") or {}
+        dvc = prov.get("dvc") or {}
+        summ = prov.get("summary") or {}
+        up = prov.get("upstream") or []
+        lines = ["Reloaded DVC checkpoint (read-only provenance)"]
+        if prov.get("source_file"):
+            lines.append(f"Source: {prov['source_file']}")
+        if prov.get("created"):
+            lines.append(f"Created: {prov['created']}")
+        if summ:
+            lines.append(
+                f"{summ.get('n_multipoints', '?')} multipoint(s) · "
+                f"{summ.get('n_frames', '?')} field(s) · "
+                f"{summ.get('n_objects', 0)} object(s) · {summ.get('dim', '?')}D")
+        if dvc:
+            method = dvc.get("method") or "DVC"
+            ss = dvc.get("subset_size")
+            lines.append(str(method) + (f" · subset {ss}" if ss is not None else ""))
+        if up:
+            lines.append("Upstream: " + " → ".join(
+                str(u.get("title", u.get("op_key", "?"))) for u in up[::-1]))
+        bp = os.path.basename((node.params or {}).get("bundle_path", ""))
+        if bp:
+            lines.append(f"Bundle: {bp}")
+        scene.set_node_tooltip(node_id, "\n".join(lines))
+
+    def _populate_dvc_panel_from_bundle(self, m: int) -> None:
+        """Feed the DVC panel from a reloaded bundle (no live record): metadata comes
+        from ``_dvc_bundle_meta``; the surrounding-channel context overlay is disabled
+        (it needs the raw ND2, absent on a pure reload)."""
+        panel = getattr(self, "_dvc_panel", None)
+        if panel is None:
+            return
+        m = int(m)
+        meta = getattr(self, "_dvc_bundle_meta", {}) or {}
+        by = meta.get("by_m", {}) or {}
+        mm = by.get(str(m)) or by.get(m) or {}
+        series = (self._dvc_series_by_m or {}).get(m, {}) or {}
+        increments = (self._dvc_incr_by_m or {}).get(m, {}) or {}
+        bg_map = (self._dvc_bg_by_mt or {}).get(m, {}) or {}
+        disp = (getattr(self, "_dvc_display_mask_by_m", {}) or {}).get(m) or {}
+        masks = disp or (getattr(self, "_dvc_bundle_whole_masks_by_m", {}) or {}).get(m, {})
+        objects = (getattr(self, "_dvc_obj_full_by_m", {}) or {}).get(m) or None
+        frames = sorted(series)
+        fs = mm.get("field_shape")
+        field_shape = tuple(int(v) for v in fs) if fs else None
+        mvs = mm.get("mask_voxel_size")
+        mask_voxel_size = tuple(float(v) for v in mvs) if mvs else None
+        n_frames_total = int(mm.get("n_frames_total")
+                             or ((max(frames) + 1) if frames else 1))
+        panel.set_data(
+            series, bg_map, frames, pixel_size=mm.get("pixel_size"),
+            field_shape=field_shape, m=m,
+            n_multipoints=int(meta.get("n_multipoints", 1) or 1),
+            n_frames_total=n_frames_total, increments=increments or None,
+            masks=masks or None, mask_voxel_size=mask_voxel_size,
+            context_provider=None,
+            context_channels=list(meta.get("context_channels", []) or []),
+            frame_times_s=mm.get("frame_times_s"),
+            surface_smooth_iterations=int(mm.get("surface_smooth_iterations", 10) or 10),
+            objects=objects)
+        if frames:
+            self._set_status(
+                f"DVC (reloaded): M{m + 1} · {len(frames)} field(s) from bundle.")
+
+    def _autoload_dvc_checkpoints(self) -> None:
+        """On pipeline load, re-hydrate the DVC viewer from any saved DVC Checkpoint
+        node's ``.nd2dvc`` bundle (mirrors ``_load_checkpoint_cache``)."""
+        sl = self._doc.analysis
+        nodes = [n for n in sl.nodes.values()
+                 if n.op_key == SPECIAL_DVC_CHECKPOINT_OP_KEY]
+        if not nodes:
+            return
+        node = nodes[0]
+        path = (node.params or {}).get("bundle_path", "")
+        if not path or not os.path.isfile(path):
+            self._set_status(
+                "DVC Checkpoint node present, but its .nd2dvc file is missing — "
+                "re-import it via the toolbar.")
+            return
+        try:
+            from nd2studios.backend.dvc_export import load_dvc_bundle
+            bundle = load_dvc_bundle(path)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"DVC checkpoint bundle failed to load: {exc}")
+            return
+        self._apply_imported_dvc_bundle(path, bundle, node=node, select_tab=False)
+        self._set_dvc_checkpoint_tooltip(node.id)
+        self._set_status("Loaded DVC checkpoint from its bundle.")
+
+    def _run_dvc_checkpoint(self, node) -> None:
+        """Run-dispatch for a DVC Checkpoint node: ensure its bundle is loaded and the
+        DVC viewer shows it (defensive — the node is normally hydrated at import /
+        pipeline-load, and being port-less it is rarely reached by the walk)."""
+        path = (getattr(node, "params", {}) or {}).get("bundle_path", "")
+        already = (getattr(self, "_dvc_from_bundle", False)
+                   and getattr(self, "_dvc_bundle_path", "") == path
+                   and bool(self._dvc_series_by_m))
+        if already:
+            self._ensure_dvc_panel()
+            self._update_overlay_tabs_available()
+            self._select_overlay_tab("dvc")
+            show_m = sorted(self._dvc_series_by_m)[0] if self._dvc_series_by_m else 0
+            self._populate_dvc_panel(int(show_m))
+        elif path and os.path.isfile(path):
+            try:
+                from nd2studios.backend.dvc_export import load_dvc_bundle
+                self._apply_imported_dvc_bundle(
+                    path, load_dvc_bundle(path), node=node)
+            except Exception as exc:  # noqa: BLE001
+                self._set_status(f"{node.title}: bundle load failed: {exc}")
+        else:
+            self._set_status(f"{node.title}: .nd2dvc file missing — re-import it.")
+        self._run_finish_node(node.id)
 
     # ── Registration viewer panel (V1.56) ──────────────────────────────────
     def _ensure_registration_panel(self):
@@ -3471,7 +5431,7 @@ class PipelinesPage(QWidget):
             self._registration_panel.status_message.connect(self._set_status)
             self._registration_panel.write_requested.connect(
                 self._apply_registration_writeback)
-            self._viewer_stack.addWidget(self._registration_panel)
+            self._panel_stack.addWidget(self._registration_panel)
         return self._registration_panel
 
     def _populate_registration_panel(self, m: Optional[int] = None) -> None:
@@ -3581,6 +5541,19 @@ class PipelinesPage(QWidget):
             f"Registration: M{int(m) + 1} shown drift-corrected · "
             f"{len(aligned)} channel(s) written to processed data.")
 
+    def _set_active_panel(self, panel) -> None:
+        """Show a specialized result panel below the (always-visible) viewer, or
+        hide the panel area when ``panel`` is None. V1.61: the MultiAxisViewer is
+        never hidden or swapped out — panels only ever appear *beneath* it."""
+        stack = getattr(self, "_panel_stack", None)
+        if stack is None:
+            return
+        if panel is None:
+            stack.setVisible(False)
+        else:
+            stack.setCurrentWidget(panel)
+            stack.setVisible(True)
+
     def _on_overlay_tab_changed(self, idx: int) -> None:
         """Switch the active overlay layer; recompute only the overlay (cheap).
 
@@ -3591,25 +5564,30 @@ class PipelinesPage(QWidget):
         self._overlay_mode = self._overlay_tab_keys[idx]
         if self._overlay_mode == "spatial":
             panel = self._ensure_spatial_panel()
-            self._viewer_stack.setCurrentWidget(panel)
+            self._set_active_panel(panel)
             self._populate_spatial_panel()
             return
         if self._overlay_mode == "serialtrack":
             panel = self._ensure_serialtrack_panel()
-            self._viewer_stack.setCurrentWidget(panel)
+            self._set_active_panel(panel)
             self._populate_serialtrack_panel()
             return
         if self._overlay_mode == "dvc":
             panel = self._ensure_dvc_panel()
-            self._viewer_stack.setCurrentWidget(panel)
+            self._set_active_panel(panel)
             self._populate_dvc_panel()
+            return
+        if self._overlay_mode == "dic":
+            panel = self._ensure_dic_panel()
+            self._set_active_panel(panel)
+            self._populate_dic_panel()
             return
         if self._overlay_mode == "registration":
             panel = self._ensure_registration_panel()
-            self._viewer_stack.setCurrentWidget(panel)
+            self._set_active_panel(panel)
             self._populate_registration_panel()
             return
-        self._viewer_stack.setCurrentWidget(self.viewer)
+        self._set_active_panel(None)
         # Re-applying the same hook invalidates the overlay cache + repaints
         # the current frame, keeping the base render cache intact.
         self.viewer.set_frame_post_process(self._composite_pipeline_overlay)
@@ -3628,18 +5606,19 @@ class PipelinesPage(QWidget):
             tb.blockSignals(True)
             tb.setCurrentIndex(idx)
             tb.blockSignals(False)
-        stack = getattr(self, "_viewer_stack", None)
-        if stack is not None:
+        if getattr(self, "_panel_stack", None) is not None:
             if mode == "spatial":
-                stack.setCurrentWidget(self._ensure_spatial_panel())
+                self._set_active_panel(self._ensure_spatial_panel())
             elif mode == "serialtrack":
-                stack.setCurrentWidget(self._ensure_serialtrack_panel())
+                self._set_active_panel(self._ensure_serialtrack_panel())
             elif mode == "dvc":
-                stack.setCurrentWidget(self._ensure_dvc_panel())
+                self._set_active_panel(self._ensure_dvc_panel())
+            elif mode == "dic":
+                self._set_active_panel(self._ensure_dic_panel())
             elif mode == "registration":
-                stack.setCurrentWidget(self._ensure_registration_panel())
+                self._set_active_panel(self._ensure_registration_panel())
             else:
-                stack.setCurrentWidget(self.viewer)
+                self._set_active_panel(None)
 
     def _update_overlay_tabs_available(self) -> None:
         """Show only the overlay tabs the current pipeline actually produced:
@@ -3648,6 +5627,8 @@ class PipelinesPage(QWidget):
         tb = getattr(self, "_overlay_tabbar", None)
         if tb is None:
             return
+        from nd2studios.backend.analysis import granule_types as gt
+        rec = self._active_record()
         has_seg = bool(self._run_results_by_m or self._analysis_screen_results
                        or self._live_seg or self._run_active)
         has_tracks = bool(self._track_colormap)
@@ -3664,8 +5645,16 @@ class PipelinesPage(QWidget):
             "serialtrack": has_tracks or has_rows,
             # DVC shows a dense field — available once a DVC node has run.
             "dvc": bool(self._dvc_series_by_m),
+            # 2D DIC (pyALDIC) — available once a DIC node has run.
+            "dic": bool(self._dic_series_by_m),
             # Registration before/after + drift plot — once a Registration node ran.
             "registration": bool(self._reg_by_m),
+            # Granule node overlays (V1.73) — each gated on its own store.
+            "granule_beads": bool(self._granule_read_store(rec, gt.GRANULE_POINTS_ATTR)),
+            "granule_clusters": bool(self._granule_read_store(rec, gt.GRANULE_LABELS_ATTR)),
+            "granule_tess": bool(self._granule_read_store(rec, gt.GRANULE_TESS_ATTR)),
+            "granule_mask": bool(self._granule_read_store(rec, gt.GRANULE_MASKS_ATTR)),
+            "granule_boundary": bool(self._granule_read_store(rec, gt.GRANULE_BANDS_ATTR)),
         }
         for i, key in enumerate(self._overlay_tab_keys):
             tb.setTabVisible(i, bool(vis.get(key, True)))
@@ -3859,11 +5848,78 @@ class PipelinesPage(QWidget):
         elif op == SPECIAL_DVC_OP_KEY:
             self._set_status(f"{node.title} runs on the full file via Run "
                              "(DVC is not computed in preview).")
+        elif op == SPECIAL_DIC_OP_KEY:
+            self._set_status(f"{node.title} runs on the full file via Run "
+                             "(2D DIC is not computed in preview).")
+        elif op in (SPECIAL_DIC_ROI_OP_KEY, SPECIAL_DIC_REFINE_OP_KEY):
+            key = "roi_shapes" if op == SPECIAL_DIC_ROI_OP_KEY else "brush_shapes"
+            drawn = node.params.get(key) or {}
+            label = ("mesh region" if op == SPECIAL_DIC_ROI_OP_KEY
+                     else "refinement brush")
+            btn = ("Draw mesh region…" if op == SPECIAL_DIC_ROI_OP_KEY
+                   else "Draw refinement brush…")
+            if drawn:
+                self._set_status(f"{node.title}: {label} drawn for "
+                                 f"{len(drawn)} multipoint(s).")
+            else:
+                self._set_status(f"{node.title}: nothing drawn yet — click the node "
+                                 f"and '{btn}'.")
         elif op == SPECIAL_REGISTER_OP_KEY:
             self._set_status(f"{node.title} runs on the full file via Run "
                              "(registration is not computed in preview).")
+        elif op == SPECIAL_MASK3D_OP_KEY:
+            drawn = node.params.get("mask_shapes") or {}
+            if drawn:
+                self._set_status(f"{node.title}: mask drawn for "
+                                 f"{len(drawn)} multipoint(s) — Run builds the "
+                                 "(Z,H,W) volume.")
+            else:
+                self._set_status(f"{node.title}: no mask yet — click the node and "
+                                 "'Draw 3D mask…'.")
         elif op in (SPECIAL_EXPORT_OP_KEY, SPECIAL_SEND_RESULTS_OP_KEY):
             self._set_status(f"{node.title} runs on the full file via Run.")
+        elif op == SPECIAL_SAVE_DATA_OP_KEY:
+            self._set_status(f"{node.title} writes the dataset to disk on Run "
+                             "(not in preview).")
+        elif op == SPECIAL_CROP_OP_KEY:
+            rect = node.params.get("rect")
+            if rect and len(rect) == 4:
+                self._set_status(
+                    f"{node.title}: crop {rect[2]}×{rect[3]} px "
+                    f"@({rect[0]},{rect[1]}) applies to downstream nodes on Run.")
+            else:
+                self._set_status(f"{node.title}: no crop region yet — click the "
+                                 "node and 'Pick crop region…'.")
+        elif op == SPECIAL_EXCLUDE_OP_KEY:
+            # Like Crop/mask3d, exclusion is a Run-time feature (it masks the image
+            # every analysis reads); preview just annotates whether a region is wired.
+            srcs = [self._doc.analysis.nodes.get(e.src_node)
+                    for e in self._doc.analysis.structural_incoming(node.id)]
+            wired = [s for s in srcs if s is not None
+                     and s.op_key in (SPECIAL_MASK3D_OP_KEY,
+                                      SPECIAL_GRANULE_MASK_OP_KEY)]
+            if wired:
+                self._set_status(
+                    f"{node.title}: '{wired[0].title}' region will be ignored by "
+                    "downstream analysis on Run.")
+            else:
+                self._set_status(
+                    f"{node.title}: wire a 3D Mask Drawing / Granule Volume Mask "
+                    "node into it — its region is then ignored by analysis on Run.")
+        elif op == SPECIAL_PRISM_OP_KEY:
+            # The Prism's channel routing / view-only overlay applies on Run (and in
+            # the DVC viewer); preview only annotates what it will do.
+            view_only = any(edge_view_only(e) for e in
+                            self._doc.analysis.structural_outgoing(node.id))
+            op_mode = str(node.params.get("channel_op", "add"))
+            if view_only:
+                self._set_status(
+                    f"{node.title}: converges its channel as a VIEW-ONLY overlay "
+                    "(dotted edge) — fed to the viewers only, not analysis.")
+            else:
+                self._set_status(
+                    f"{node.title}: will '{op_mode}' its channel into downstream "
+                    "analysis (click the outgoing wire to make it view-only).")
         elif op == SPECIAL_PAUSE_OP_KEY:
             self._set_status("Pause — preview stops here (Run executes the rest).")
 
@@ -4389,7 +6445,7 @@ class PipelinesPage(QWidget):
         btn = self._mode_btns.get(mode)
         if btn is not None and not btn.isChecked():
             btn.setChecked(True)
-        self._set_panel_visible("viewer", mode in ("image", "split"))
+        self._set_panel_visible("viewer", True)  # V1.61: never hide the viewer
         self._set_panel_visible("plots", mode in ("table", "split"))
 
     def _inject_result_choices(self, specs, names: List[str]) -> None:
@@ -4606,11 +6662,22 @@ class PipelinesPage(QWidget):
             if not self._run_active:
                 return
             self._finish_dvc(result)
+        elif result.key == _RUN_DIC_KEY:
+            # Run: the 2D DIC node's pyALDIC engine finished (off-thread).
+            if not self._run_active:
+                return
+            self._finish_dic(result)
         elif result.key == _RUN_REGISTER_KEY:
             # Run: the Registration node finished (off-thread).
             if not self._run_active:
                 return
             self._finish_register(result)
+        elif result.key == _RUN_GRANULE_KEY:
+            # Run: a granule-chain node (detect / cluster / tessellate / mask /
+            # boundary) finished off-thread.
+            if not self._run_active:
+                return
+            self._finish_granule(result)
         elif result.key == _RUN_LOOPCOMBINE_KEY:
             # Run: the loop's off-thread union-dedup combine finished.
             if not self._run_active:
@@ -4654,7 +6721,8 @@ class PipelinesPage(QWidget):
         # submit re-showed the bar), so leave the progress bar as-is. A
         # cancelled Run job (e.g. file changed mid-run) aborts the walk cleanly.
         if key in (_RUN_ANALYSIS_KEY, _RUN_MEASURE_KEY, _RUN_TRACK_KEY,
-                   _RUN_TRACKOBJ_KEY, _RUN_DVC_KEY, _RUN_REGISTER_KEY,
+                   _RUN_TRACKOBJ_KEY, _RUN_DVC_KEY, _RUN_DIC_KEY, _RUN_REGISTER_KEY,
+                   _RUN_GRANULE_KEY,
                    _RUN_RESULTS_KEY, _RUN_LOOPCOMBINE_KEY) and self._run_active:
             if getattr(self, "_loop_ctx", None) is not None:
                 self._loop_finish_cleanup()  # V1.49: restore swept params
@@ -4665,7 +6733,9 @@ class PipelinesPage(QWidget):
             self._run_analysis_ctx = None
             self._run_trackobj_node = None
             self._run_dvc_node = None
+            self._run_dic_node = None
             self._run_register_node = None
+            self._run_granule_ctx = None
             self._run_pending_track_rows = None
             self._run_states = {}
             scene = self._scenes.get(Stage.ANALYSIS)
@@ -4678,7 +6748,7 @@ class PipelinesPage(QWidget):
         if key in (_PREVIEW_KEY, _ANALYSIS_PREVIEW_KEY, _ANALYSIS_COMMIT_KEY,
                    _RESULTS_PREVIEW_KEY, _PV_SCREEN_KEY, _RUN_ANALYSIS_KEY,
                    _RUN_MEASURE_KEY, _RUN_TRACK_KEY, _RUN_TRACKOBJ_KEY,
-                   _RUN_DVC_KEY, _RUN_REGISTER_KEY, _RUN_RESULTS_KEY):
+                   _RUN_DVC_KEY, _RUN_DIC_KEY, _RUN_REGISTER_KEY, _RUN_RESULTS_KEY):
             self._set_preview_progress(visible=True, value=int(fraction * 100))
 
     def _set_preview_progress(self, *, visible: bool, value: int = 0) -> None:
@@ -4691,10 +6761,9 @@ class PipelinesPage(QWidget):
 
     # ── apply ────────────────────────────────────────────────────────────────
     def _on_apply(self) -> None:
-        # Apply only commits a Processing recipe now; the merged Analysis tab
-        # executes via Run (the Apply button is hidden there).
-        if self._stage is Stage.PROCESSING:
-            self._apply_processing()
+        # V1.61 merge: Apply always commits the processing recipe (the button is
+        # always visible on the one tab, regardless of which node is previewed).
+        self._apply_processing()
 
     # ── Run (merged Analysis tab) ───────────────────────────────────────────
     def _on_run_button(self) -> None:
@@ -4742,16 +6811,30 @@ class PipelinesPage(QWidget):
         order; the page paints each node shaded (pending / un-taken branch),
         gold (executing), then normal (done), branching at if-else nodes and
         parking on async compute. Pause returns to editor mode."""
-        if self._stage is not Stage.ANALYSIS or self._run_active:
+        if self._run_active:
             return
         record = self._active_record()
         if record is None or not record._raw_channels:
             QMessageBox.information(self, "Run", "Import a file first.")
             return
+        # V1.61 unified Run: commit the processing graph's recipe first so the
+        # analysis walk reads the current processed image, then run the analysis
+        # graph. Processing enhancement nodes execute as the committed recipe, not
+        # as Run steps (the pump passes them through).
+        self._sync_committed_recipe_from_graph()
         sl = self._doc.analysis
-        if input_node(sl) is None or not sl.nodes:
+        # V1.62 (R3): run the focused input's chain (the file the user is on),
+        # falling back to the first input node.
+        _ui = None
+        _fid = getattr(self, "_focused_input_id", "")
+        if _fid and _fid in sl.nodes and sl.nodes[_fid].role is NodeRole.INPUT:
+            _ui = sl.nodes[_fid]
+        if _ui is None:
+            _ui = self._stage_input_node(Stage.PROCESSING)
+        if _ui is None or not sl.nodes:
             QMessageBox.information(self, "Run", "Add nodes and wire them first.")
             return
+        run_start = _ui.id
         # Resume a paused run from where it left off — but only if the graph's
         # node set is unchanged; otherwise restart cleanly.
         if (self._run_paused and self._runner_obj is not None
@@ -4778,6 +6861,17 @@ class PipelinesPage(QWidget):
         if record is not None:
             record._registration_by_m = {}
             record._registration_crop = None
+            # V1.71: drop any prior run's manual Crop-node rect so this Run only
+            # crops downstream if a Crop node runs in it again.
+            record._pipeline_crop = None
+            # V1.77: drop any prior run's Prism view-only overlay directive so the DVC
+            # viewer only overlays a channel if a Prism (re)publishes it this Run.
+            record._prism_overlay_by_m = {}
+        # V1.75: resolve every Exclude node's region up-front (rasterizing any drawn
+        # masks) into record._exclude_by_m, so downstream analysis ignores those
+        # voxels regardless of the walk order — the Exclude branch is independent of
+        # the analysis branch, so we cannot rely on it running first.
+        self._resolve_run_exclusions()
         self._populate_iteration_selector()  # hide the combo for a fresh run
         self._run_pending = ""
         # Per-branch row scoping for object-lens if-else: rows carried on each
@@ -4791,7 +6885,7 @@ class PipelinesPage(QWidget):
         ckpt_id = self._checkpoint_resume_target()
         if ckpt_id is not None:
             frozen = self._checkpoint_ancestors(ckpt_id)
-            self._runner_obj = GraphRunner(sl, frozen=frozen)
+            self._runner_obj = GraphRunner(sl, start=run_start, frozen=frozen)
             self._run_active = True
             self._run_context = {"rows": [], "result": None}
             self._restore_checkpoint(ckpt_id)
@@ -4803,11 +6897,15 @@ class PipelinesPage(QWidget):
             self._scenes[Stage.ANALYSIS].set_run_states(self._run_states)
             self._btn_run.setEnabled(False)
             title = sl.nodes[ckpt_id].title if ckpt_id in sl.nodes else "checkpoint"
+            crop = self._effective_run_crop()
+            crop_note = (f" · cropped to {crop[2]}×{crop[3]} @({crop[0]},{crop[1]})"
+                         if crop is not None else "")
             self._set_status(
-                f"Resuming from '{title}' — upstream frozen, running downstream…")
+                f"Resuming from '{title}' — upstream frozen, running "
+                f"downstream{crop_note}…")
             self._run_pump()
             return
-        self._runner_obj = GraphRunner(sl)
+        self._runner_obj = GraphRunner(sl, start=run_start)
         self._run_active = True
         # Record the geometry this Run's masks will be computed at, so overlays
         # know whether the committed masks match the current display (full vs crop).
@@ -4889,8 +6987,19 @@ class PipelinesPage(QWidget):
 
     def _run_execute_node(self, node) -> None:
         op = node.op_key
-        if node.role is NodeRole.INPUT or node.role is NodeRole.OUTPUT:
+        # V1.61 merge: PROCESSING (enhancement) nodes live in the merged graph but
+        # execute as the committed recipe, not as a Run step -- pass them through
+        # so the walk proceeds to the analysis nodes.
+        if node.stage is Stage.PROCESSING and node.role is NodeRole.ACTION:
             self._run_finish_node(node.id)
+            return
+        if node.role is NodeRole.INPUT:
+            self._run_finish_node(node.id)
+        elif node.role is NodeRole.OUTPUT:
+            # V1.79: an Output node auto-saves the backend data of the node wired into
+            # it (DVC → the full .nd2dvc bundle) to a folder named after the Output
+            # node; a non-DVC Output node is the unchanged pass-through.
+            self._run_output(node)
         elif op == IF_ELSE_OP_KEY:
             cond = Condition.from_dict(node.params.get("condition"))
             true_port = next((p.id for p in node.outputs if p.name == "true"), None)
@@ -4922,6 +7031,8 @@ class PipelinesPage(QWidget):
             self._pause_run(node)
         elif op == SPECIAL_CHECKPOINT_OP_KEY:
             self._run_checkpoint(node)
+        elif op == SPECIAL_DVC_CHECKPOINT_OP_KEY:
+            self._run_dvc_checkpoint(node)
         elif op.startswith("analysis:"):
             self._run_analysis_node(node)
         elif op.startswith("results:"):
@@ -4936,6 +7047,14 @@ class PipelinesPage(QWidget):
             self._run_dismiss(node)
         elif op == SPECIAL_EXPORT_OP_KEY:
             self._run_export(node)
+        elif op == SPECIAL_SAVE_DATA_OP_KEY:
+            self._run_save_data(node)
+        elif op == SPECIAL_CROP_OP_KEY:
+            self._run_crop(node)
+        elif op == SPECIAL_EXCLUDE_OP_KEY:
+            self._run_exclude(node)
+        elif op == SPECIAL_PRISM_OP_KEY:
+            self._run_prism(node)
         elif op == SPECIAL_CT_METRICS_OP_KEY:
             self._run_ct_metrics(node)
         elif op in (SPECIAL_CT_FIELDS_OP_KEY, SPECIAL_INTERP_MAP_OP_KEY):
@@ -4943,8 +7062,24 @@ class PipelinesPage(QWidget):
             self._run_finish_node(node.id)
         elif op == SPECIAL_DVC_OP_KEY:
             self._run_dvc(node)
+        elif op == SPECIAL_DIC_OP_KEY:
+            self._run_dic(node)
+        elif op in (SPECIAL_DIC_ROI_OP_KEY, SPECIAL_DIC_REFINE_OP_KEY):
+            self._run_dic_region(node)
         elif op == SPECIAL_REGISTER_OP_KEY:
             self._run_register(node)
+        elif op == SPECIAL_MASK3D_OP_KEY:
+            self._run_mask3d_node(node)
+        elif op == SPECIAL_BEAD_DETECT_OP_KEY:
+            self._run_bead_detect(node)
+        elif op == SPECIAL_GRANULE_CLUSTER_OP_KEY:
+            self._run_granule_cluster(node)
+        elif op == SPECIAL_GRANULE_TESSELLATE_OP_KEY:
+            self._run_granule_tessellate(node)
+        elif op == SPECIAL_GRANULE_MASK_OP_KEY:
+            self._run_granule_mask(node)
+        elif op == SPECIAL_GRANULE_BOUNDARY_OP_KEY:
+            self._run_granule_boundary(node)
         elif op == SPECIAL_SEND_RESULTS_OP_KEY:
             self._run_send_results(node)
         else:
@@ -5560,13 +7695,15 @@ class PipelinesPage(QWidget):
             if cropped:
                 out = {nm: self._crop_channel_for_run(arr)
                        for nm, arr in out.items()}
-            return out
+            # V1.75: blank the excluded region so this multipoint's analysis never
+            # sees it (crop-aligned; no-op when no Exclude node published a mask).
+            return self._apply_exclusion_channels(record, out, m)
         view = record.processed_view()
         for nm in view.keys():
             arr = view[nm]
             out[nm] = (self._crop_channel_for_run(arr) if cropped
                        else np.asarray(arr))
-        return out
+        return self._apply_exclusion_channels(record, out, m)
 
     def _materialize_channels_for_m(self, record, m: int) -> Dict[str, Any]:
         """``{channel: (T, H, W)}`` for multipoint ``m`` — image data the
@@ -5596,7 +7733,7 @@ class PipelinesPage(QWidget):
             full = self._apply_registration_to_channels(record, full, m)
             for name, arr in full.items():
                 out[name] = self._crop_frame(arr)
-            return out
+            return self._apply_exclusion_channels(record, out, m)  # V1.75
         full = {}
         for name, arr in (record._raw_channels or {}).items():
             a = arr.materialize() if hasattr(arr, "materialize") else np.asarray(arr)
@@ -5604,6 +7741,49 @@ class PipelinesPage(QWidget):
         full = self._apply_registration_to_channels(record, full, m)
         for name, arr in full.items():
             out[name] = self._crop_frame(arr)
+        return self._apply_exclusion_channels(record, out, m)  # V1.75
+
+    def _zstack_channels_for_m(self, record, m: int) -> Dict[str, np.ndarray]:
+        """``{channel: (T, Z, H, W)}`` raw voxels for multipoint ``m`` — the full
+        Z-stack the Save Data node writes (unlike ``_processed_channels_for_m`` /
+        ``_materialize_channels_for_m`` which collapse Z to a ``(T, H, W)``
+        projection). Reads each ``(Z, H, W)`` volume via ``vol.get_volume`` (the
+        same path DVC / 3D-mask nodes use), applies the pipeline's registration
+        per-Z, and crops in XY to the active crop. Returns ``{}`` when the volume
+        can't serve full Z (e.g. a loader with no ``get_volume``) so the caller
+        can fall back to a projection."""
+        vol = getattr(record, "_raw_volume", None)
+        if vol is None or not hasattr(vol, "get_volume"):
+            return {}
+        names = list(getattr(vol, "channel_names", []) or [])
+        nt = int(getattr(vol, "n_timepoints", 1) or 1)
+        tf = (getattr(record, "_registration_by_m", None) or {}).get(int(m))
+        order = int(getattr(record, "_registration_interp_order", 1) or 1)
+        rect = self._crop_rect()
+        out: Dict[str, np.ndarray] = {}
+        for c, name in enumerate(names):
+            vols: List[np.ndarray] = []
+            for t in range(nt):
+                try:
+                    v = np.asarray(vol.get_volume(int(c), m=int(m), t=int(t)))
+                except Exception:  # noqa: BLE001
+                    continue
+                if v.ndim == 2:
+                    v = v[None, ...]  # (1, H, W)
+                if tf:
+                    from nd2studios.backend.registration import estimate as _est
+                    try:
+                        v = np.stack(
+                            [_est.apply_frame(v[z], tf, int(t), interp_order=order)
+                             for z in range(v.shape[0])], axis=0)
+                    except Exception:  # noqa: BLE001 — bad transform: keep raw Z
+                        pass
+                if rect is not None:
+                    x, y, w, h = rect
+                    v = v[..., y:y + h, x:x + w]
+                vols.append(v)
+            if vols:
+                out[name] = np.stack(vols, axis=0)  # (T, Z, H, W)
         return out
 
     def _ensure_run_rows(self) -> List[Dict[str, Any]]:
@@ -5734,6 +7914,849 @@ class PipelinesPage(QWidget):
         self._populate_iteration_selector()  # V1.49.x: show saved-iteration combo
         self._run_finish_node(node.id if node is not None else self._run_pending)
 
+    def _build_mask3d_by_m(self, node, record, vol) -> Dict[int, Dict[int, Any]]:
+        """Rasterize a 3D Mask Drawing node's drawn shapes into
+        ``{m: {t: (Z,H,W) bool}}`` — the core of :meth:`_run_mask3d_node`.
+
+        Factored out (V1.75) so the Exclude pre-pass (``_resolve_run_exclusions``)
+        can rasterize the same drawn geometry **before** the Run walk — making
+        exclusion order-independent — without re-running the mask node. Reads
+        ``node.params['mask_shapes']`` + the record's raw volume and mutates
+        nothing; returns ``{}`` when nothing is drawn or the volume is unreadable."""
+        from nd2studios.backend.analysis import mask3d as _mask3d
+        store = node.params.get("mask_shapes") or {}
+        if not store or vol is None or not hasattr(vol, "get_volume"):
+            return {}
+        names = list(getattr(vol, "channel_names", []) or [])
+        _extra, seg = self._analysis_run_spec(node, names)
+        channel = seg[0] if seg else (names[0] if names else None)
+        c_idx = names.index(channel) if channel in names else 0
+        n_z = int(getattr(vol, "n_zslices", 1) or 1)
+        n_t = int(getattr(vol, "n_timepoints", 1) or 1)
+        # Rasterize in the full/raw frame — the same frame the editor draws on
+        # (a within-frame registered shift, never a crop), matching the raw-frame
+        # convention the per-object scoping / exclusion reads rely on.
+        H = int(getattr(vol, "height", 0) or getattr(record, "height", 0) or 0)
+        W = int(getattr(vol, "width", 0) or getattr(record, "width", 0) or 0)
+        mode = str(node.params.get("mode") or "Propagate across Z")
+        propagate = str(node.params.get("propagate") or "Interpolate between planes")
+        apply_all = bool(node.params.get("apply_all_frames", True))
+        if mode == "Propagate across Z":
+            prop_key = (_mask3d.PROPAGATE_COPY if propagate == "Copy to all Z"
+                        else _mask3d.PROPAGATE_INTERPOLATE)
+        else:
+            prop_key = _mask3d.PROPAGATE_NONE  # Manual / Threshold seed every plane
+        mask_by_m: Dict[int, Dict[int, Any]] = {}
+        drawn_ms: List[int] = []
+        for mk in store:
+            try:
+                drawn_ms.append(int(mk))
+            except (TypeError, ValueError):
+                continue
+        for m in sorted(set(drawn_ms)):
+            shapes_by_t = store.get(str(m)) or {}
+            drawn_ts: Dict[int, Any] = {}
+            for tk, by_z in shapes_by_t.items():
+                try:
+                    ti = int(tk)
+                except (TypeError, ValueError):
+                    continue
+                if by_z and isinstance(by_z, dict):  # {z_key: [shapes]}
+                    drawn_ts[ti] = by_z
+            if not drawn_ts:
+                continue
+            if H <= 0 or W <= 0:  # metadata missing — read one volume for the size
+                try:
+                    v0 = np.asarray(vol.get_volume(c_idx, m=m, t=0))
+                    if v0.ndim == 2:
+                        v0 = v0[None, ...]
+                    H, W = int(v0.shape[-2]), int(v0.shape[-1])
+                except Exception:  # noqa: BLE001
+                    continue
+            base_t = sorted(drawn_ts)[0]
+            by_m: Dict[int, Any] = {}
+            frames = range(n_t) if apply_all else sorted(drawn_ts)
+            for t in frames:
+                by_z = drawn_ts.get(int(t)) or (drawn_ts[base_t] if apply_all else None)
+                if not by_z:
+                    continue
+                by_m[int(t)] = _mask3d.build_mask_volume(by_z, n_z, H, W, prop_key)
+            if by_m:
+                mask_by_m[int(m)] = by_m
+        return mask_by_m
+
+    def _run_mask3d_node(self, node) -> None:
+        """3D Mask Drawing: rasterize the node's drawn per-Z shapes into a
+        ``(Z,H,W)`` boolean mask volume per ``(m, t)`` and publish it to
+        ``self._mask3d_by_m`` (+ the record) so a downstream node — the Phase 2
+        DVC-on-object render — can restrict / colour the field to the object.
+
+        Synchronous: polygon rasterization is cheap, so there is no worker job. The
+        drawn shapes were captured in the editor (``_edit_mask3d``); this only turns
+        them into dense volumes according to the node's mode / propagate params."""
+        record = self._active_record()
+        vol = getattr(record, "_raw_volume", None) if record is not None else None
+        if record is None or vol is None or not hasattr(vol, "get_volume"):
+            self._set_status(f"{node.title}: no file imported — skipped.")
+            self._run_finish_node(node.id)
+            return
+        store = node.params.get("mask_shapes") or {}
+        if not store:
+            self._set_status(f"{node.title}: no mask drawn — skipped "
+                             "(select the node and use 'Draw 3D mask…').")
+            self._run_finish_node(node.id)
+            return
+        mask_by_m = self._build_mask3d_by_m(node, record, vol)
+        n_built = sum(len(frames) for frames in mask_by_m.values())
+        # Report the actual built dims (the builder reads a volume for the size when
+        # metadata is missing); fall back to the metadata dims otherwise.
+        n_z = int(getattr(vol, "n_zslices", 1) or 1)
+        H = int(getattr(vol, "height", 0) or getattr(record, "height", 0) or 0)
+        W = int(getattr(vol, "width", 0) or getattr(record, "width", 0) or 0)
+        _built = next((v for frames in mask_by_m.values()
+                       for v in frames.values()), None)
+        if _built is not None:
+            n_z, H, W = (int(s) for s in np.asarray(_built).shape[-3:])
+        # A fresh dict (not the accumulated page store) → per-record isolation.
+        self._mask3d_by_m = mask_by_m
+        try:  # cross-Run reuse (Phase 2 DVC render reads this off the record)
+            record._mask3d_by_m = mask_by_m
+        except Exception:  # noqa: BLE001
+            pass
+        self._set_status(
+            f"{node.title}: built {n_built} mask volume(s) ({n_z}×{H}×{W}) "
+            f"across {len(mask_by_m)} multipoint(s).")
+        self._run_finish_node(node.id)
+
+    # ── Exclude node (V1.75) ────────────────────────────────────────────────
+    # Wire a region-producing node (3D Mask Drawing / Granule Volume Mask) INTO an
+    # Exclude node and every downstream analysis ignores the voxels inside it. Like
+    # the Crop node, it publishes a record side-artifact — record._exclude_by_m,
+    # {m: (Z,H,W) bool} (True = ignore) — that the shared image-read chokepoints
+    # (_processed_channels_for_m, _DVCJob._read_volume, _materialize_channels_for_m)
+    # zero out, so it is honoured with no per-node changes. Resolved up-front in
+    # _resolve_run_exclusions (before the Run walk) so it is order-independent for
+    # mask3d sources, which sit on a side-branch the walk order does not constrain.
+
+    def _resolve_run_exclusions(self) -> None:
+        """Build ``record._exclude_by_m`` from every Exclude node BEFORE the Run
+        walk, so all analysis ignores the excluded voxels regardless of node order.
+
+        mask3d sources are rasterized from their drawn shapes here (order-
+        independent); granule/analysis/track sources are read from the record when
+        already present (prior Run / checkpoint) and otherwise picked up when the
+        Exclude node itself runs (:meth:`_run_exclude`)."""
+        record = self._active_record()
+        if record is None:
+            return
+        record._exclude_by_m = {}          # fresh each Run — clears stale state
+        try:
+            sl = self._doc.analysis
+        except Exception:  # noqa: BLE001
+            return
+        ex_nodes = [n for n in sl.nodes.values()
+                    if getattr(n, "op_key", "") == SPECIAL_EXCLUDE_OP_KEY]
+        if not ex_nodes:
+            return
+        n_regions = 0
+        for node in ex_nodes:
+            by_m = self._exclusion_source_masks(node, record)
+            dilate = int(node.params.get("dilate_px", 0) or 0)
+            for m, vol_bool in by_m.items():
+                self._merge_exclusion(record, m, vol_bool, dilate)
+                n_regions += 1
+        if n_regions:
+            self._set_status(
+                f"Exclude: {n_regions} region set(s) will be ignored by analysis "
+                f"across {len(record._exclude_by_m)} multipoint(s).")
+
+    def _exclusion_source_masks(self, node, record) -> Dict[int, Any]:
+        """``{m: (Z,H,W) bool}`` union of the region(s) wired INTO an Exclude node.
+
+        Mirrors :meth:`_dvc_scoped_object_regions` but returns a per-multipoint
+        union volume (not per-object boxes). Supports the two ``(Z,H,W)`` region
+        families the user names: a drawn 3D mask (rasterized from the node's shapes,
+        so it works even before the mask node runs) and a Granule Volume Mask (from
+        ``record._granule_masks_by_m`` when present)."""
+        out: Dict[int, Any] = {}
+        try:
+            from nd2studios.pipeline_graph.registry_adapter import (
+                node_produces_objects,
+            )
+        except Exception:  # noqa: BLE001
+            return out
+        sl = self._doc.analysis
+        vol = getattr(record, "_raw_volume", None)
+        for e in sl.structural_incoming(node.id):
+            src = sl.nodes.get(e.src_node)
+            if src is None or not node_produces_objects(src):
+                continue
+            op = getattr(src, "op_key", "")
+            if op == SPECIAL_MASK3D_OP_KEY:
+                mask_by_m = (self._build_mask3d_by_m(src, record, vol)
+                             if vol is not None else {})
+                if not mask_by_m:  # not yet drawn / built — fall back to the record
+                    mask_by_m = (getattr(record, "_mask3d_by_m", None)
+                                 or getattr(self, "_mask3d_by_m", {}) or {})
+                for m, frames in mask_by_m.items():
+                    u = self._union_frames_bool(frames)
+                    if u is not None:
+                        self._accumulate_mask(out, int(m), u)
+            elif op == SPECIAL_GRANULE_MASK_OP_KEY:
+                self._accumulate_granule_exclusion(record, out)
+        return out
+
+    @staticmethod
+    def _union_frames_bool(frames) -> Optional[np.ndarray]:
+        """Union a ``{t: (Z,H,W) bool}`` dict (or a bare array) over T into one
+        ``(Z,H,W) bool`` — the excluded region spans all timepoints."""
+        if frames is None:
+            return None
+        if not isinstance(frames, dict):
+            a = np.asarray(frames).astype(bool)
+            return a[None, ...] if a.ndim == 2 else a
+        u = None
+        for v in frames.values():
+            a = np.asarray(v).astype(bool)
+            if a.ndim == 2:
+                a = a[None, ...]
+            if u is None:
+                u = a.copy()
+            elif u.shape == a.shape:
+                u = u | a
+        return u
+
+    def _accumulate_granule_exclusion(self, record, out: Dict[int, Any]) -> None:
+        """OR each multipoint's combined granule label volume (>0) into ``out``."""
+        gmasks = (getattr(record, "_granule_masks_by_m", None)
+                  or getattr(self, "_granule_masks_by_m", {}) or {})
+        if not isinstance(gmasks, dict):
+            return
+        try:
+            from nd2studios.backend.analysis.granule_types import COMBINED_LABELS_KEY
+        except Exception:  # noqa: BLE001
+            return
+        for m, frames in gmasks.items():
+            entry = (frames.get(min(frames))
+                     if isinstance(frames, dict) and frames else None)
+            if isinstance(entry, dict) and entry.get(COMBINED_LABELS_KEY) is not None:
+                self._accumulate_mask(
+                    out, int(m), np.asarray(entry[COMBINED_LABELS_KEY]) > 0)
+
+    @staticmethod
+    def _accumulate_mask(out: Dict[int, Any], m: int, vol_bool) -> None:
+        """OR ``vol_bool`` into ``out[m]`` (matching ``(Z,H,W)``; replace on a shape
+        mismatch — different sources are all in the raw-frame convention)."""
+        a = np.asarray(vol_bool).astype(bool)
+        if a.ndim == 2:
+            a = a[None, ...]
+        if m in out and out[m].shape == a.shape:
+            out[m] = out[m] | a
+        else:
+            out[m] = a
+
+    def _merge_exclusion(self, record, m: int, vol_bool, dilate: int = 0) -> None:
+        """Grow (optional) then OR ``vol_bool`` into ``record._exclude_by_m[m]``."""
+        a = np.asarray(vol_bool).astype(bool)
+        if a.ndim == 2:
+            a = a[None, ...]
+        if dilate > 0:
+            try:
+                from scipy.ndimage import binary_dilation
+                a = binary_dilation(a, iterations=int(dilate))
+            except Exception:  # noqa: BLE001 — a bad dilate must not fail the Run
+                pass
+        store = getattr(record, "_exclude_by_m", None)
+        if not isinstance(store, dict):
+            store = {}
+            record._exclude_by_m = store
+        self._accumulate_mask(store, int(m), a)
+
+    def _apply_exclusion_channels(self, record, out: Dict[str, Any],
+                                  m: int) -> Dict[str, Any]:
+        """Zero the excluded voxels in each ``(T,H,W)`` channel of ``out`` (V1.75).
+
+        No-op unless an Exclude node published ``record._exclude_by_m[m]``. The
+        ``(Z,H,W)`` exclusion is projected over Z to an ``(H,W)`` footprint (a pixel
+        is ignored if it is inside the region at *any* Z) and sliced to the active
+        crop so it aligns with the (already-cropped) channels. Applied to the
+        analysis / spatial-maps reads only — never to Save Data / Export."""
+        ex = getattr(record, "_exclude_by_m", None) if record is not None else None
+        vol_ex = ex.get(int(m)) if isinstance(ex, dict) else None
+        if vol_ex is None:
+            return out
+        fp = np.asarray(vol_ex)
+        fp = fp.any(axis=0) if fp.ndim == 3 else fp.astype(bool)   # (H,W) footprint
+        rect = self._crop_rect()
+        if rect is not None:
+            x, y, w, h = rect
+            fp = fp[y:y + h, x:x + w]
+        if not fp.any():
+            return out
+        for nm, arr in list(out.items()):
+            a = np.asarray(arr)
+            if a.ndim == 3 and a.shape[-2:] == fp.shape:
+                a = a.copy()
+                a[:, fp] = 0
+            elif a.ndim == 2 and a.shape == fp.shape:
+                a = a.copy()
+                a[fp] = 0
+            else:
+                continue
+            out[nm] = a
+        return out
+
+    def _run_exclude(self, node) -> None:
+        """Exclude: union the wired region(s) into ``record._exclude_by_m`` so every
+        downstream analysis node ignores those voxels. A pass-through — the run
+        continues after it.
+
+        The exclusion is normally resolved up-front (``_resolve_run_exclusions``, so
+        the order the walk reaches this side-branch never matters for a drawn mask);
+        re-resolving here also captures a granule/analysis source that finished
+        earlier in THIS run."""
+        record = self._active_record()
+        if record is None:
+            self._run_finish_node(node.id)
+            return
+        by_m = self._exclusion_source_masks(node, record)
+        dilate = int(node.params.get("dilate_px", 0) or 0)
+        n = 0
+        for m, vol_bool in by_m.items():
+            self._merge_exclusion(record, m, vol_bool, dilate)
+            n += 1
+        if n:
+            self._set_status(
+                f"{node.title}: ignoring {n} region set(s) in downstream analysis.")
+        else:
+            self._set_status(
+                f"{node.title}: no region wired in — nothing excluded. Connect a "
+                "3D Mask Drawing or Granule Volume Mask node into it.")
+        self._run_finish_node(node.id)
+
+    # ── Prism (V1.77) ────────────────────────────────────────────────────────
+    def _run_prism(self, node) -> None:
+        """Prism: a channel splicer / overlay converger. A pass-through.
+
+        Its effect on ANALYSIS channels is resolved purely from the wiring by
+        ``channel_sets`` (the ``channel_op`` directive) — no side-artifact needed. Here
+        we only publish the VIEW-ONLY overlay directive the DVC viewer reads
+        (``record._prism_overlay_by_m``: the green-in-shell overlay). Ordering is
+        guaranteed by the (still-structural) view-only edge feeding DVC, so this runs
+        before ``_run_dvc`` / the DVC panel populate — no pre-Run pass required."""
+        record = self._active_record()
+        if record is None:
+            self._run_finish_node(node.id)
+            return
+        self._resolve_prism_overlay(node, record)
+        self._run_finish_node(node.id)
+
+    def _resolve_prism_overlay(self, node, record) -> None:
+        """Publish ``record._prism_overlay_by_m`` for a Prism that converges a channel
+        into a DVC node on a VIEW-ONLY (dotted) edge (V1.77).
+
+        Overlay channel = the channel(s) wired into the Prism's rainbow port. Shell =
+        the union of the granule boundary bands (``record._granule_bands_by_m`` combined
+        labels > 0) when a Granule Boundary node is upstream of the Prism — exactly the
+        volume between the volume-mask boundary and the boundary-extraction updated
+        boundary. With no boundary upstream the overlay is the full channel volume
+        (shell ``None``). A no-op unless the Prism has a view-only edge into a DVC node."""
+        from nd2studios.pipeline_graph.model import PortType
+        sl = self._doc.analysis
+        vol = getattr(record, "_raw_volume", None)
+        names = list(getattr(vol, "channel_names", []) or [])
+        if not names:
+            return
+        # Only act when this Prism feeds a DVC node on a view-only (dotted) edge.
+        feeds_dvc_view_only = any(
+            edge_view_only(e)
+            and getattr(sl.nodes.get(e.dst_node), "op_key", "") == SPECIAL_DVC_OP_KEY
+            for e in sl.structural_outgoing(node.id))
+        if not feeds_dvc_view_only:
+            return
+        # Overlay channel(s) = the channel(s) injected into the Prism's rainbow port.
+        sets = channel_sets(sl, names)
+        injected: set = set()
+        for e in sl.structural_incoming(node.id):
+            sp = sl.find_port(e.src_port)
+            if sp is not None and sp.type is PortType.CHANNEL:
+                injected |= sets.get(e.src_node, set())
+        inj_ordered = [c for c in names if c in injected]
+        if not inj_ordered:
+            self._set_status(
+                f"{node.title}: no channel wired into its rainbow port — nothing to "
+                "overlay. Drag a channel node into the Prism.")
+            return
+        channel = inj_ordered[0]
+        c_idx = names.index(channel)
+        render = str(node.params.get("overlay_render", "Shell (iso)"))
+        shell_by_m = (self._prism_shell_by_m(record)
+                      if self._prism_boundary_upstream(node) else {})
+        store = getattr(record, "_prism_overlay_by_m", None)
+        if not isinstance(store, dict):
+            store = {}
+            record._prism_overlay_by_m = store
+        n_m = max(1, self._record_n_multipoints(record))
+        for m in range(n_m):
+            store[int(m)] = {
+                "channel": channel, "channel_idx": int(c_idx),
+                "shell": shell_by_m.get(int(m)), "render": render,
+            }
+        n_shell = sum(1 for v in shell_by_m.values() if v is not None)
+        if n_shell:
+            self._set_status(
+                f"{node.title}: '{channel}' overlay clipped to the granule shell "
+                f"({n_shell} multipoint(s)) in the DVC 3-D object view.")
+        else:
+            self._set_status(
+                f"{node.title}: '{channel}' loaded as a view-only overlay in the "
+                "DVC viewer (no Granule Boundary upstream — full volume).")
+
+    def _prism_boundary_upstream(self, node) -> bool:
+        """True if a Granule Boundary Extraction node is upstream (structurally) of
+        this Prism — the trigger to clip the overlay to the granule shell (V1.77)."""
+        sl = self._doc.analysis
+        seen: set = set()
+        stack = [e.src_node for e in sl.structural_incoming(node.id)]
+        while stack:
+            nid = stack.pop()
+            if nid in seen:
+                continue
+            seen.add(nid)
+            n = sl.nodes.get(nid)
+            if n is None:
+                continue
+            if n.op_key == SPECIAL_GRANULE_BOUNDARY_OP_KEY:
+                return True
+            stack.extend(e.src_node for e in sl.structural_incoming(nid))
+        return False
+
+    def _prism_shell_by_m(self, record) -> Dict[int, Any]:
+        """``{m: (Z,H,W) bool}`` — the union of the granule boundary bands (the shell
+        between the two boundaries), per multipoint. Reads the combined band labels
+        (``> 0`` = any band voxel) from ``record._granule_bands_by_m`` (V1.77)."""
+        from nd2studios.backend.analysis.granule_types import (
+            COMBINED_LABELS_KEY, GRANULE_BANDS_ATTR,
+        )
+        out: Dict[int, Any] = {}
+        store = self._granule_read_store(record, GRANULE_BANDS_ATTR)
+        if not isinstance(store, dict):
+            return out
+        for m, bt in store.items():
+            if not isinstance(bt, dict) or not bt:
+                continue
+            entry = next(iter(bt.values()))   # the sole reference-frame t
+            if isinstance(entry, dict) and entry.get(COMBINED_LABELS_KEY) is not None:
+                out[int(m)] = np.asarray(entry[COMBINED_LABELS_KEY]) > 0
+        return out
+
+    # ── Granule Separation (V1.70) ──────────────────────────────────────────
+    # Five special nodes separate a bead point cloud into hydrogel granules:
+    # Bead Detect → Cluster → Tessellate → Volume Mask → Boundary. Each computes
+    # per (m, t) and publishes to ``record._granule_*_by_m`` (mirroring
+    # ``_mask3d_by_m``); downstream nodes read that store, not the wire. Granules
+    # are defined on the currently-viewed timepoint (the reference frame) and are
+    # reused across T downstream — like a drawn 3D mask.
+
+    def _granule_voxel_size(self, record) -> tuple:
+        """``(dz, dy, dx)`` µm for the active record (falls back to 1.0)."""
+        px = float(getattr(record, "pixel_size_um", 1.0) or 1.0)
+        zs = float(getattr(record, "z_step_um", 1.0) or 1.0)
+        return (zs, px, px)
+
+    def _granule_read_store(self, record, attr):
+        """Read a ``{m:{t:…}}`` granule store off the record (then the page)."""
+        store = getattr(record, attr, None) if record is not None else None
+        if not store:
+            store = getattr(self, attr, None)
+        return store if isinstance(store, dict) else {}
+
+    def _granule_publish(self, attr, by_m) -> None:
+        """Publish a granule ``{m:{t:…}}`` store to the page + active record."""
+        setattr(self, attr, by_m)
+        record = self._active_record()
+        if record is not None:
+            try:
+                setattr(record, attr, by_m)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _granule_out_rows(self, node, rows):
+        """Map the node's output port(s) to ``rows`` for the DATA feed."""
+        if not rows:
+            return None
+        return {p.id: rows for p in node.outputs} or None
+
+    def _submit_granule_job(self, node, kind: str, payload: Dict[str, Any],
+                            attr: str) -> None:
+        """Submit a granule compute off the GUI thread and gate the run walk on it.
+
+        All five granule ops are backend compute that can take seconds (bead
+        detection especially — numba blob finding + the per-Z registration warp +
+        first-call JIT), so they run in a :class:`_GranuleJob` like DVC / tracking,
+        never on the event loop. ``_finish_granule`` resumes the walk."""
+        if self._runner is None:
+            self._set_status(f"{node.title}: no compute runner — skipped.")
+            self._run_finish_node(node.id)
+            return
+        self._run_granule_ctx = {"node": node, "attr": attr}
+        self._run_pending = node.id      # async node — gate the walk until it lands
+        self._set_status(f"{node.title}: running…")
+        self._runner.submit(_GranuleJob(_RUN_GRANULE_KEY, kind, payload))
+
+    def _finish_granule(self, result) -> None:
+        """Resume the run after a :class:`_GranuleJob` finishes: publish its
+        ``{m:{t:…}}`` store to ``record`` + the page, report status, complete."""
+        ctx = getattr(self, "_run_granule_ctx", None) or {}
+        self._run_granule_ctx = None
+        node = ctx.get("node")
+        attr = ctx.get("attr")
+        nid = node.id if node is not None else self._run_pending
+        title = node.title if node is not None else "Granule"
+        if not result.ok or not isinstance(result.value, dict):
+            self._set_status(f"{title} failed: {result.error}")
+            self._run_finish_node(nid)
+            return
+        value = result.value
+        if attr:
+            self._granule_publish(attr, value.get("store") or {})
+            # Auto-select this node's overlay tab (as DVC does on finish). Because
+            # _select_overlay_tab sets the tabbar under blockSignals — so it does NOT
+            # fire _on_overlay_tab_changed — explicitly re-arm the post-process hook
+            # to repaint the granule overlay (V1.73 §1 wiring subtlety).
+            from nd2studios.backend.analysis import granule_types as _gt
+            _mode = {
+                _gt.GRANULE_POINTS_ATTR: "granule_beads",
+                _gt.GRANULE_LABELS_ATTR: "granule_clusters",
+                _gt.GRANULE_TESS_ATTR: "granule_tess",
+                _gt.GRANULE_MASKS_ATTR: "granule_mask",
+                _gt.GRANULE_BANDS_ATTR: "granule_boundary",
+            }.get(attr)
+            if _mode:
+                self._update_overlay_tabs_available()
+                self._select_overlay_tab(_mode)
+                try:
+                    self.viewer.set_frame_post_process(
+                        self._composite_pipeline_overlay)
+                except Exception:  # noqa: BLE001
+                    pass
+                if (self.viewer3d is not None and getattr(self, "_view3d_stack", None)
+                        is not None
+                        and self._view3d_stack.currentWidget() is self.viewer3d):
+                    self._feed_view3d()   # refresh 3-D if it is currently shown
+        self._set_status(f"{title}: {value.get('status') or 'done'}.")
+        rows = value.get("rows")
+        port_rows = (self._granule_out_rows(node, rows)
+                     if (rows and node is not None) else None)
+        self._run_finish_node(nid, port_rows=port_rows)
+
+    def _run_bead_detect(self, node) -> None:
+        """Detect bead centroids in the wired channel's **registered** raw
+        ``(Z,H,W)`` volume at the current timepoint → ``record._granule_points_by_m``.
+
+        Runs OFF the GUI thread (:class:`_GranuleJob`, ``kind="detect"``). The worker
+        applies the upstream Registration node's per-Z drift transform and confines
+        detection to the effective crop (``_crop_rect`` — registration common-region
+        ∩ preview ∩ Crop node), reporting FULL-FRAME coordinates. A non-deconvolved
+        stack is fine (``ParticleDetector`` works on raw intensity)."""
+        from nd2studios.backend.analysis import granule_types as gt
+        record = self._active_record()
+        vol = getattr(record, "_raw_volume", None) if record is not None else None
+        if record is None or vol is None or not hasattr(vol, "get_volume"):
+            self._set_status(f"{node.title}: no file imported — skipped.")
+            self._run_finish_node(node.id)
+            return
+        names = list(getattr(vol, "channel_names", []) or [])
+        _extra, seg = self._analysis_run_spec(node, names)
+        channel = seg[0] if seg else (names[0] if names else None)
+        c_idx = names.index(channel) if channel in names else 0
+        n_m = max(1, self._record_n_multipoints(record))
+        try:
+            cur_m, cur_t, _ = self.viewer.coords()
+        except Exception:  # noqa: BLE001
+            cur_m, cur_t = 0, 0
+        cur_m = max(0, min(int(cur_m), n_m - 1))
+        all_m = bool(node.params.get("all_multipoints", False))
+        m_list = list(range(n_m)) if all_m else [cur_m]
+        payload = {
+            "vol": vol, "c_idx": c_idx, "m_list": m_list, "t": int(cur_t),
+            "transforms": getattr(record, "_registration_by_m", None) or {},
+            "interp_order": int(getattr(record, "_registration_interp_order", 1) or 1),
+            "rect": self._crop_rect(),
+            "voxel": self._granule_voxel_size(record),
+            "params": dict(node.params),
+            # V1.75: an upstream Exclude node's mask → zeroed in the worker's read
+            # so beads are never detected inside the excluded region.
+            "exclude": getattr(record, "_exclude_by_m", None) or {},
+        }
+        self._submit_granule_job(node, "detect", payload, gt.GRANULE_POINTS_ATTR)
+
+    def _run_granule_cluster(self, node) -> None:
+        """Assign each bead to a granule (GMM + BIC sweep) → ``_granule_labels_by_m``
+        (off the GUI thread)."""
+        from nd2studios.backend.analysis import granule_types as gt
+        record = self._active_record()
+        points_by_m = self._granule_read_store(record, gt.GRANULE_POINTS_ATTR)
+        if not points_by_m:
+            self._set_status(f"{node.title}: no point cloud — wire a Bead "
+                             "Detection node upstream.")
+            self._run_finish_node(node.id)
+            return
+        payload = {"points_by_m": points_by_m,
+                   "voxel": self._granule_voxel_size(record),
+                   "params": dict(node.params)}
+        self._submit_granule_job(node, "cluster", payload, gt.GRANULE_LABELS_ATTR)
+
+    def _run_granule_tessellate(self, node) -> None:
+        """Per-granule boundaries + density-merge → ``_granule_tess_by_m`` (final
+        labels; off the GUI thread)."""
+        from nd2studios.backend.analysis import granule_types as gt
+        record = self._active_record()
+        points_by_m = self._granule_read_store(record, gt.GRANULE_POINTS_ATTR)
+        labels_by_m = self._granule_read_store(record, gt.GRANULE_LABELS_ATTR)
+        if not labels_by_m:
+            self._set_status(f"{node.title}: no clustered points — wire a Granule "
+                             "Clustering node upstream.")
+            self._run_finish_node(node.id)
+            return
+        payload = {"points_by_m": points_by_m, "labels_by_m": labels_by_m,
+                   "voxel": self._granule_voxel_size(record),
+                   "params": dict(node.params)}
+        self._submit_granule_job(node, "tessellate", payload, gt.GRANULE_TESS_ATTR)
+
+    def _run_granule_mask(self, node) -> None:
+        """Voxelize granule boundaries (+ SDF-Gaussian smoothing) →
+        ``_granule_masks_by_m`` (off the GUI thread)."""
+        from nd2studios.backend.analysis import granule_types as gt
+        record = self._active_record()
+        vol = getattr(record, "_raw_volume", None) if record is not None else None
+        tess_by_m = self._granule_read_store(record, gt.GRANULE_TESS_ATTR)
+        if not tess_by_m or vol is None:
+            self._set_status(f"{node.title}: no tessellation — wire a Granule "
+                             "Tessellation node upstream.")
+            self._run_finish_node(node.id)
+            return
+        n_z = int(getattr(vol, "n_zslices", 1) or 1)
+        H = int(getattr(vol, "height", 0) or getattr(record, "height", 0) or 0)
+        W = int(getattr(vol, "width", 0) or getattr(record, "width", 0) or 0)
+        payload = {"tess_by_m": tess_by_m, "shape_zhw": (n_z, H, W),
+                   "voxel": self._granule_voxel_size(record),
+                   "params": dict(node.params)}
+        self._submit_granule_job(node, "mask", payload, gt.GRANULE_MASKS_ATTR)
+
+    def _run_granule_boundary(self, node) -> None:
+        """Outward boundary band per granule → ``_granule_bands_by_m`` (off the GUI
+        thread)."""
+        from nd2studios.backend.analysis import granule_types as gt
+        record = self._active_record()
+        masks_by_m = self._granule_read_store(record, gt.GRANULE_MASKS_ATTR)
+        if not masks_by_m:
+            self._set_status(f"{node.title}: no granule masks — wire a Granule "
+                             "Volume Mask node upstream.")
+            self._run_finish_node(node.id)
+            return
+        payload = {"masks_by_m": masks_by_m,
+                   "voxel": self._granule_voxel_size(record),
+                   "params": dict(node.params)}
+        self._submit_granule_job(node, "boundary", payload, gt.GRANULE_BANDS_ATTR)
+
+    # ── 2D DIC (pyALDIC) node (V1.78) ───────────────────────────────────────
+    def _run_dic_region(self, node) -> None:
+        """DIC Mesh Region / Refinement: rasterize the node's drawn shapes and
+        publish them as a record side-artifact the DIC job reads.
+
+        The Mesh Region node publishes ``record._dic_roi_by_m`` (the boolean AL-DIC
+        mesh domain); the Mesh Refinement node publishes ``record._dic_refine_by_m``
+        (brush region + criteria for the adaptive quadtree). Both are pass-throughs —
+        the run continues after them. Synchronous (rasterization is cheap)."""
+        record = self._active_record()
+        vol = getattr(record, "_raw_volume", None) if record is not None else None
+        if record is None or vol is None or not hasattr(vol, "get_volume"):
+            self._set_status(f"{node.title}: no file imported — skipped.")
+            self._run_finish_node(node.id)
+            return
+        is_roi = node.op_key == SPECIAL_DIC_ROI_OP_KEY
+        store = node.params.get("roi_shapes" if is_roi else "brush_shapes") or {}
+        if not store:
+            self._set_status(f"{node.title}: nothing drawn — skipped.")
+            self._run_finish_node(node.id)
+            return
+        # Rasterize at the registered + cropped frame size (pre-downsample); the DIC
+        # job resizes to its correlated-frame size. Matches the frame drawn over in
+        # the editor (which uses the same crop rect).
+        rect = self._crop_rect()
+        if rect is not None:
+            W, H = int(rect[2]), int(rect[3])
+        else:
+            H = int(getattr(vol, "height", 0) or getattr(record, "height", 0) or 0)
+            W = int(getattr(vol, "width", 0) or getattr(record, "width", 0) or 0)
+        if H <= 0 or W <= 0:
+            try:
+                fr = np.asarray(vol.get_volume(0, m=0, t=0))
+                if fr.ndim == 3:
+                    fr = fr[0]
+                if rect is not None:
+                    x, y, w, h = rect
+                    fr = fr[y:y + h, x:x + w]
+                H, W = fr.shape[:2]
+            except Exception:  # noqa: BLE001
+                H, W = 0, 0
+        if H <= 0 or W <= 0:
+            self._set_status(f"{node.title}: could not determine frame size — skipped.")
+            self._run_finish_node(node.id)
+            return
+        from nd2studios.backend.dic import roi as dic_roi
+        n = 0
+        if is_roi:
+            by_m: Dict[int, Any] = {}
+            for m_str, shapes in store.items():
+                try:
+                    m = int(m_str)
+                except (TypeError, ValueError):
+                    continue
+                mask = dic_roi.build_roi_mask(shapes, H, W)
+                if mask.any():
+                    by_m[m] = mask
+                    n += 1
+            merged = dict(getattr(record, "_dic_roi_by_m", None) or {})
+            merged.update(by_m)
+            try:
+                record._dic_roi_by_m = merged
+            except Exception:  # noqa: BLE001
+                pass
+            self._dic_roi_by_m = merged
+            self._set_status(f"{node.title}: mesh region set for {n} multipoint(s).")
+        else:
+            crit = {
+                "mask_boundary": bool(node.params.get("refine_mask_boundary", False)),
+                "roi_edge": bool(node.params.get("refine_roi_edge", True)),
+                "brush": bool(node.params.get("refine_brush", True)),
+            }
+            mes = int(node.params.get("min_element_size", 8) or 8)
+            by_m = {}
+            for m_str, shapes in store.items():
+                try:
+                    m = int(m_str)
+                except (TypeError, ValueError):
+                    continue
+                brush = dic_roi.build_roi_mask(shapes, H, W)
+                by_m[m] = {"brush": (brush if brush.any() else None),
+                           "criteria": crit, "min_element_size": mes}
+                n += 1
+            merged = dict(getattr(record, "_dic_refine_by_m", None) or {})
+            merged.update(by_m)
+            try:
+                record._dic_refine_by_m = merged
+            except Exception:  # noqa: BLE001
+                pass
+            self._dic_refine_by_m = merged
+            self._set_status(f"{node.title}: mesh refinement set for {n} multipoint(s).")
+        self._run_finish_node(node.id)
+
+    def _run_dic(self, node) -> None:
+        """DIC (pyALDIC): compute the 2D displacement + strain field **series** over
+        the timelapse of the wired channel via the optional ``al-dic`` package.
+
+        The 2D sibling of :meth:`_run_dvc`: reads one projected frame per timepoint
+        (registration + crop + exclude applied), restricts the mesh to an upstream
+        DIC Mesh Region's ROI and refines it per a DIC Mesh Refinement node. Runs
+        off-thread in :class:`_DICJob`; ``_finish_dic`` opens the DIC viewer tab."""
+        record = self._active_record()
+        vol = getattr(record, "_raw_volume", None) if record is not None else None
+        if record is None or vol is None or not hasattr(vol, "get_volume"):
+            self._set_status(f"{node.title}: no file imported — skipped.")
+            self._run_finish_node(node.id)
+            return
+        from nd2studios.backend.dic.engine import al_dic_available
+        if not al_dic_available():
+            self._set_status(
+                f"{node.title}: needs the optional 'al-dic' package — install it with "
+                "'pip install al-dic'. Skipped.")
+            self._run_finish_node(node.id)
+            return
+        names = list(getattr(vol, "channel_names", []) or [])
+        if not names:
+            self._set_status(f"{node.title}: no channels — skipped.")
+            self._run_finish_node(node.id)
+            return
+        _extra, seg = self._analysis_run_spec(node, names)
+        channel = seg[0] if seg else names[0]
+        if channel not in names:
+            channel = names[0]
+        c_idx = names.index(channel)
+        n_t = int(getattr(vol, "n_timepoints", 1) or 1)
+        if n_t < 2:
+            self._set_status(f"{node.title}: needs ≥2 timepoints — skipped.")
+            self._run_finish_node(node.id)
+            return
+        mode = str(node.params.get("tracking_mode", "cumulative") or "cumulative")
+        ref_frame = max(0, min(int(node.params.get("ref_frame", 0) or 0), n_t - 1))
+        down = max(1, int(node.params.get("downsample", 1) or 1))
+        px = float(getattr(record, "pixel_size_um", 1.0) or 1.0) * down
+        voxel = (px, px)
+        n_m = max(1, self._record_n_multipoints(record))
+        cur_m, _, _ = self.viewer.coords()
+        cur_m = max(0, min(int(cur_m), n_m - 1))
+        all_m = bool(node.params.get("all_multipoints", False))
+        m_list = list(range(n_m)) if all_m else [cur_m]
+        rect = self._crop_rect()
+        transforms = getattr(record, "_registration_by_m", None) or None
+        interp_order = int(getattr(record, "_registration_interp_order", 1) or 1)
+        roi_by_m = (getattr(record, "_dic_roi_by_m", None)
+                    or getattr(self, "_dic_roi_by_m", {}) or {})
+        refine_by_m = (getattr(record, "_dic_refine_by_m", None)
+                       or getattr(self, "_dic_refine_by_m", {}) or {})
+        self._run_dic_node = node
+        self._run_dic_display_m = cur_m
+        self._run_pending = node.id  # async node — gate the walk until the job lands
+        scope = f"all {n_m} M" if all_m else f"M{cur_m + 1}"
+        binned = f" · ÷{down} XY" if down > 1 else ""
+        reginfo = " · registered" if transforms else ""
+        cropinfo = f" · crop {rect[2]}×{rect[3]}" if rect is not None else ""
+        roiinfo = " · ROI" if roi_by_m else ""
+        self._set_status(
+            f"{node.title}: 2D {mode} DIC on '{channel}' · {scope} · "
+            f"{n_t} frame(s){binned}{reginfo}{cropinfo}{roiinfo}…")
+        self._runner.submit(_DICJob(
+            _RUN_DIC_KEY, vol, c_idx, m_list, n_t, ref_frame, mode, down, voxel,
+            dict(node.params), rect=rect, transforms_by_m=transforms,
+            interp_order=interp_order,
+            exclude_by_m=getattr(record, "_exclude_by_m", None),
+            roi_by_m=roi_by_m, refine_by_m=refine_by_m))
+
+    def _finish_dic(self, result) -> None:
+        """Resume the Run after the DIC worker finishes: store the field series,
+        open + populate the (playable) DIC tab, and complete the node."""
+        node = getattr(self, "_run_dic_node", None)
+        self._run_dic_node = None
+        title = node.title if node is not None else "DIC"
+        nid = node.id if node is not None else self._run_pending
+        if not result.ok or not result.value:
+            self._set_status(f"{title} failed: {result.error}")
+            self._run_finish_node(nid)
+            return
+        by_m = result.value  # {m: {"primary": {t:(res,bg)}, "increment": {t:res}}}
+        n_fields = 0
+        for m, bundle in by_m.items():
+            primary = bundle.get("primary", {}) if isinstance(bundle, dict) else {}
+            increment = bundle.get("increment", {}) if isinstance(bundle, dict) else {}
+            res_map = {int(t): res for t, (res, _bg) in primary.items()}
+            bg_map = {int(t): np.asarray(bg) for t, (_res, bg) in primary.items()}
+            self._dic_series_by_m[int(m)] = res_map
+            self._dic_bg_by_mt[int(m)] = bg_map
+            self._dic_incr_by_m[int(m)] = {int(t): r for t, r in increment.items()}
+            n_fields += len(res_map)
+        self._ensure_dic_panel()
+        self._update_overlay_tabs_available()
+        self._select_overlay_tab("dic")
+        show_m = getattr(self, "_run_dic_display_m", None)
+        if show_m is None or int(show_m) not in by_m:
+            show_m = sorted(by_m)[0] if by_m else 0
+        self._populate_dic_panel(int(show_m))
+        self._set_status(
+            f"{title}: {n_fields} field(s) across {len(by_m)} multipoint(s).")
+        self._run_finish_node(nid)
+
     def _run_dvc(self, node) -> None:
         """DVC (ALDVC): compute the dense displacement + strain field **series**
         over the whole timelapse of the wired channel.
@@ -5805,12 +8828,79 @@ class PipelinesPage(QWidget):
         scope = f"all {n_m} M" if all_m else f"M{cur_m + 1}"
         binned = f" · ÷{down} XY" if down > 1 else ""
         zinfo = f" · Z[{z0}:{z1 if z1 is not None else n_z}]" if is_3d else ""
+        # V1.59: correlate the registered, cropped region — apply the same drift
+        # transforms + crop (preview ∩ registration common crop) the rest of the
+        # pipeline uses. The rect is in original (pre-downsample) XY coords; the
+        # worker crops before binning.
+        rect = self._crop_rect()
+        transforms = getattr(record, "_registration_by_m", None) or None
+        interp_order = int(getattr(record, "_registration_interp_order", 1) or 1)
+        cropinfo = f" · crop {rect[2]}×{rect[3]}" if rect is not None else ""
+        reginfo = " · registered" if transforms else ""
+        # V1.68 — per-object scope: if the edge feeding this DVC node has its
+        # Frame/Objects lever on "objects", enumerate the upstream object mask and
+        # run DVC once per object (each on its own crop). Whole-frame otherwise.
+        object_regions = self._dvc_scoped_object_regions(node, cur_m)
+        self._run_dvc_object_mode = bool(object_regions)
+        objinfo = (f" · {len(object_regions)} object(s)" if object_regions else "")
         self._set_status(
             f"{node.title}: {dim} {mode} DVC on '{channel}' · {scope} · "
-            f"{len(frames)} frame(s){zinfo}{binned}…")
+            f"{len(frames)} frame(s){zinfo}{binned}{reginfo}{cropinfo}{objinfo}…")
         self._runner.submit(_DVCJob(
             _RUN_DVC_KEY, vol, c_idx, m_list, frames, ref_frame, mode,
-            z0, z1, down, voxel, dict(node.params)))
+            z0, z1, down, voxel, dict(node.params),
+            rect=rect, transforms_by_m=transforms, interp_order=interp_order,
+            object_regions=object_regions,
+            exclude_by_m=getattr(record, "_exclude_by_m", None)))  # V1.75
+
+    def _dvc_scoped_object_regions(self, node, m: int):
+        """Object regions to scope this DVC node to, or ``None`` for whole-frame.
+
+        Returns a list of :class:`ObjectRegion` when a structural edge feeding this
+        DVC node has ``edge_scope == objects`` and its source produces objects and
+        a drawn 3-D mask exists for multipoint ``m``; otherwise ``None`` (the
+        default whole-frame path — every legacy graph)."""
+        try:
+            from nd2studios.pipeline_graph.model import SCOPE_OBJECTS, edge_scope
+            from nd2studios.pipeline_graph.registry_adapter import node_produces_objects
+            from nd2studios.backend.analysis.object_scope import iter_objects
+        except Exception:  # noqa: BLE001
+            return None
+        sl = self._doc.analysis
+        scoped = False
+        for e in sl.structural_incoming(node.id):
+            src = sl.nodes.get(e.src_node)
+            if (src is not None and node_produces_objects(src)
+                    and edge_scope(e) == SCOPE_OBJECTS):
+                scoped = True
+                break
+        if not scoped:
+            return None
+        record = self._active_record()
+        masks_by_m = (getattr(record, "_mask3d_by_m", None)
+                      or getattr(self, "_mask3d_by_m", {}) or {})
+        frames = masks_by_m.get(int(m)) if isinstance(masks_by_m, dict) else None
+        if frames:
+            # Enumerate from a representative frame (masks are typically shared across
+            # T via "apply to all frames"); the object layout defines the crops.
+            mask = frames.get(min(frames)) if isinstance(frames, dict) else None
+            if mask is not None:
+                return iter_objects(np.asarray(mask).astype(bool)) or None
+        # V1.70 — granule source: record._granule_masks_by_m[m][t] is
+        # {gid:(Z,H,W) bool, "_labels": (Z,H,W) int32}. Enumerate from the combined
+        # label volume so touching granules stay distinct objects (plain connected
+        # components would merge them into one).
+        gmasks = (getattr(record, "_granule_masks_by_m", None)
+                  or getattr(self, "_granule_masks_by_m", {}) or {})
+        gframes = gmasks.get(int(m)) if isinstance(gmasks, dict) else None
+        if gframes:
+            from nd2studios.backend.analysis.granule_types import COMBINED_LABELS_KEY
+            from nd2studios.backend.analysis.object_scope import iter_objects_3d_labels
+            entry = gframes.get(min(gframes)) if isinstance(gframes, dict) else None
+            if isinstance(entry, dict) and entry.get(COMBINED_LABELS_KEY) is not None:
+                return iter_objects_3d_labels(
+                    np.asarray(entry[COMBINED_LABELS_KEY])) or None
+        return None
 
     def _finish_dvc(self, result) -> None:
         """Resume the Run after the DVC worker finishes: store the field series,
@@ -5823,7 +8913,22 @@ class PipelinesPage(QWidget):
             self._set_status(f"{title} failed: {result.error}")
             self._run_finish_node(nid)
             return
-        by_m = result.value  # {m: {"primary": {t:(res,bg)}, "increment": {t:res}}}
+        value = result.value
+        # V1.76: a real DVC run supersedes any reloaded bundle — leave the
+        # bundle-feed path so the panel derives metadata from the live record again.
+        self._dvc_from_bundle = False
+        self._dvc_bundle_whole_masks_by_m = {}
+        self._dvc_display_mask_by_m = {}
+        self._dvc_obj_by_m = {}
+        self._dvc_obj_full_by_m = {}       # V1.74 per-granule full bundles
+        if isinstance(value, dict) and "objects" in value:
+            # V1.68 per-object result: {"objects": {oid: {m: bundle}},
+            #                           "object_masks": {oid: mask}}. Store every
+            # object; display the largest (most voxels) in its own crop frame — one
+            # surface + MDM per object (a per-object selector is a follow-on).
+            by_m = self._store_dvc_objects(value)
+        else:
+            by_m = value  # {m: {"primary": {t:(res,bg)}, "increment": {t:res}}}
         n_fields = 0
         for m, bundle in by_m.items():
             primary = bundle.get("primary", {}) if isinstance(bundle, dict) else {}
@@ -5851,9 +8956,77 @@ class PipelinesPage(QWidget):
         if show_m is None or int(show_m) not in by_m:
             show_m = sorted(by_m)[0] if by_m else 0
         self._populate_dvc_panel(int(show_m))
+        obj_note = ""
+        obj_by_m = getattr(self, "_dvc_obj_by_m", {}) or {}
+        if obj_by_m:
+            n_obj = max((len(v) for v in obj_by_m.values()), default=0)
+            obj_note = f" · {n_obj} object(s) (showing largest)"
         self._set_status(
-            f"{title}: {n_fields} field(s) across {len(by_m)} multipoint(s).")
+            f"{title}: {n_fields} field(s) across {len(by_m)} multipoint(s)"
+            f"{obj_note}.")
         self._run_finish_node(nid)
+
+    def _store_dvc_objects(self, value):
+        """Store per-object DVC results (V1.68/V1.74) and return the ``{m: bundle}``
+        of the **largest** object for the standard display path.
+
+        ``value`` is ``{"objects": {object_id: {m: bundle}}, "object_masks":
+        {object_id: mask}}`` (each bundle in the object's own crop frame). Stores:
+
+        - ``self._dvc_obj_by_m`` = ``{m: {object_id: {t: res}}}`` (status counts).
+        - ``self._dvc_display_mask_by_m`` = the **largest** object's cropped mask,
+          broadcast across its frames — the default single-surface display path.
+        - ``self._dvc_obj_full_by_m`` (V1.74) = ``{m: {object_id: {"series": {t:res},
+          "bg": {t:bg}, "increment": {t:res}, "mask": {t:mask}, "n_voxels": int}}}``
+          — the full per-object bundle the DVC panel's per-granule selector + "All
+          granules" composite need (per-object backgrounds / increments / masks were
+          previously discarded).
+
+        Returns the display (largest) object's per-m bundle for the caller to fold
+        into the normal ``_dvc_series_by_m`` display path (unchanged)."""
+        objects = value.get("objects", {}) or {}
+        obj_masks = value.get("object_masks", {}) or {}
+        obj_origins = value.get("object_origins", {}) or {}
+        if not objects:
+            return {}
+        # Largest object by cropped-mask voxel count (falls back to id order).
+        def _size(oid):
+            mm = obj_masks.get(oid)
+            return int(np.asarray(mm).astype(bool).sum()) if mm is not None else 0
+        display_oid = max(objects, key=_size)
+        self._dvc_obj_by_m = {}
+        self._dvc_obj_full_by_m = {}
+        for oid, by_m in objects.items():
+            mask = obj_masks.get(oid)
+            mask = np.asarray(mask).astype(bool) if mask is not None else None
+            n_vox = int(mask.sum()) if mask is not None else 0
+            origin = tuple(int(v) for v in obj_origins.get(oid, (0, 0, 0)))
+            for m, bundle in by_m.items():
+                primary = bundle.get("primary", {}) if isinstance(bundle, dict) else {}
+                increment = (bundle.get("increment", {})
+                             if isinstance(bundle, dict) else {})
+                series = {int(t): res for t, (res, _bg) in primary.items()}
+                self._dvc_obj_by_m.setdefault(int(m), {})[int(oid)] = series
+                self._dvc_obj_full_by_m.setdefault(int(m), {})[int(oid)] = {
+                    "series": series,
+                    "bg": {int(t): np.asarray(bg) for t, (_res, bg) in primary.items()},
+                    "increment": {int(t): r for t, r in increment.items()},
+                    "mask": ({int(t): mask for t in series} if mask is not None else {}),
+                    "n_voxels": n_vox,
+                    "origin": origin,      # (z0, y0, x0) full-frame raw voxels
+                }
+        # The display object's cropped mask, broadcast across its computed frames,
+        # so the 3-D object / unwrap views build the surface from THIS object only.
+        disp = objects.get(display_oid, {})
+        mask = obj_masks.get(display_oid)
+        self._dvc_display_mask_by_m = {}
+        if mask is not None:
+            mask = np.asarray(mask).astype(bool)
+            for m, bundle in disp.items():
+                primary = bundle.get("primary", {}) if isinstance(bundle, dict) else {}
+                self._dvc_display_mask_by_m[int(m)] = {
+                    int(t): mask for t in primary}
+        return disp
 
     # ── Registration node (V1.56) ──────────────────────────────────────────
     def _run_register(self, node) -> None:
@@ -6278,6 +9451,211 @@ class PipelinesPage(QWidget):
             self._set_status(f"Export failed: {exc}")
         self._run_finish_node(node.id)
 
+    def _run_save_data(self, node) -> None:
+        """Save the dataset **as it is at this node** to a chosen folder.
+
+        ``data`` selects the full Z-stack ``(T,Z,H,W)`` raw voxels
+        (``_zstack_channels_for_m``), the recipe-processed Z-projection, or the
+        raw Z-projection — written as a multi-channel TIFF hyperstack (one
+        ``.tif`` per multipoint) or a compressed NPZ. A pass-through node: the run
+        continues after it."""
+        record = self._active_record()
+        if record is None:
+            self._set_status("Save Data: no active dataset — skipped.")
+            self._run_finish_node(node.id)
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "Save dataset to folder")
+        if not out_dir:
+            self._set_status("Save Data cancelled.")
+            self._run_finish_node(node.id)
+            return
+        params = dict(node.params)
+        # Back-compat: an earlier build used a 'source' (processed/raw) param.
+        data = str(params.get("data")
+                   or ("Z-projection (recipe-processed)"
+                       if params.get("source") == "processed"
+                       else "Full Z-stack (raw voxels)"))
+        fmt = str(params.get("image_format", "TIFF hyperstack"))
+        bit_depth = str(params.get("bit_depth", "passthrough"))
+        all_m = bool(params.get("all_multipoints", False))
+        n_m = max(1, self._record_n_multipoints(record))
+        cur_m, _, _ = self.viewer.coords()
+        cur_m = max(0, min(int(cur_m), n_m - 1))
+        m_list = list(range(n_m)) if all_m else [cur_m]
+        multi = all_m or n_m > 1
+        # Calibration to embed so the saved files conserve the ND2's spatial /
+        # temporal metadata (crop is XY-only, so pixel size / Z-step / T interval
+        # are all unchanged by it).
+        px, z_step, finterval = self._save_data_calibration(record)
+
+        def _channels_for(m: int) -> Dict[str, np.ndarray]:
+            if data.startswith("Full Z-stack"):
+                ch = self._zstack_channels_for_m(record, m)
+                if ch:
+                    return ch
+                # Loader can't serve full Z — fall back to a raw projection.
+                self._set_status("Save Data: full Z-stack unavailable for this "
+                                 "loader — saving the Z-projection instead.")
+                return self._materialize_channels_for_m(record, m)
+            if data == "Z-projection (recipe-processed)":
+                return self._processed_channels_for_m(record, m)
+            return self._materialize_channels_for_m(record, m)
+
+        written: List[str] = []
+        saved_m: List[int] = []
+        arch = {"T": 0, "C": 0, "Z": 0, "H": 0, "W": 0, "channels": []}
+        try:
+            from nd2studios.backend.exporters.tiff_exporter import (
+                export_tiff_hyperstack,
+            )
+            for m in m_list:
+                channels = {nm: np.asarray(a)
+                            for nm, a in (_channels_for(m) or {}).items()
+                            if a is not None}
+                if not channels:
+                    continue
+                sample = next(iter(channels.values()))
+                # (T, H, W) or (T, Z, H, W) → record the full axis architecture.
+                if sample.ndim == 4:
+                    t_ax, z_ax, h_ax, w_ax = (int(v) for v in sample.shape)
+                else:
+                    t_ax, h_ax, w_ax = (int(v) for v in sample.shape)
+                    z_ax = 1
+                arch = {"T": t_ax, "C": len(channels), "Z": z_ax,
+                        "H": h_ax, "W": w_ax, "channels": list(channels.keys())}
+                suffix = f"_M{m + 1:02d}" if multi else ""
+                if fmt == "NPZ":
+                    path = os.path.join(out_dir, f"pipeline_data{suffix}.npz")
+                    np.savez_compressed(path, **channels)
+                    written.append(path)
+                else:
+                    enabled = {nm: True for nm in channels}
+                    path = os.path.join(out_dir, f"pipeline_data{suffix}.tif")
+                    written.append(export_tiff_hyperstack(
+                        channels, enabled, path, bit_depth=bit_depth,
+                        pixel_size_um=(px if px > 0 else None),
+                        z_step_um=(z_step if z_step > 0 else None),
+                        finterval_s=(finterval if finterval > 0 else None)))
+                saved_m.append(int(m))
+            if written:
+                self._write_save_data_sidecar(
+                    out_dir, record, data, fmt, bit_depth, saved_m, n_m,
+                    arch, px, z_step, finterval, written)
+                self._set_status(
+                    f"Save Data: wrote {len(written)} file(s) — {data}, "
+                    f"{arch['T']}T×{len(saved_m)}M×{arch['C']}C×{arch['Z']}Z "
+                    f"@ {arch['H']}×{arch['W']} px — to {out_dir}.")
+            else:
+                self._set_status("Save Data: no channel data to save — skipped.")
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Save Data failed: {exc}")
+        self._run_finish_node(node.id)
+
+    def _save_data_calibration(self, record) -> Tuple[float, float, float]:
+        """``(pixel_size_um, z_step_um, frame_interval_s)`` for ``record`` — the
+        spatial + temporal calibration embedded by Save Data. Reads the volume /
+        metadata defensively (0.0 = unknown/absent). A crop is XY-only, so none of
+        these change under a crop."""
+        vol = getattr(record, "_raw_volume", None)
+        md = getattr(record, "nd2_metadata", {}) or {}
+        px = float(getattr(record, "pixel_size_um", 0.0)
+                   or md.get("pixel_size_um", 0.0) or 0.0)
+        z_step = float(getattr(vol, "z_step_um", 0.0)
+                       or md.get("z_step_um", 0.0) or 0.0)
+        # Frame interval: prefer the median spacing of the ND2 frame timestamps.
+        finterval = 0.0
+        ts = md.get("frame_timestamps_s")
+        try:
+            arr = np.asarray(ts, dtype=float)
+            if arr.ndim == 1 and arr.size >= 2:
+                d = np.diff(arr)
+                d = d[np.isfinite(d) & (d > 0)]
+                if d.size:
+                    finterval = float(np.median(d))
+        except Exception:  # noqa: BLE001
+            pass
+        if finterval <= 0:
+            finterval = float(md.get("frame_interval_s", 0.0) or 0.0)
+        return px, z_step, finterval
+
+    def _write_save_data_sidecar(self, out_dir, record, data, fmt, bit_depth,
+                                 saved_m, n_m, arch, px, z_step, finterval,
+                                 written) -> None:
+        """Write ``pipeline_data_metadata.json`` recording the full architecture
+        (T, M, C, Z, H, W), calibration, channel info, and crop provenance — so
+        every aspect the TIFF/NPZ can't embed is still saved alongside."""
+        md = getattr(record, "nd2_metadata", {}) or {}
+        crop = self._crop_rect()
+        payload = {
+            "produced_by": "ND2Studios Save Data node",
+            "source_file": md.get("filepath") or getattr(record, "name", ""),
+            "data_mode": data,
+            "image_format": fmt,
+            "bit_depth": bit_depth,
+            "architecture": {
+                "T": arch["T"], "M": len(saved_m), "C": arch["C"],
+                "Z": arch["Z"], "H": arch["H"], "W": arch["W"],
+            },
+            "multipoints_saved": saved_m,
+            "n_multipoints_total": int(n_m),
+            "channel_names": arch["channels"],
+            "channel_display": getattr(record, "channel_display", {}) or {},
+            "pixel_size_um": px,
+            "z_step_um": z_step,
+            "frame_interval_s": finterval,
+            "crop_applied_xywh": list(crop) if crop is not None else None,
+            "files": [os.path.basename(p) for p in written],
+        }
+        try:
+            with open(os.path.join(out_dir, "pipeline_data_metadata.json"),
+                      "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+        except Exception:  # noqa: BLE001 — a sidecar failure must not fail the save
+            pass
+
+    def _run_crop(self, node) -> None:
+        """Publish the node's manual crop rect on the record so every downstream
+        node (and the viewer) reads the cropped image — the crop "applies to the
+        rest of the pipeline". Reset at run start; picked up via ``_crop_rect``.
+        A pass-through: the run continues after it."""
+        record = self._active_record()
+        rect = node.params.get("rect")
+        if record is None or not rect or len(rect) != 4:
+            self._set_status(
+                f"{node.title}: no crop region set — skipped. Pick one with "
+                "'Pick crop region…' in the node settings.")
+            self._run_finish_node(node.id)
+            return
+        x, y, w, h = (int(v) for v in rect)
+        # Clamp to the record's raw frame so an out-of-bounds rect (e.g. picked on
+        # a differently-sized dataset) can't slice an empty region downstream.
+        shape = self._raw_frame_shape(record)
+        if shape is not None and shape[0] > 0 and shape[1] > 0:
+            fh, fw = shape
+            x = max(0, min(x, fw - 1))
+            y = max(0, min(y, fh - 1))
+            w = max(1, min(w, fw - x))
+            h = max(1, min(h, fh - y))
+        if w <= 0 or h <= 0:
+            self._set_status(f"{node.title}: crop region is empty — skipped.")
+            self._run_finish_node(node.id)
+            return
+        record._pipeline_crop = (x, y, w, h)
+        # Every downstream analysis node now computes masks at this cropped
+        # geometry (the crop node runs before them in topological order), so keep
+        # ``_run_results_crop`` — the geometry the overlay guard compares against
+        # (_overlay_result_for / _label_stack_for_m) — in step, else the freshly
+        # committed crop-sized masks would be suppressed as a geometry mismatch.
+        self._run_results_crop = self._crop_rect()
+        # Redraw the viewer so the shown base image reflects the crop immediately.
+        try:
+            self._show_base_image()
+        except Exception:  # noqa: BLE001 — never break the run on a redraw
+            pass
+        self._set_status(
+            f"{node.title}: cropped downstream pipeline to {w}×{h} px @({x},{y}).")
+        self._run_finish_node(node.id)
+
     def _run_ct_metrics(self, node) -> None:
         """Cell-Tracker Metrics: augment the accumulated rows with per-cell
         spatial metrics (neighbor distance, local divergence / curl) and, when an
@@ -6374,10 +9752,23 @@ class PipelinesPage(QWidget):
         Covers the structural ancestors (op_key + params), every edge feeding them
         or the checkpoint (structural + channel wiring, so the wired segmentation
         channel counts), any loop-edge config touching them, the Processing
-        recipe / per-channel recipes / normalized flag, the Run crop geometry, and
-        a **source-file signature** (so a persisted cache reloaded against a
-        different ND2 file invalidates through the same gate). A change to any of
-        these invalidates the freeze and forces a full re-run.
+        recipe / per-channel recipes / normalized flag, and a **source-file
+        signature** (so a persisted cache reloaded against a different ND2 file
+        invalidates through the same gate). A change to any of these invalidates
+        the freeze and forces a full re-run.
+
+        V1.59: **no crop is folded in** — neither the preview crop (a downstream
+        scoping concern) nor the registration common-region crop. The registration
+        crop is fully determined by things already hashed (the Registration node's
+        params + channel wiring + source-file signature), so hashing it is
+        redundant — *and* actively harmful: ``_on_run`` clears
+        ``record._registration_crop`` at the start of every Run (before this hash is
+        recomputed for the resume decision), which made a checkpoint downstream of a
+        "crop to common region" Registration node mismatch on every resume and
+        re-run the whole upstream. A checkpoint frozen full-frame or at a
+        registration crop stays valid when a preview crop is set; the cropped resume
+        re-scopes the frozen data to the crop on restore (see
+        ``_restore_checkpoint``).
         """
         sl = self._doc.analysis
         anc = self._checkpoint_ancestors(node_id)
@@ -6399,7 +9790,10 @@ class PipelinesPage(QWidget):
             "recipe": self._graph_recipe(),
             "recipe_by_channel": self._graph_channel_recipes(record),
             "normalized": bool(self._normalized),
-            "crop": self._crop_rect(),
+            # V1.59: no crop — the preview crop is a downstream concern and the
+            # registration crop is redundant (determined by the reg node's params +
+            # file signature above) AND is cleared at run start, so folding it in
+            # spuriously invalidated any checkpoint after a "crop to common" reg node.
             "file": self._record_signature(record),
         }
         blob = json.dumps(payload, sort_keys=True, default=str)
@@ -6431,8 +9825,17 @@ class PipelinesPage(QWidget):
         rows, run context and track overlay state (arrays held by reference —
         session RAM), and stamps the current upstream hash so a later Run can tell
         the freeze is still valid. Re-freezing on every full Run keeps the snapshot
-        current after any upstream edit."""
+        current after any upstream edit.
+
+        V1.59: also freezes the **registration** state (per-M transforms, interp
+        order, common crop, viewer bundle) a Registration node published on the
+        record. That state lives on the record — not in these accumulators — and is
+        cleared at the start of every Run, so without capturing it a resume that
+        skips the (frozen) Registration node would leave downstream nodes with no
+        drift correction. ``_restore_checkpoint`` re-publishes it."""
         self._ensure_run_rows()
+        record = self._active_record()
+        reg_by_m = getattr(record, "_registration_by_m", None) if record else None
         snapshot = {
             "results_by_m": dict(self._run_results_by_m or {}),
             "all_rows": [dict(r) for r in (self._run_all_rows or [])],
@@ -6440,12 +9843,22 @@ class PipelinesPage(QWidget):
             "ctx_rows": [dict(r) for r in (self._run_context.get("rows") or [])],
             "ctx_result": self._run_context.get("result"),
             "ctx_results_by_m": dict(self._run_context.get("results_by_m") or {}),
-            "results_crop": self._run_results_crop,
+            # The geometry the frozen masks live in — ``_crop_rect()`` here folds in
+            # any registration common crop that ran upstream (the preview crop is
+            # off during the full Run that freezes), so a cropped resume slices
+            # relative to the right origin.
+            "results_crop": self._crop_rect(),
             "track_colormap": (dict(self._track_colormap)
                                if self._track_colormap else None),
             "track_long_ids": set(self._track_long_ids or set()),
             "track_overlay_rows": [dict(r) for r in
                                    (self._track_overlay_rows or [])],
+            # V1.59: registration state (arrays held by reference — session RAM).
+            "reg_by_m": (dict(reg_by_m) if reg_by_m else None),
+            "reg_interp_order": (int(getattr(record, "_registration_interp_order", 1) or 1)
+                                 if record else 1),
+            "reg_crop": (getattr(record, "_registration_crop", None) if record else None),
+            "reg_bundle": (dict(self._reg_by_m) if self._reg_by_m else None),
         }
         self._checkpoint_store[node.id] = {
             "hash": self._checkpoint_upstream_hash(node.id),
@@ -6477,6 +9890,22 @@ class PipelinesPage(QWidget):
                 continue
             if entry.get("hash") != self._checkpoint_upstream_hash(nid):
                 continue
+            # V1.59: a cropped resume re-scopes the frozen **masks** to the Run crop
+            # by slicing them — only valid when the crop lies fully within the
+            # geometry the masks were frozen at, else the slice runs out of bounds.
+            # This guard applies ONLY when the checkpoint actually froze masks; a
+            # registration-only checkpoint (no masks) has nothing to slice, so any
+            # crop is fine (it is applied to the live channel/volume reads, always a
+            # valid operation). Without this exemption a preview crop drawn on a
+            # registration-cropped display could spuriously fail containment and
+            # send the Run back to re-register — the reported bug.
+            data = entry.get("data") or {}
+            has_masks = any(
+                getattr(r, "label_masks", None)
+                for r in (data.get("results_by_m") or {}).values())
+            if has_masks and not self._crop_contains(
+                    data.get("results_crop"), self._effective_run_crop()):
+                continue
             rank = order.get(nid, -1)
             if rank > best_rank:
                 best_rank, best = rank, nid
@@ -6496,11 +9925,101 @@ class PipelinesPage(QWidget):
                                 if snap["track_colormap"] else None)
         self._track_long_ids = set(snap["track_long_ids"])
         self._track_overlay_rows = [dict(r) for r in snap["track_overlay_rows"]]
+        # V1.59: re-publish the frozen registration state onto the record BEFORE
+        # computing the crop, so the (frozen, non-re-running) Registration node's
+        # drift correction + common crop reach every downstream reader and the
+        # effective Run crop composes with the restored reg crop. Skipped when the
+        # checkpoint has no registration (a plain analysis checkpoint).
+        self._restore_registration_state(snap)
+        # V1.59: cropped resume — re-scope the frozen full-frame (or reg-crop)
+        # masks to the active Run crop so the downstream pipeline runs in crop
+        # space, exactly like a fresh cropped Run. The resume-target guard has
+        # already ensured the crop is contained in the frozen geometry.
+        target = self._effective_run_crop()
+        if target != snap["results_crop"]:
+            self._recrop_restored_checkpoint(target, snap["results_crop"])
         # Reflect the restored state in the table / overlays immediately.
         self._populate_results_table(self._run_all_rows)
         self._update_analysis_plots(self._run_all_rows)
         self._update_overlay_tabs_available()
         self._update_merged_view_mode()
+
+    def _restore_registration_state(self, snap: Dict[str, Any]) -> None:
+        """Re-publish a checkpoint's frozen registration state onto the active
+        record so a resume that skips the (frozen) Registration node still applies
+        its drift correction + common crop downstream (V1.59). No-op when the
+        checkpoint froze no registration."""
+        reg_by_m = snap.get("reg_by_m")
+        if not reg_by_m:
+            return
+        record = self._active_record()
+        if record is None:
+            return
+        record._registration_by_m = dict(reg_by_m)
+        record._registration_interp_order = int(snap.get("reg_interp_order", 1) or 1)
+        record._registration_crop = snap.get("reg_crop")
+        self._reg_by_m = dict(snap.get("reg_bundle") or {})
+        # Make the Registration overlay tab available again (the panel populates
+        # lazily from ``_reg_by_m`` when selected).
+        self._ensure_registration_panel()
+        self._update_overlay_tabs_available()
+
+    def _crop_analysis_result(self, res, rect, origin):
+        """A copy of ``res`` with its label masks sliced to ``rect`` ``(x,y,w,h)``
+        (original-frame coords). ``origin`` ``(ox, oy)`` is the coordinate origin
+        the frozen masks live in (the checkpoint's ``results_crop`` origin, or
+        ``(0, 0)`` for a full-frame freeze), so the slice is taken in the masks'
+        own space. Overlay style is preserved; per-(frame,label) voxel counts are
+        dropped (they would be wrong for objects clipped by the crop) (V1.59)."""
+        if res is None:
+            return res
+        x, y, w, h = rect
+        ox, oy = origin
+        x0, y0 = int(x - ox), int(y - oy)
+        from nd2studios.core.analysis_registry import AnalysisResult
+        out = AnalysisResult()
+        for ch, arr in (getattr(res, "label_masks", {}) or {}).items():
+            out.label_masks[ch] = np.asarray(arr)[..., y0:y0 + h, x0:x0 + w]
+        for nm, arr in (getattr(res, "secondary_label_masks", {}) or {}).items():
+            out.secondary_label_masks[nm] = np.asarray(arr)[..., y0:y0 + h, x0:x0 + w]
+        out.overlay_color = res.overlay_color
+        out.overlay_alpha = res.overlay_alpha
+        out.overlay_outline = getattr(res, "overlay_outline", False)
+        out.secondary_overlay_color = res.secondary_overlay_color
+        out.secondary_overlay_alpha = res.secondary_overlay_alpha
+        return out
+
+    def _recrop_restored_checkpoint(self, target, stored) -> None:
+        """Re-scope the just-restored checkpoint snapshot to the Run crop
+        ``target``. Slices every frozen result's masks (origin-aware, relative to
+        the frozen ``stored`` geometry) and **re-derives** the measurement rows
+        from the sliced masks + cropped channels (``_ensure_run_rows`` →
+        crop-aware ``_materialize_channels_for_m`` + ``compute_measurements``), so
+        every spatial column is correct in crop space — the same measurement path
+        a fresh cropped Run uses. Tracks are re-derived too (V1.59)."""
+        origin = (int(stored[0]), int(stored[1])) if stored else (0, 0)
+        self._run_results_by_m = {
+            m: self._crop_analysis_result(res, target, origin)
+            for m, res in (self._run_results_by_m or {}).items()}
+        ctx_rbm = self._run_context.get("results_by_m") or {}
+        self._run_context["results_by_m"] = {
+            m: self._crop_analysis_result(res, target, origin)
+            for m, res in ctx_rbm.items()}
+        if self._run_context.get("result") is not None:
+            self._run_context["result"] = self._crop_analysis_result(
+                self._run_context["result"], target, origin)
+        # Drop the frozen full-frame rows / tracks; re-derive in crop space.
+        self._run_all_rows = []
+        self._results_rows = []
+        self._run_context["rows"] = []
+        self._run_context.pop("scoped_now", None)
+        self._track_colormap = None
+        self._track_long_ids = set()
+        self._track_overlay_rows = []
+        self._run_results_crop = target
+        rows = self._ensure_run_rows()
+        self._run_all_rows = list(rows)
+        self._set_track_overlay_state(rows)
 
     def _pause_run(self, node) -> None:
         """Pause node: halt the run and drop the whole page back to editor mode
@@ -6554,11 +10073,13 @@ class PipelinesPage(QWidget):
         (``recipe_for_node`` raises), or for a direct Input→Output wire (empty
         chain) — i.e. the graph says "no processing".
         """
-        outs = output_nodes(self._doc.processing)
-        if not outs:
+        # V1.61: no processing-output bridge node -- derive the recipe from the
+        # processing tail (the last enhancement node before analysis begins).
+        tail = self._processing_tail_node()
+        if tail is None:
             return []
         try:
-            return recipe_for_node(self._doc.processing, outs[0].id)
+            return recipe_for_node(self._doc.analysis, tail.id)
         except ValueError:
             return []
 
@@ -6568,15 +10089,15 @@ class PipelinesPage(QWidget):
         ``None`` when the graph has no channel wiring — the legacy single recipe
         then applies to every channel. Otherwise ``{channel: recipe}`` for the
         primary Output's chain; channels absent from the dict stay raw."""
-        sl = self._doc.processing
+        sl = self._doc.analysis  # V1.61: processing nodes live in the merged slice
         if not has_channel_wiring(sl):
             return None
-        outs = output_nodes(sl)
+        tail = self._processing_tail_node()
         names = list((record._raw_channels or {}).keys())
-        if not outs:
+        if tail is None:
             return {}
         try:
-            return channel_recipes(sl, outs[0].id, names)
+            return channel_recipes(sl, tail.id, names)
         except Exception:  # noqa: BLE001
             return None
 
@@ -6619,15 +10140,15 @@ class PipelinesPage(QWidget):
         if record is None or not record._raw_channels:
             QMessageBox.information(self, "Apply", "Import a file first.")
             return
-        outs = output_nodes(self._doc.processing)
-        if not outs:
+        tail = self._processing_tail_node()  # V1.61: derive from the enhancement tail
+        if tail is None:
             QMessageBox.information(
                 self, "Apply",
-                "Add an Output node and connect it to commit a recipe.",
+                "Add processing (enhancement) nodes wired to the input to commit a recipe.",
             )
             return
         try:
-            recipe = recipe_for_node(self._doc.processing, outs[0].id)
+            recipe = recipe_for_node(self._doc.analysis, tail.id)
         except ValueError as exc:
             QMessageBox.warning(self, "Apply", str(exc))
             return
@@ -6881,8 +10402,14 @@ class PipelinesPage(QWidget):
             QMessageBox.warning(self, "Load pipeline", str(exc))
             return
         self._doc = doc
-        self._bridge_counter = len(output_nodes(doc.processing))
-        self._analysis_bridge_counter = len(output_nodes(doc.analysis))
+        # V1.61 merge: processing + analysis outputs both live in the merged
+        # slice; count each group by node stage.
+        _mouts = [n for n in doc.analysis.nodes.values()
+                  if n.role is NodeRole.OUTPUT]
+        self._bridge_counter = sum(
+            1 for n in _mouts if n.stage is Stage.PROCESSING)
+        self._analysis_bridge_counter = sum(
+            1 for n in _mouts if n.stage is not Stage.PROCESSING)
         self._results_bridge_counter = len(output_nodes(doc.results))
         self._selected_node_id = ""
         self._preview_node_ids = {
@@ -6905,6 +10432,9 @@ class PipelinesPage(QWidget):
         # ports on loaded process nodes, and recolor channel wires.
         for stage in self._stages:
             self._ensure_channel_nodes(stage)
+        # V1.76: re-hydrate the DVC viewer from any saved DVC Checkpoint node's bundle
+        # so a reloaded pipeline shows its DVC results with no Run.
+        self._autoload_dvc_checkpoints()
         n_ck = len(self._checkpoint_store)
         self._set_status(
             f"Pipeline loaded (+ {n_ck} checkpoint{'s' if n_ck != 1 else ''})"
@@ -6920,7 +10450,7 @@ class PipelinesPage(QWidget):
         record = self._active_record()
         if record is None or not record._raw_channels:
             return
-        self._ensure_input_node(self._stage)
+        self._ensure_input_node(Stage.PROCESSING)  # V1.61: one universal input
         self._refresh_active_view()
 
     def load_from_experiment(self, exp) -> None:
@@ -6980,8 +10510,7 @@ class PipelinesPage(QWidget):
             return
         self._update_preview_highlight()
         self._update_merged_view_mode()
-        if self._stage is Stage.ANALYSIS:
-            self._show_base_image()
+        self._show_base_image()  # V1.61: always show the base so the viewer isn't blank
         self._request_preview()
         QTimer.singleShot(0, self._frame_all_nodes)
 
@@ -6992,50 +10521,15 @@ class PipelinesPage(QWidget):
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _ensure_input_node(self, stage: Stage) -> None:
-        """Create the stage's source node from the active record, once."""
-        record = self._active_record()
-        if record is None or not record._raw_channels:
-            return
-        sl = self._doc.slice_for(stage)
-        if input_node(sl) is None:
-            scene = self._scenes[stage]
-            if stage is Stage.PROCESSING:
-                n_ch = len(record._raw_channels)
-                node = scene.add_node_from_spec(processing_input_spec(), (40.0, 80.0))
-                node.title = f"Input ({n_ch} ch)"
-            elif stage is Stage.ANALYSIS:
-                n_ch = len(self._current_channel_names())
-                node = scene.add_node_from_spec(analysis_input_spec(), (40.0, 80.0))
-                node.title = f"Processed ({n_ch} ch)"
-            else:
-                return
-            item = scene.node_item(node.id)
-            if item is not None:
-                item.update()
-        # V1.48: per-channel source pills under the Input node (+ "All").
-        self._ensure_channel_nodes(stage)
+        """V1.62 (R3): sync one input node per loaded file (was a single universal
+        input). Only the PROCESSING group carries input nodes."""
+        if stage is Stage.PROCESSING:
+            self._sync_input_nodes()
 
     def _refresh_input_node(self, stage: Stage) -> None:
-        """Update the existing source node's title to the active record's channel
-        count (creating it if the stage has none yet). Lets a new file's channel
-        count replace the previous file's on the carried-over graph."""
-        record = self._active_record()
-        if record is None or not record._raw_channels:
-            return
-        sl = self._doc.slice_for(stage)
-        node = input_node(sl)
-        if node is None:
-            self._ensure_input_node(stage)
-            return
+        """V1.62 (R3): re-sync the per-file input nodes to the loaded file set."""
         if stage is Stage.PROCESSING:
-            node.title = f"Input ({len(record._raw_channels)} ch)"
-        elif stage is Stage.ANALYSIS:
-            node.title = f"Processed ({len(self._current_channel_names())} ch)"
-        item = self._scenes[stage].node_item(node.id)
-        if item is not None:
-            item.update()
-        # Reconcile channel pills to the new file's channel set.
-        self._ensure_channel_nodes(stage)
+            self._sync_input_nodes()
 
     # ── channel-flow (V1.48) ────────────────────────────────────────────────
     def _channel_colors_map(self) -> Dict[str, str]:
@@ -7141,11 +10635,130 @@ class PipelinesPage(QWidget):
                 if spec.default not in spec.choices:
                     spec.default = "None"
 
-    def _active_record(self):
+    def _exp_active(self):
+        """The Import tab's active record (unfollowed)."""
         mw = self.main_window
         if mw is None or getattr(mw, "exp_manager", None) is None:
             return None
         return mw.exp_manager.active
+
+    def _loaded_files(self):
+        """``[(record, basename)]`` for every loaded Import panel (+ the active
+        record), keyed uniquely by ``exp_id``. V1.62 (R3)."""
+        out = []
+        seen = set()
+        mw = self.main_window
+        imp = (mw.pages.get("import")
+               if (mw is not None and getattr(mw, "pages", None)) else None)
+        panels = getattr(imp, "_panels", None) if imp is not None else None
+        if panels:
+            for pnl in panels:
+                rec = getattr(pnl, "record", None)
+                if rec is None or not getattr(rec, "_raw_channels", None):
+                    continue
+                if rec.exp_id in seen:
+                    continue
+                seen.add(rec.exp_id)
+                fp = getattr(pnl, "filepath", None)
+                name = os.path.basename(fp) if fp else (rec.name or "Input")
+                out.append((rec, name))
+        act = self._exp_active()
+        if (act is not None and getattr(act, "_raw_channels", None)
+                and act.exp_id not in seen):
+            out.append((act, act.name or "Input"))
+        return out
+
+    def _loaded_records_by_id(self):
+        return {rec.exp_id: rec for rec, _ in self._loaded_files()}
+
+    def _input_node_for(self, node_id: str) -> str:
+        """Walk structural inputs back from ``node_id`` to its INPUT node id
+        ('' if none). V1.62 (R3)."""
+        sl = self._doc.analysis
+        cur = node_id
+        seen = set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            n = sl.nodes.get(cur)
+            if n is None:
+                break
+            if n.role is NodeRole.INPUT:
+                return cur
+            inc = sl.structural_incoming(cur)
+            cur = inc[0].src_node if inc else ""
+        return ""
+
+    def _sync_input_nodes(self) -> None:
+        """One input node per loaded file (bound by ``exp_id``, titled by
+        basename). Adopts a legacy unbound universal input for the first file,
+        creates a node per additional file, disables (keeps) nodes whose file was
+        closed, and keeps ``_focused_input_id`` on a live input. V1.62 (R3)."""
+        files = self._loaded_files()
+        if not files:
+            return
+        sl = self._doc.analysis
+        scene = self._scenes.get(Stage.ANALYSIS)
+        if scene is None:
+            return
+        inputs = [n for n in sl.nodes.values()
+                  if n.role is NodeRole.INPUT and n.stage is Stage.PROCESSING]
+        by_eid = {n.params.get("source_exp_id"): n for n in inputs
+                  if n.params.get("source_exp_id")}
+        unbound = [n for n in inputs if not n.params.get("source_exp_id")]
+        live = set()
+        y = 80.0
+        for rec, name in files:
+            live.add(rec.exp_id)
+            node = by_eid.get(rec.exp_id)
+            if node is None and unbound:
+                node = unbound.pop(0)            # adopt a legacy universal input
+                node.params["source_exp_id"] = rec.exp_id
+                by_eid[rec.exp_id] = node
+            if node is None:
+                node = scene.add_node_from_spec(processing_input_spec(), (40.0, y))
+                node.params["source_exp_id"] = rec.exp_id
+                by_eid[rec.exp_id] = node
+            node.title = name
+            node.enabled = True
+            it = scene.node_item(node.id)
+            if it is not None:
+                it.update()
+            y = max(y, float(node.pos[1])) + 160.0
+        # Disable (keep) inputs whose file was closed.
+        for eid, node in by_eid.items():
+            if eid not in live and node.enabled:
+                node.enabled = False
+                it = scene.node_item(node.id)
+                if it is not None:
+                    it.update()
+        # Keep the focused input on a live, enabled input.
+        cur = sl.nodes.get(self._focused_input_id) if self._focused_input_id else None
+        if cur is None or not cur.enabled or cur.role is not NodeRole.INPUT:
+            act = self._exp_active()
+            focus = by_eid.get(act.exp_id) if act is not None else None
+            if focus is None or not focus.enabled:
+                focus = next((n for n in by_eid.values() if n.enabled), None)
+            self._focused_input_id = focus.id if focus is not None else ""
+        # V1.48: channel pills for the primary input (R8 will attach per-input
+        # channels to the node body; pills remain for now).
+        self._ensure_channel_nodes(Stage.PROCESSING)
+
+    def _active_record(self):
+        # V1.62 (R3): the active record follows the focused input node (the input
+        # feeding the previewed / running chain), so a file's chain uses that
+        # file's data. Falls back to the Import tab's active record — which keeps
+        # single-file behavior identical (the sole input binds to the active
+        # record).
+        fid = getattr(self, "_focused_input_id", "")
+        if fid:
+            node = self._doc.analysis.nodes.get(fid)
+            if node is not None:
+                eid = node.params.get("source_exp_id")
+                if eid:
+                    rec = self._loaded_records_by_id().get(eid)
+                    if rec is not None:
+                        return rec
+        return self._exp_active()
 
     def _current_slice(self):
         return self._doc.slice_for(self._stage)

@@ -31,13 +31,15 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox,
-    QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
-from nd2studios.widgets.icon_button import icon_button
+from nd2studios.widgets.icon_button import icon_button, scale_qss, scaled
 from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
+from nd2studios.widgets.viewer3d import PyVista3DViewer
 from nd2studios.workers.load_worker import LoadWorker
 
 _SIDEBAR_EXPANDED_W: int = 220
@@ -79,7 +81,7 @@ class ChannelInfoRow(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 1, 0, 1)
         lbl = QLabel(f"C{idx}: {name}")
-        lbl.setMinimumWidth(110)
+        lbl.setMinimumWidth(scaled(110))
         layout.addWidget(lbl)
         bits: List[str] = []
         if exposure_ms is not None:
@@ -89,7 +91,7 @@ class ChannelInfoRow(QWidget):
         if emission_nm is not None:
             bits.append(f"em {emission_nm:.0f}")
         info = QLabel("  ".join(bits) or "—")
-        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 8pt;"))
         layout.addWidget(info, stretch=1)
 
 
@@ -176,7 +178,15 @@ class FilePanel(QWidget):
         self._full_volume = None      # original dataset before any crop
         self._full_timestamps = None
         self._crop_worker = None
-        self._inner_splitter.addWidget(self.viewer)
+
+        # V1.65 — 2D/3D swap. The 2-D MultiAxisViewer and a lazily-built
+        # PyVista3DViewer share a QStackedWidget; the header "3D" button flips
+        # them. ``self.viewer`` stays the 2-D viewer so every existing caller
+        # (PlayAll banner, zoom reset, crop tools) is unaffected.
+        self._view_stack = QStackedWidget()
+        self._view_stack.addWidget(self.viewer)   # index 0 — 2-D
+        self.viewer3d = None                       # built on first 3-D toggle
+        self._inner_splitter.addWidget(self._view_stack)
 
         self._inner_splitter.setStretchFactor(0, 0)
         self._inner_splitter.setStretchFactor(1, 1)
@@ -191,7 +201,7 @@ class FilePanel(QWidget):
     def _build_header(self) -> QWidget:
         bar = QWidget()
         bar.setObjectName("filePanelHeader")
-        bar.setFixedHeight(30)
+        bar.setFixedHeight(scaled(30))
         hl = QHBoxLayout(bar)
         hl.setContentsMargins(6, 0, 6, 0)
         hl.setSpacing(4)
@@ -199,7 +209,7 @@ class FilePanel(QWidget):
         # Use plain ASCII so the button text is always visible on Windows.
         self._btn_collapse = QPushButton("<")
         self._btn_collapse.setObjectName("filePanelCollapseBtn")
-        self._btn_collapse.setFixedSize(22, 22)
+        self._btn_collapse.setFixedSize(scaled(22), scaled(22))
         self._btn_collapse.setToolTip("Collapse / expand file controls")
         self._btn_collapse.clicked.connect(self._toggle_sidebar)
         hl.addWidget(self._btn_collapse)
@@ -208,10 +218,19 @@ class FilePanel(QWidget):
         self._lbl_name.setObjectName("filePanelTitle")
         hl.addWidget(self._lbl_name, stretch=1)
 
+        # V1.65 — volumetric 3-D toggle (icon-only; falls back to "3D" text).
+        self._btn_3d = icon_button(
+            "fa5s.cube", "3D — toggle volumetric view",
+            checkable=True, object_name="toggleBtn",
+            button_px=22, icon_px=12,
+        )
+        self._btn_3d.toggled.connect(self._toggle_3d)
+        hl.addWidget(self._btn_3d)
+
         if self._show_close:
             self._btn_close = QPushButton("x")
             self._btn_close.setObjectName("filePanelCloseBtn")
-            self._btn_close.setFixedSize(22, 22)
+            self._btn_close.setFixedSize(scaled(22), scaled(22))
             self._btn_close.setToolTip("Close this panel")
             self._btn_close.clicked.connect(
                 lambda: self.panel_close_requested.emit(self)
@@ -255,9 +274,9 @@ class FilePanel(QWidget):
             fl.addWidget(self.btn_add_file)
         self.lbl_filepath = QLabel("No file loaded.")
         self.lbl_filepath.setWordWrap(True)
-        self.lbl_filepath.setStyleSheet(
+        self.lbl_filepath.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         fl.addWidget(self.lbl_filepath)
         sl.addWidget(file_group)
 
@@ -282,7 +301,7 @@ class FilePanel(QWidget):
         self.meta_table.setHorizontalHeaderLabels(["Property", "Value"])
         self.meta_table.horizontalHeader().setStretchLastSection(True)
         self.meta_table.verticalHeader().setVisible(False)
-        self.meta_table.setMaximumHeight(200)
+        self.meta_table.setMaximumHeight(scaled(200))
         ml.addWidget(self.meta_table)
         sl.addWidget(meta_group)
 
@@ -291,7 +310,7 @@ class FilePanel(QWidget):
         cl = QVBoxLayout(info_group)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(110)
+        scroll.setMaximumHeight(scaled(110))
         self._info_container = QWidget()
         self._info_layout = QVBoxLayout(self._info_container)
         self._info_layout.setContentsMargins(2, 2, 2, 2)
@@ -358,15 +377,29 @@ class FilePanel(QWidget):
         gl.addLayout(crop_row)
 
         self.lbl_xy_crop_status = QLabel("No XY crop")
-        self.lbl_xy_crop_status.setStyleSheet(
+        self.lbl_xy_crop_status.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         gl.addWidget(self.lbl_xy_crop_status)
 
+        # V1.72 — main export: split the (cropped) volume along M/T/Z/C into
+        # separate files (one per split-axis index; kept axes bundled per file).
+        self.btn_split_export = icon_button(
+            "fa5s.layer-group",
+            "Export by axis — split the cropped data along M / T / Z / C into "
+            "multiple TIFF / PNG / movie files",
+            text=" Export by axis…", object_name="primaryBtn",
+        )
+        self.btn_split_export.setEnabled(False)
+        self.btn_split_export.clicked.connect(self._open_split_export_dialog)
+        gl.addWidget(self.btn_split_export)
+
+        # Quick export of the current M/Z view only (single hyperstack / movie /
+        # PNG sequence) — kept from V1.57.
         self.btn_export = icon_button(
             "fa5s.download",
-            "Export — write the current (cropped) data to disk",
-            text=" Export cropped…", object_name="primaryBtn",
+            "Quick export — write only the current (cropped) M/Z view to disk",
+            text=" Quick export…", object_name="compactBtn",
         )
         self.btn_export.setEnabled(False)
         menu = QMenu(self.btn_export)
@@ -404,11 +437,58 @@ class FilePanel(QWidget):
 
     def fit_viewer(self) -> None:
         """Ask the canvas to zoom-to-fit the image in the current viewport."""
+        stack = getattr(self, "_view_stack", None)
+        viewer3d = getattr(self, "viewer3d", None)
+        if (viewer3d is not None and stack is not None
+                and stack.currentWidget() is viewer3d):
+            viewer3d.reset_camera()
+            return
         canvas = getattr(self.viewer, "canvas", None)
         if canvas is not None:
             reset = getattr(canvas, "reset_zoom", None)
             if callable(reset):
                 reset()
+
+    # ── V1.65 — 2D / 3D toggle ───────────────────────────────────────
+    def _ensure_viewer3d(self) -> PyVista3DViewer:
+        """Lazily construct the 3-D viewer and add it to the view stack."""
+        if self.viewer3d is None:
+            self.viewer3d = PyVista3DViewer(self)
+            # Keep the record's position/LUT authoritative regardless of view.
+            self.viewer3d.coords_changed.connect(self._on_coords_changed)
+            self.viewer3d.channels_changed.connect(self._on_channels_changed)
+            self._view_stack.addWidget(self.viewer3d)   # index 1 — 3-D
+        return self.viewer3d
+
+    def _toggle_3d(self, enabled: bool) -> None:
+        if enabled:
+            viewer3d = self._ensure_viewer3d()
+            self._view_stack.setCurrentWidget(viewer3d)   # show the canvas first…
+            self._feed_viewer3d()                          # …then build + render
+        else:
+            self._view_stack.setCurrentWidget(self.viewer)
+            self.fit_viewer()
+
+    def _feed_viewer3d(self) -> None:
+        """Push the current raw volume + channel state into the 3-D viewer."""
+        if self.viewer3d is None or self.record is None:
+            return
+        volume = getattr(self.record, "_raw_volume", None)
+        # Mirror the 2-D per-channel color/LUT so the two views agree.
+        state = self.viewer.channel_state() or self.record.channel_display
+        if volume is not None:
+            self.viewer3d.set_volume(
+                volume,
+                channel_display=state,
+                z_mode=self.combo_zproj.currentText(),
+                z_index=int(getattr(self.record, "z_view_index", 0)),
+                m=int(getattr(self.record, "m_index", 0)), t=0,
+                z=int(getattr(self.record, "z_view_index", 0)),
+            )
+        else:
+            self.viewer3d.set_channels(
+                self.record._raw_channels or {}, channel_display=state,
+            )
 
     # ── File operations ──────────────────────────────────────────────
 
@@ -513,6 +593,7 @@ class FilePanel(QWidget):
 
         self.btn_confirm.setEnabled(True)
         self.btn_export.setEnabled(True)
+        self.btn_split_export.setEnabled(True)
         n_m = int(meta.get("n_multipoints", 1))
         self.btn_stitch.setEnabled(n_m > 1)
 
@@ -683,7 +764,7 @@ class FilePanel(QWidget):
             f"Image: {img_w} × {img_h} px  "
             f"(X = columns from left, Y = rows from top)"
         )
-        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         layout.addWidget(info)
 
         form = QFormLayout()
@@ -919,6 +1000,61 @@ class FilePanel(QWidget):
             basename=self._export_basename(),
         )
         self._run_export(req, "Writing image sequence…")
+
+    # ── V1.72 split-by-axis export ──
+    def _open_split_export_dialog(self) -> None:
+        """Open the Split/Keep matrix dialog and run the multi-file export.
+
+        Splits the current (cropped) volume along M/T/Z/C into separate files.
+        Honors the XY crop, the enabled channels, and the per-channel color/LUT
+        from the live viewer, so output matches what is on screen.
+        """
+        from nd2studios.widgets.split_export_dialog import SplitExportDialog
+        from nd2studios.workers.export_worker import ExportRequest
+
+        rec = self.record
+        vol = rec._raw_volume
+        if vol is None:
+            QMessageBox.information(
+                self, "Volume required",
+                "Export by axis needs a volume with M / T / Z axes. Load an "
+                "ND2 / TIFF volume first (use Quick export for channel-only data).",
+            )
+            return
+
+        names = list(vol.channel_names)
+        colors, enabled, lut = self._colors_enabled_lut(names)
+        z_mode = self.combo_zproj.currentText()
+
+        n_z_raw = int(vol.n_zslices)
+        iterate_z = (z_mode == "none" and n_z_raw > 1)
+        n_z_eff = n_z_raw if iterate_z else 1
+        enabled_channels = [n for n in names if enabled.get(n, True)]
+        if not enabled_channels:
+            QMessageBox.information(
+                self, "No channels enabled",
+                "Enable at least one channel in the viewer before exporting.")
+            return
+
+        dlg = SplitExportDialog(
+            n_m=int(vol.n_multipoints), n_t=int(vol.n_timepoints),
+            n_z_eff=n_z_eff, iterate_z=iterate_z,
+            n_c_enabled=len(enabled_channels), crop_rect=self._xy_crop,
+            default_basename=self._export_basename(), z_mode=z_mode, parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        spec = dlg.spec()
+        req = ExportRequest(
+            mode="split", filepath=spec.output_dir, split_spec=spec,
+            raw_volume=vol, colors=colors, enabled=enabled, lut_settings=lut,
+            pixel_size_um=self._pixel_size_um(),
+            frame_timestamps_s=self._frame_timestamps(),
+            crop_rect=self._xy_crop, bit_depth=spec.bit_depth,
+            movie_options=dlg.movie_options(),
+        )
+        self._run_export(req, f"Split export → {spec.output_dir}")
 
     def _run_export(self, request, label: str) -> None:
         from nd2studios.workers.export_worker import ExportWorker

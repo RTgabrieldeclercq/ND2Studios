@@ -41,6 +41,7 @@ from nd2studios.backend.exporters.composite_exporter import (
     _composite_frame,
 )
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled_pt, scaled
 from nd2studios.widgets.image_viewer import ImageCanvas
 
 # Click hit-test radius (image px) when the click misses every label mask.
@@ -130,7 +131,7 @@ class WholeFrameReviewDialog(QDialog):
             sz = screen.size()
             self.resize(int(sz.width() * 0.85), int(sz.height() * 0.88))
         else:
-            self.resize(1200, 850)
+            self.resize(scaled(1200), scaled(850))
 
         self._build_ui()
         self._apply_style()
@@ -180,8 +181,8 @@ class WholeFrameReviewDialog(QDialog):
 
         top = QHBoxLayout()
         self._lbl_progress = QLabel("")
-        self._lbl_progress.setStyleSheet(
-            f"color: {Settings.FG_PRIMARY}; font: bold 11pt;")
+        self._lbl_progress.setStyleSheet(scale_qss(
+            f"color: {Settings.FG_PRIMARY}; font: bold 11pt;"))
         top.addWidget(self._lbl_progress, stretch=1)
 
         if len(self._m_list) > 1:
@@ -197,7 +198,7 @@ class WholeFrameReviewDialog(QDialog):
         outer.addLayout(top)
 
         self._canvas = ImageCanvas(self)
-        self._canvas.setMinimumSize(320, 320)
+        self._canvas.setMinimumSize(scaled(320), scaled(320))
         self._canvas.set_overlay(self._paint_overlay)
         self._canvas.clicked.connect(self._on_canvas_clicked)
         outer.addWidget(self._canvas, stretch=1)
@@ -207,7 +208,7 @@ class WholeFrameReviewDialog(QDialog):
         t_row.setSpacing(6)
         self._btn_play = QPushButton("▶ Play")
         self._btn_play.setCheckable(True)
-        self._btn_play.setMinimumWidth(80)
+        self._btn_play.setMinimumWidth(scaled(80))
         self._btn_play.toggled.connect(self._on_play_toggled)
         t_row.addWidget(self._btn_play)
         t_row.addWidget(QLabel("T:"))
@@ -216,7 +217,7 @@ class WholeFrameReviewDialog(QDialog):
         self._slider_t.valueChanged.connect(self._on_t_changed)
         t_row.addWidget(self._slider_t, stretch=1)
         self._spin_t = QSpinBox()
-        self._spin_t.setFixedWidth(55)
+        self._spin_t.setFixedWidth(scaled(55))
         self._spin_t.valueChanged.connect(self._on_spin_t_changed)
         t_row.addWidget(self._spin_t)
         self._lbl_t_total = QLabel("")
@@ -228,7 +229,7 @@ class WholeFrameReviewDialog(QDialog):
         self._spin_fps.setRange(0.5, 60.0)
         self._spin_fps.setValue(5.0)
         self._spin_fps.setSingleStep(0.5)
-        self._spin_fps.setFixedWidth(65)
+        self._spin_fps.setFixedWidth(scaled(65))
         self._spin_fps.valueChanged.connect(self._on_fps_changed)
         t_row.addWidget(self._spin_fps)
         outer.addLayout(t_row)
@@ -237,20 +238,20 @@ class WholeFrameReviewDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
         hint = QLabel("Click a cell to inspect it over time  •  Alt-click to toggle reject.")
-        hint.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt italic;")
+        hint.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 8pt italic;"))
         btn_row.addWidget(hint)
         btn_row.addStretch(1)
         # Track-level actions — visible only while a cell is selected.
         self._btn_accept_track = QPushButton("Accept Track")
         self._btn_accept_track.setObjectName("primaryBtn")
-        self._btn_accept_track.setMinimumWidth(110)
+        self._btn_accept_track.setMinimumWidth(scaled(110))
         self._btn_accept_track.setToolTip("Accept every frame of the selected cell/track.")
         self._btn_accept_track.clicked.connect(lambda: self._decide_track("accepted"))
         self._btn_accept_track.setVisible(False)
         btn_row.addWidget(self._btn_accept_track)
         self._btn_reject_track = QPushButton("Reject Track")
         self._btn_reject_track.setObjectName("rejectBtn")
-        self._btn_reject_track.setMinimumWidth(110)
+        self._btn_reject_track.setMinimumWidth(scaled(110))
         self._btn_reject_track.setToolTip("Reject every frame of the selected cell/track.")
         self._btn_reject_track.clicked.connect(lambda: self._decide_track("rejected"))
         self._btn_reject_track.setVisible(False)
@@ -258,25 +259,25 @@ class WholeFrameReviewDialog(QDialog):
         btn_row.addSpacing(20)
         self._btn_accept_frame = QPushButton("Accept Frame")
         self._btn_accept_frame.setObjectName("primaryBtn")
-        self._btn_accept_frame.setMinimumWidth(120)
+        self._btn_accept_frame.setMinimumWidth(scaled(120))
         self._btn_accept_frame.setToolTip("Accept every object on this frame.")
         self._btn_accept_frame.clicked.connect(lambda: self._decide_frame("accepted"))
         btn_row.addWidget(self._btn_accept_frame)
         self._btn_reject_frame = QPushButton("Reject Frame")
         self._btn_reject_frame.setObjectName("rejectBtn")
-        self._btn_reject_frame.setMinimumWidth(120)
+        self._btn_reject_frame.setMinimumWidth(scaled(120))
         self._btn_reject_frame.setToolTip("Reject every object on this frame.")
         self._btn_reject_frame.clicked.connect(lambda: self._decide_frame("rejected"))
         btn_row.addWidget(self._btn_reject_frame)
         btn_row.addSpacing(20)
         self._btn_done = QPushButton("Done")
-        self._btn_done.setMinimumWidth(90)
+        self._btn_done.setMinimumWidth(scaled(90))
         self._btn_done.clicked.connect(self.accept)
         btn_row.addWidget(self._btn_done)
         outer.addLayout(btn_row)
 
     def _apply_style(self) -> None:
-        self.setStyleSheet(f"""
+        self.setStyleSheet(scale_qss(f"""
             QWidget {{
                 background: {Settings.BG_PRIMARY};
                 color: {Settings.FG_PRIMARY};
@@ -308,7 +309,7 @@ class WholeFrameReviewDialog(QDialog):
                 background: #8b1a1a; color: #f8f8f2; border: none;
             }}
             QPushButton#rejectBtn:hover {{ background: #b22222; }}
-        """)
+        """))
 
     # ── navigation ──────────────────────────────────────────────────────────
 
@@ -405,7 +406,7 @@ class WholeFrameReviewDialog(QDialog):
         if not rows and not has_selection:
             return
         font = QFont("Helvetica Neue")
-        font.setPointSize(9)
+        font.setPointSizeF(scaled_pt(9))
         font.setBold(True)
         painter.setFont(font)
         sel = self._selected_row_at_current()
@@ -522,7 +523,7 @@ class WholeFrameReviewDialog(QDialog):
         painter.drawRect(rect)
 
         font = QFont("Helvetica Neue")
-        font.setPointSize(8)
+        font.setPointSizeF(scaled_pt(8))
         font.setBold(True)
         painter.setFont(font)
 

@@ -49,6 +49,15 @@ def _forced_strategy_override() -> "Optional[LoadStrategy]":
         return None
 
 
+def _preview_planes() -> int:
+    """Deep-Z display preview budget (0 = exact). V1.66; Performance dialog."""
+    try:
+        from nd2studios.core.settings import Settings
+        return max(0, int(getattr(Settings, "DISPLAY_PREVIEW_Z_PLANES", 0) or 0))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _meta_like_from_dataset_meta(ext_meta: Dict[str, Any]) -> Any:
     """Adapt the dict-shaped extended metadata into a duck-typed object
     that :func:`choose_strategy` can read footprint fields off of.
@@ -189,16 +198,20 @@ class LoadWorker(BaseWorker):
             # numpy-protocol proxy instead of materializing every plane into
             # RAM. Previously the decision was computed but ignored, so
             # "Force Lazy" still eagerly materialized (and could OOM).
+            # V1.66 — stream via StreamingDataset (bounded LRU cache + neighbour
+            # prefetch + blocked Z-projection) instead of holding the raw lazy
+            # volume, which had no working cache (configure_cache never existed
+            # on LazyND2Volume) so every scrub re-decoded through dask.
             from nd2studios.backend.nd2_volume import LazyND2Volume
-            self.set_status("Opening volume (lazy, on-demand reads)…")
-            dataset = LazyND2Volume(self.filepath)
-            dataset.z_mode = self.z_projection
-            budget = getattr(decision, "cache_budget_bytes", 0) or 0
-            if budget and hasattr(dataset, "configure_cache"):
-                try:
-                    dataset.configure_cache(int(budget))
-                except Exception:  # noqa: BLE001
-                    pass
+            from nd2studios.backend.streaming_dataset import StreamingDataset
+            self.set_status("Opening volume (streaming, on-demand reads)…")
+            lazy = LazyND2Volume(self.filepath)
+            budget = int(getattr(decision, "cache_budget_bytes", 0) or 0) \
+                or (256 * 1024 * 1024)
+            dataset = StreamingDataset.from_volume(
+                lazy, cache_budget_bytes=budget, z_mode=self.z_projection,
+                preview_planes=_preview_planes(),
+                preview_default=_preview_planes() > 0)
             self.set_progress(95)
         else:
             # Eager parallel decode into a single in-RAM dict. After this
@@ -256,7 +269,8 @@ class LoadWorker(BaseWorker):
         # trivial OS resources, so we'd rather refuse early than open
         # them only to discover the data won't fit in RAM.
         meta_adapter = _meta_like_from_dataset_meta(ext_meta)
-        decision = choose_strategy(meta_adapter, self.filepaths[0])
+        decision = choose_strategy(meta_adapter, self.filepaths[0],
+                                   override=_forced_strategy_override())
         log_decision(decision)
         self.strategy_chosen.emit(decision)
         self.set_status(
@@ -271,27 +285,37 @@ class LoadWorker(BaseWorker):
         )
         self.set_progress(25)
 
-        self.set_status(
-            f"Materializing {n_files}-file composite volume into RAM…"
-        )
-
         def _on_pct(pct: int) -> None:
             self.set_progress(25 + int(70 * pct / 100))
 
-        dataset = materialize_from_volume(
-            composite,
-            z_mode=self.z_projection,
-            progress_cb=_on_pct,
-            cancel_cb=lambda: bool(self.cancelled),
-        )
-        # Composite is no longer needed; its child file handles can be
-        # closed (they were only kept open for the parallel decode).
-        try:
-            close = getattr(composite, "close", None)
-            if callable(close):
-                close()
-        except Exception:
-            pass
+        if decision.strategy == LoadStrategy.LAZY_CACHED:
+            # V1.66 — stream the composite on demand (LazyVolumeSource stacks
+            # per-plane get_frame reads across files); keep it open for reads.
+            from nd2studios.backend.streaming_dataset import StreamingDataset
+            self.set_status(
+                f"Opening {n_files}-file composite (streaming, on-demand)…")
+            budget = int(getattr(decision, "cache_budget_bytes", 0) or 0) \
+                or (256 * 1024 * 1024)
+            dataset = StreamingDataset.from_volume(
+                composite, cache_budget_bytes=budget, z_mode=self.z_projection,
+                preview_planes=_preview_planes(),
+                preview_default=_preview_planes() > 0)
+        else:
+            self.set_status(
+                f"Materializing {n_files}-file composite volume into RAM…")
+            dataset = materialize_from_volume(
+                composite,
+                z_mode=self.z_projection,
+                progress_cb=_on_pct,
+                cancel_cb=lambda: bool(self.cancelled),
+            )
+            # Composite child handles were only kept open for the decode.
+            try:
+                close = getattr(composite, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
         if self.cancelled:
             return {}
 
@@ -347,7 +371,8 @@ class LoadWorker(BaseWorker):
             "width": getattr(composite, "width", 0),
             "dtype": str(getattr(composite, "dtype", "uint16")),
         })
-        decision = choose_strategy(composite_meta, self.filepaths[0])
+        decision = choose_strategy(composite_meta, self.filepaths[0],
+                                   override=_forced_strategy_override())
         log_decision(decision)
         self.strategy_chosen.emit(decision)
         self.set_status(
@@ -356,25 +381,35 @@ class LoadWorker(BaseWorker):
             f"{decision.available_gb:.1f} GB available)"
         )
 
-        self.set_status(
-            f"Materializing {n_files}-file composite TIFF into RAM…"
-        )
-
         def _on_pct(pct: int) -> None:
             self.set_progress(25 + int(70 * pct / 100))
 
-        dataset = materialize_from_volume(
-            composite,
-            z_mode=self.z_projection,
-            progress_cb=_on_pct,
-            cancel_cb=lambda: bool(self.cancelled),
-        )
-        try:
-            close = getattr(composite, "close", None)
-            if callable(close):
-                close()
-        except Exception:
-            pass
+        if decision.strategy == LoadStrategy.LAZY_CACHED:
+            # V1.66 — stream the multi-file TIFF composite on demand.
+            from nd2studios.backend.streaming_dataset import StreamingDataset
+            self.set_status(
+                f"Opening {n_files}-file composite TIFF (streaming)…")
+            budget = int(getattr(decision, "cache_budget_bytes", 0) or 0) \
+                or (256 * 1024 * 1024)
+            dataset = StreamingDataset.from_volume(
+                composite, cache_budget_bytes=budget, z_mode=self.z_projection,
+                preview_planes=_preview_planes(),
+                preview_default=_preview_planes() > 0)
+        else:
+            self.set_status(
+                f"Materializing {n_files}-file composite TIFF into RAM…")
+            dataset = materialize_from_volume(
+                composite,
+                z_mode=self.z_projection,
+                progress_cb=_on_pct,
+                cancel_cb=lambda: bool(self.cancelled),
+            )
+            try:
+                close = getattr(composite, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
         if self.cancelled:
             return {}
 
@@ -443,7 +478,8 @@ class LoadWorker(BaseWorker):
             "width": getattr(composite, "width", 0),
             "dtype": str(getattr(composite, "dtype", "uint16")),
         })
-        decision = choose_strategy(composite_meta, self.filepath)
+        decision = choose_strategy(composite_meta, self.filepath,
+                                   override=_forced_strategy_override())
         log_decision(decision)
         self.strategy_chosen.emit(decision)
         self.set_status(
@@ -452,17 +488,37 @@ class LoadWorker(BaseWorker):
             f"{decision.available_gb:.1f} GB available)"
         )
 
-        self.set_status("Materializing TIFF into RAM…")
-
         def _on_pct(pct: int) -> None:
             self.set_progress(20 + int(75 * pct / 100))
 
-        dataset = materialize_from_volume(
-            composite,
-            z_mode=self.z_projection,
-            progress_cb=_on_pct,
-            cancel_cb=lambda: bool(self.cancelled),
-        )
+        if decision.strategy == LoadStrategy.LAZY_CACHED:
+            # V1.66 — stream a large TIFF via a memory-map (opens instantly,
+            # only touched frames are read) instead of decoding every plane
+            # into RAM. Uncompressed/contiguous (Big)TIFFs mmap directly;
+            # compressed/tiled fall back to per-page reads inside the source.
+            from nd2studios.backend.streaming_dataset import StreamingDataset
+            self.set_status("Opening TIFF (streaming, memory-mapped)…")
+            budget = int(getattr(decision, "cache_budget_bytes", 0) or 0) \
+                or (256 * 1024 * 1024)
+            dataset = StreamingDataset.from_tiff(
+                self.filepath,
+                channel_names=list(getattr(composite, "channel_names", []) or []),
+                pixel_size_um=float(getattr(composite, "pixel_size_um", 1.0)),
+                z_step_um=float(getattr(composite, "z_step_um", 1.0)),
+                cache_budget_bytes=budget,
+                z_mode=self.z_projection,
+                preview_planes=_preview_planes(),
+                preview_default=_preview_planes() > 0,
+            )
+            self.set_progress(95)
+        else:
+            self.set_status("Materializing TIFF into RAM…")
+            dataset = materialize_from_volume(
+                composite,
+                z_mode=self.z_projection,
+                progress_cb=_on_pct,
+                cancel_cb=lambda: bool(self.cancelled),
+            )
         try:
             close = getattr(composite, "close", None)
             if callable(close):

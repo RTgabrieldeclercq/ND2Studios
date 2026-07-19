@@ -46,7 +46,7 @@ from nd2studios.pipeline_graph.registry_adapter import (
     param_specs_for,
     plugin_name_for_op_key,
 )
-from nd2studios.widgets.icon_button import scaled
+from nd2studios.widgets.icon_button import scaled, scale_qss
 
 # Generation resolution (image px) of the synthetic field, and the on-screen
 # thumbnail edge (base 96-DPI px). The two are decoupled so the preview can be
@@ -444,7 +444,7 @@ class AddNodeDialog(QDialog):
 
         self._title = QLabel("")
         self._title.setObjectName("addNodeTitle")
-        self._title.setStyleSheet(f"color:{Settings.ACCENT_CYAN}; font:bold 15pt;")
+        self._title.setStyleSheet(scale_qss(f"color:{Settings.ACCENT_CYAN}; font:bold 15pt;"))
         detail.addWidget(self._title)
 
         # Scroll the (lengthy) description so it never crowds out the preview.
@@ -453,8 +453,8 @@ class AddNodeDialog(QDialog):
         self._desc.setObjectName("addNodeDesc")
         self._desc.setTextFormat(Qt.TextFormat.PlainText)
         self._desc.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self._desc.setStyleSheet(
-            f"color:{Settings.FG_PRIMARY}; font:10.5pt; line-height:140%;")
+        self._desc.setStyleSheet(scale_qss(
+            f"color:{Settings.FG_PRIMARY}; font:10.5pt; line-height:140%;"))
         desc_scroll = QScrollArea()
         desc_scroll.setObjectName("addNodeDescScroll")
         desc_scroll.setWidgetResizable(True)
@@ -472,8 +472,8 @@ class AddNodeDialog(QDialog):
         self._raw_thumb = self._captioned("Raw (example data)")
         self._arrow = QLabel("→")
         self._arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._arrow.setStyleSheet(
-            f"color:{Settings.ACCENT_CYAN}; font:bold 28pt; background:transparent;")
+        self._arrow.setStyleSheet(scale_qss(
+            f"color:{Settings.ACCENT_CYAN}; font:bold 28pt; background:transparent;"))
         self._proc_thumb = self._captioned("Processed result")
         prev_l.addStretch(1)
         prev_l.addLayout(self._raw_thumb[0])
@@ -500,7 +500,7 @@ class AddNodeDialog(QDialog):
         thumb = _Thumb()
         cap = QLabel(caption)
         cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        cap.setStyleSheet(f"color:{Settings.FG_SECONDARY}; font:8.5pt;")
+        cap.setStyleSheet(scale_qss(f"color:{Settings.FG_SECONDARY}; font:8.5pt;"))
         col.addWidget(thumb, alignment=Qt.AlignmentFlag.AlignCenter)
         col.addWidget(cap)
         return col, thumb

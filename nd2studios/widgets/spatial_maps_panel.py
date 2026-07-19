@@ -37,7 +37,7 @@ from nd2studios.widgets.common import MplCanvas
 from nd2studios.widgets.image_viewer import frame_to_uint8
 from nd2studios.widgets.scale_bar import draw_scale_bar
 from nd2studios.widgets.frame_strip import FrameStrip
-from nd2studios.widgets.icon_button import icon_button, bind_toggle_icon
+from nd2studios.widgets.icon_button import icon_button, bind_toggle_icon, scale_qss, scaled
 from nd2studios.backend.celltracker.fields import (
     compute_spatial_fields, FIELD_OPTIONS,
 )
@@ -67,10 +67,10 @@ class _CollapsibleSection(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         self._btn = QPushButton(f"{'▶' if collapsed else '▼'}  {title}")
-        self._btn.setStyleSheet(
+        self._btn.setStyleSheet(scale_qss(
             f"text-align: left; padding: 4px 8px; font: bold 9pt; "
             f"color: {Settings.ACCENT_CYAN}; background: {Settings.BG_TERTIARY}; "
-            f"border: none; border-radius: 4px;")
+            f"border: none; border-radius: 4px;"))
         self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn.clicked.connect(self._toggle)
         lay.addWidget(self._btn)
@@ -362,7 +362,7 @@ class SpatialMapsPanel(QWidget):
 
         self._full_sidebar = QScrollArea()
         self._full_sidebar.setWidgetResizable(True)
-        self._full_sidebar.setFixedWidth(270)
+        self._full_sidebar.setFixedWidth(scaled(270))
         self._full_sidebar.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         side_inner = QWidget()
@@ -396,7 +396,7 @@ class SpatialMapsPanel(QWidget):
         right.addWidget(self.canvas, stretch=1)
         self.lbl_stats = QLabel("—")
         self.lbl_stats.setWordWrap(True)
-        self.lbl_stats.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        self.lbl_stats.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 8pt;"))
         right.addWidget(self.lbl_stats)
         right.addLayout(self._build_frame_row())
         mid.addLayout(right, stretch=1)
@@ -408,7 +408,7 @@ class SpatialMapsPanel(QWidget):
         row.setSpacing(4)
         row.addWidget(QLabel("Template:"))
         self.combo_template = QComboBox()
-        self.combo_template.setMinimumWidth(160)
+        self.combo_template.setMinimumWidth(scaled(160))
         self.combo_template.activated.connect(self._on_template_activated)
         row.addWidget(self.combo_template)
         btn_save_tpl = QPushButton("Save template…")
@@ -437,16 +437,16 @@ class SpatialMapsPanel(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(4)
         lbl = QLabel("T:")
-        lbl.setFixedWidth(18)
+        lbl.setFixedWidth(scaled(18))
         row.addWidget(lbl)
         self._frame_strip = FrameStrip("T")
         self._frame_strip.current_changed.connect(self._on_strip_current)
         row.addWidget(self._frame_strip, stretch=1)
         self._frame_label = QLabel("1/1")
-        self._frame_label.setFixedWidth(56)
+        self._frame_label.setFixedWidth(scaled(56))
         self._frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._frame_label.setStyleSheet(
-            f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self._frame_label.setStyleSheet(scale_qss(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         row.addWidget(self._frame_label)
         self._play_btn = icon_button(
             "fa5s.play", "Play / pause", checkable=True,
@@ -460,7 +460,7 @@ class SpatialMapsPanel(QWidget):
         self._fps_spin.setValue(5.0)
         self._fps_spin.setSingleStep(0.5)
         self._fps_spin.setSuffix(" fps")
-        self._fps_spin.setFixedWidth(72)
+        self._fps_spin.setFixedWidth(scaled(72))
         self._fps_spin.setToolTip("Playback speed")
         self._fps_spin.valueChanged.connect(self._on_fps_changed)
         row.addWidget(self._fps_spin)
@@ -506,19 +506,19 @@ class SpatialMapsPanel(QWidget):
         btn_home = QPushButton("Home")
         btn_home.setObjectName("compactBtn")
         btn_home.setToolTip("Reset view (fit map to window)")
-        btn_home.setFixedSize(BTN_W, BTN_H)
+        btn_home.setFixedSize(scaled(BTN_W), scaled(BTN_H))
         btn_home.clicked.connect(self._on_zoom_home)
         row.addWidget(btn_home)
         btn_in = QPushButton("+")
         btn_in.setObjectName("compactBtn")
         btn_in.setToolTip("Zoom in")
-        btn_in.setFixedSize(BTN_H, BTN_H)
+        btn_in.setFixedSize(scaled(BTN_H), scaled(BTN_H))
         btn_in.clicked.connect(lambda: self._zoom_about(0.8))
         row.addWidget(btn_in)
         btn_out = QPushButton("-")
         btn_out.setObjectName("compactBtn")
         btn_out.setToolTip("Zoom out")
-        btn_out.setFixedSize(BTN_H, BTN_H)
+        btn_out.setFixedSize(scaled(BTN_H), scaled(BTN_H))
         btn_out.clicked.connect(lambda: self._zoom_about(1.25))
         row.addWidget(btn_out)
         self._btn_pan = QPushButton("Pan")
@@ -526,12 +526,12 @@ class SpatialMapsPanel(QWidget):
         self._btn_pan.setToolTip(
             "Toggle pan. When on, left-click and drag to move the zoomed map.")
         self._btn_pan.setCheckable(True)
-        self._btn_pan.setFixedSize(BTN_W, BTN_H)
+        self._btn_pan.setFixedSize(scaled(BTN_W), scaled(BTN_H))
         self._btn_pan.toggled.connect(self._set_pan_mode)
         row.addWidget(self._btn_pan)
         self._lbl_zoom = QLabel("100%")
-        self._lbl_zoom.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
-        self._lbl_zoom.setMinimumWidth(48)
+        self._lbl_zoom.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
+        self._lbl_zoom.setMinimumWidth(scaled(48))
         row.addWidget(self._lbl_zoom)
         row.addStretch(1)
         return row
@@ -1451,7 +1451,7 @@ class SpatialTemplatePicker(QDialog):
     def __init__(self, names: List[str], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Spatial map templates")
-        self.resize(460, 360)
+        self.resize(scaled(460), scaled(360))
         root = QVBoxLayout(self)
         root.addWidget(QLabel(
             "Templates load into the Spatial Maps tab when this node runs. "

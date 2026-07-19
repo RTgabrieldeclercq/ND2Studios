@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.common import MplCanvas
 from nd2studios.widgets.frame_strip import FrameStrip
-from nd2studios.widgets.icon_button import scaled
+from nd2studios.widgets.icon_button import scaled, scale_qss
 from nd2studios.widgets.image_viewer import frame_to_uint8
 
 _VIEWS = [("compare", "Before / After"), ("shifts", "Shifts vs time")]
@@ -79,7 +79,7 @@ class RegistrationPanel(QWidget):
         row.addWidget(QLabel("View:"))
         row.addWidget(self.cmb_view)
         self.lbl_meta = QLabel("")
-        self.lbl_meta.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_meta.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         row.addWidget(self.lbl_meta)
         row.addStretch(1)
         self.btn_write = QPushButton("Write aligned → processed channels")
@@ -113,7 +113,7 @@ class RegistrationPanel(QWidget):
         self.spn_fps.setValue(6)
         self.spn_fps.setSuffix(" fps")
         self.lbl_frame = QLabel("T 0/0")
-        self.lbl_frame.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_frame.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         self.strip = FrameStrip()
         self.strip.current_changed.connect(self._on_frame_changed)
         trow.addWidget(self.lbl_m)
@@ -233,7 +233,7 @@ class RegistrationPanel(QWidget):
                     "first.", ha="center", va="center",
                     color=Settings.FG_SECONDARY, transform=ax.transAxes)
             ax.set_axis_off()
-            self.canvas.draw()
+            self.canvas.safe_draw()
             return
         try:
             if self._view_key() == "compare":
@@ -246,8 +246,8 @@ class RegistrationPanel(QWidget):
             ax.text(0.5, 0.5, f"Render error:\n{exc}", ha="center", va="center",
                     color=Settings.ACCENT_RED, transform=ax.transAxes, fontsize=8)
             ax.set_axis_off()
-        self.canvas.fig.tight_layout()
-        self.canvas.draw()
+        self.canvas.safe_tight_layout()
+        self.canvas.safe_draw()
 
     def _render_compare(self) -> None:
         t = int(self._t)

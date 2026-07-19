@@ -2,6 +2,242 @@
 
 **Version:** V1.46
 
+## V1.78 additions (2D DIC — pyALDIC)
+
+The 2D sibling of the DVC (ALDVC) node, built on the optional third-party
+`al-dic` package (pyALDIC). It **reuses the DVC data model + viewer** end-to-end
+rather than forking them.
+
+- **`backend/dic/`** (Qt-free) — the engine layer.
+  - `method.py` registers `PyALDICMethod` under the *shared* `DVCMethod` registry
+    (`core/dvc_registry.py`) as `name="pyALDIC"`, so its `get_params()` is the
+    single source of truth for the DIC node's engine ParamSpecs (consumed by
+    `registry_adapter.param_specs_for`) — exactly the `ALDVCMethod` idiom.
+  - `engine.py` wraps `al_dic.core.pipeline.run_aldic`. `al_dic` is imported
+    **lazily** (gated by `importlib.util.find_spec`, friendly `ImportError`), so
+    importing the module never requires the extra and it stays out of
+    `requirements.txt`. The core piece is the **result adapter**: pyALDIC returns
+    an *adaptive quadtree FE mesh* (node coords `[x,y]`, displacement interleaved
+    `[u,v,…]`), which the adapter resamples onto a **regular grid** `(Gy,Gx,2)`
+    (pitch = winstepsize) via `scipy.griddata`, swapping conventions to
+    `DVCResult`'s `(y,x)` / `[dy,dx]`. Displacement stays in pixels;
+    `DVCResult.voxel_size_um` does the µm conversion (like ALDVC). Strain is left
+    `None` — `DVCPanel.field_bundle_from_result` re-derives it from displacement.
+  - `roi.py` rasterizes a serializable vector-shape action list (rect / ellipse /
+    circle / polygon / brush / invert / clear, Add=OR / Cut=AND-NOT) into a
+    boolean mask, mirroring pyALDIC's `ROIController` semantics.
+- **Three Special nodes** (`registry_adapter.py`): `special:dic` (terminal
+  compute node, IMAGE input → dedicated "DIC" viewer tab), `special:dic_roi`
+  (draw the mesh domain), `special:dic_refine` (adaptive-refinement brush +
+  criteria). The two mesh nodes are pass-throughs wired upstream of the DIC node.
+- **Data flow — record side-artifacts** (the DVC-family pattern): the mesh nodes
+  publish `record._dic_roi_by_m` (boolean mesh domain) and
+  `record._dic_refine_by_m` (brush + criteria); `_DICJob` reads both plus the
+  shared crop / `_registration_by_m` / `_exclude_by_m`, so the correlation runs on
+  the same registered + cropped + excluded region every other reader sees.
+- **Runtime** (`pages/pipelines_page.py`): `_DICJob` (2D sibling of `_DVCJob`)
+  reads one projected frame per timepoint and calls `run_pyaldic_series` once per
+  multipoint (native accumulative/incremental tracking), returning the same
+  `{m:{"primary":{t:(DVCResult,bg)},"increment":{t:DVCResult}}}` shape.
+  `_finish_dic` stores `_dic_series_by_m` and opens the "DIC" overlay tab, which
+  reuses the **`DVCPanel`** widget unchanged (`_ensure_dic_panel` /
+  `_populate_dic_panel`). Kept independent of the DVC stores/tab so DIC and DVC
+  results coexist.
+- **Editor** (`widgets/node_board/dic_mesh_editor_dialog.py`,
+  `DICMeshEditorDialog`) reproduces pyALDIC's ROI-toolbar flow over the reused
+  `ImageCanvas` (Add/Cut × rect/circle/polygon + brush + invert/clear/undo, mesh
+  dot preview).
+
+## V1.66 additions (streaming / memory-mapped loader)
+
+**Streaming is the overarching viewing setup.** Every file opens instantly and
+streams frames on demand instead of eagerly decoding the whole `(M,T,Z,H,W)`
+volume into RAM (the V1.41 `MaterializedDataset` freeze). `Settings.STREAM_ALWAYS`
+(default True) makes `choose_strategy` return `LAZY_CACHED` for all files; eager
+full-RAM loading is opt-in via `FORCED_LOAD_STRATEGY`. Because `StreamingDataset`
+mirrors the `MaterializedDataset` API and the app already handled lazy channel
+proxies (the pre-V1.41 `LazyND2Channel` contract, which `_StreamChannel`
+reproduces), the viewer / recipe / analysis / export / batch / 3-D paths all
+consume a streaming dataset unchanged (`RecipeWorker` materializes proxies
+frame-by-frame; `PreRenderWorker` skips datasets without an in-RAM `channels`
+dict).
+
+**Stream-for-view / materialize-for-analysis.** The viewer always streams, but
+heavy compute goes resident when it fits: `resource_strategy.fits_resident()`
+(RAM-relative, ignoring the small view-open byte cap) drives
+`should_stream_analysis` (materialize a fitting streamed dataset for fast in-RAM
+analysis; stream only what's too big to fit) and `materialize_channels_if_fits()`
+(the analysis page reads its input channels into RAM when they fit). Memory
+pressure forces streaming.
+
+- **`backend/streaming_dataset.py`** (Qt-free) — `StreamingDataset` mirrors the
+  `MaterializedDataset` API exactly, so it is a drop-in behind the same seam the
+  viewer/pipelines already use. It wraps a read *source* and adds a byte-bounded
+  LRU frame cache, neighbour prefetch, and blocked Z-projection. Sources:
+  `TiffMemmapSource` (`tifffile.memmap`, OS-paged; per-page fallback for
+  compressed) and `LazyVolumeSource` (wraps `LazyND2Volume` etc.).
+- **`utils/resource_strategy.py`** — an absolute `EAGER_MAX_BYTES` cap makes big
+  files choose `LAZY_CACHED`; the streaming-first policy keeps Z intact (so the
+  V1.65 3-D viewer/Z navigation work) rather than collapsing it (`EAGER_REDUCED`,
+  now override-only).
+- **`workers/load_worker.py`** — `_load_tiff`/`_load_nd2` return a
+  `StreamingDataset` for `LAZY_CACHED`; `workers/pre_render_worker.py` skips the
+  bulk RGB pre-render for streaming datasets.
+
+Data flow (large file): pick file → `choose_strategy` → `LAZY_CACHED` →
+`StreamingDataset` (memmap / lazy) → viewer reads `get_frame` on demand, served
+from cache/prefetch; the full volume is never resident. Memory used is a bounded,
+reclaimable page-cache — not eager anonymous heap. Multi-file imports still
+materialize (follow-up).
+
+## V1.65 additions (PyVista volumetric 3-D viewer)
+
+A reusable 3-D viewer, offered as a **2D ⇄ 3D toggle** in the Import-tab panels
+and the Pipelines preview. It renders the raw `(Z,H,W)` volume (the only place a
+Z axis survives — the recipe/analysis/export path collapses Z), so it always
+reads `record._raw_volume` via `get_volume(c, m, t, z_start, z_end)`.
+
+Layering (respects the backend-purity rule; the graphics dependency is confined
+to the widget layer):
+
+- **`backend/viz3d/`** — pure numpy, Qt- **and** PyVista-free. `prep.py` turns a
+  duck-typed volume (`MaterializedDataset` / `LazyND2Volume`) into LUT-mapped
+  uint8 `(Z,H,W)` blocks + anisotropic `Spacing(dz,dy,dx)`. `overlays.py` adapts
+  result objects — `DVCResult → DVCField` (world-µm glyph points/vectors + scalar
+  fields) and `TrackData → PtvTracks` (world-space polyline segments) — consumed
+  *duck-typed* so the backend never imports the (Qt-tainted) modules that define
+  them.
+- **`widgets/viewer3d/`** — Qt + PyVista, gated. `PyVista3DViewer` embeds a
+  `pyvistaqt.QtInteractor` and mirrors enough of `MultiAxisViewer`'s API to be a
+  drop-in alternate behind a stacked toggle; four render modes (volume / MIP /
+  ortho slices / isosurface) map onto `add_volume(blending=…)` / `slice_orthogonal`
+  / `contour`. `deps.py` holds the `find_spec` gate; `placeholder.Missing3DDeps`
+  shows an install hint when absent; `viewer3d_dialog.Viewer3DDialog` is the
+  result pop-out. **No module-level PyVista import** — VTK loads lazily only when
+  a canvas is created.
+- **`workers/volume3d_worker.py`** — `VolumeBuildWorker(BaseWorker)` builds the
+  uint8 blocks off-thread (numpy only); the viewer creates every VTK actor on the
+  GUI thread in the worker's `finished` slot (VTK/OpenGL is main-thread-only). A
+  small LRU cache of built blocks keeps M/T scrubbing and playback smooth.
+
+Data flow (3-D toggle on):
+`record._raw_volume` → `VolumeBuildWorker` → `prep.build_channel_volumes` (LUT →
+uint8) → `PyVista3DViewer` → `pyvista.ImageData` actors (spacing = physical µm).
+Overlays: `DVCResult`/`TrackData` → `viz3d.overlays` → `set_overlay` → glyphs /
+warp / tubes.
+
+Integration: `widgets/file_panel.py` and `pages/pipelines_page.py` each wrap
+their existing `MultiAxisViewer` in a `QStackedWidget` and add a "3D" toggle;
+`self.viewer` stays the 2-D viewer so all existing callers/overlays are
+unaffected. PyVista/VTK are an optional, `find_spec`-gated extra (Cellpose/
+StarDist precedent) — **not** pinned in `requirements.txt`.
+
+**DVC-on-object render (V1.67 — Phase 2 of the DVC-on-object feature).** The
+already-computed DVC field is rendered **onto the 3D Mask Drawing node's mask**
+(V1.65 Phase 1). `backend/viz3d/overlays.dvc_object_field(result, mask,
+mask_voxel_size_um)` reuses `dvc_field()` for the scalars, then interpolates each
+onto the object's voxels (`scipy` `RegularGridInterpolator`, linear) — aligned in
+physical **µm** so XY-downsample and anisotropic Z need no extra bookkeeping —
+cropped to the object bbox → a `MaskedField` (mask block + per-name scalar volumes,
+NaN outside, µm spacing + world origin). `PyVista3DViewer._add_masked_field_overlay`
+draws the mask iso-contour as the boundary **surface** colored by the scalar, plus
+the **interior** per render mode (Iso = surface; Slices = shell + interior slices;
+Volume/MIP = shell + volume render). A new **overlay-only render path** lets the
+object render with no raw image volume. Surfaced as a **"3D Object" subtab** in
+`widgets/dvc_panel.py` (the matplotlib canvas + a lazily-built `PyVista3DViewer`
+share a `QStackedWidget`); `pipelines_page::_populate_dvc_panel` feeds
+`record._mask3d_by_m[m]` + the raw voxel size into `DVCPanel.set_data(masks=,
+mask_voxel_size=)`. Data flow: `record._mask3d_by_m` + page `_dvc_series_by_m` →
+`dvc_object_field` → `MaskedField` → `set_overlay` → surface/interior actors.
+
+**DVC surface deformation metrics (V1.68 — Phase 3, Stout et al. 2016 MDM).** The
+*primary* object view is now a **smoothed closed surface mesh** carrying the
+displacement, not a voxel block (V1.67's `MaskedField` is demoted to the optional
+interior). Pure-numpy (`Qt`/`VTK`-free) additions: **`backend/viz3d/surface.py`**
+(`build_object_surface` — `skimage` marching cubes + a pure-numpy **Taubin** λ|μ
+smooth, outward re-winding, divergence-theorem enclosed volume, all in µm;
+`sample_displacement_on_surface` reusing V1.67's µm alignment;
+`decompose_surface_displacement` → normal `u⊥`/tangential `u∥`) and
+**`backend/viz3d/mdm.py`** (Mean Deformation Metrics — the divergence-theorem
+surface integral `⟨∇u⟩`, `⟨F⟩`/`⟨J⟩`/polar `⟨R⟩`,`⟨U⟩`/`⟨λ_i⟩`,`⟨N_i⟩`/`⟨θ⟩`, and
+`cumulative_rotation` `⟨Θ⟩`). `overlays.dvc_object_surface(...)` orchestrates them
+into a **`SurfaceField`** (mesh + per-vertex scalars + `MDMResult`);
+`overlays.unwrap_surface(...)` → **`UnwrapMap`** is a genus-0 spherical
+parameterization rasterized to a 2-D **Mollweide/equirectangular** map + tangential
+`u∥` field. `PyVista3DViewer._add_surface_field_overlay` renders the mesh
+(divergent colormap for signed scalars) + `set_context_channel(...)` composites a
+*surrounding channel* as a cloud/shell. `DVCPanel` gains a **"2D Unwrap"** view, a
+**Mean Deformation Metrics readout**, a **context-channel** picker, and
+`_SurfaceFieldWorker` (off-thread `SurfaceField` build, cached by
+`(object, incr, t, scalar, smooth)` — the leading `object` dimension added in V1.74).
+**`backend/dvc/` is neither imported nor modified** — `DVCResult` is consumed
+read-only. Review: `Research/mean_deformation_metrics.md`.
+
+**Frame / Object scope toggle (V1.68).** A per-edge **scope** on
+`Edge.params["scope"]` (`SCOPE_WHOLE` default / `SCOPE_OBJECTS`), via
+`model.edge_scope`/`set_edge_scope` — round-trips today with **no schema bump**
+(absent ⇒ whole-frame ⇒ every legacy graph unchanged). `registry_adapter.
+node_produces_objects(node)` (mask3d / track / analysis) gates a clickable
+**Frame ↔ Objects lever** drawn on the wire midpoint by `EdgeItem.set_scope_lever`;
+`NodeScene.toggle_edge_scope`/`edge_scope_changed`/`refresh_scope_levers` persist +
+signal it. On "objects", downstream runs per object: `backend/analysis/
+object_scope.iter_objects` enumerates `ObjectRegion`s (3-D CC of a bool mask, or
+per-label XY-union-over-T of a `(T,H,W)` label mask), and `ObjectCropVolume`
+(`pipeline_graph/executor.py`, beside `CroppedVolume`) is the lazy per-object crop
+(XY bbox + optional Z sub-stack, conserving T/M/C). Wired for DVC:
+`_DVCJob(object_regions=...)` runs ALDVC once per object on its crop (`method.run`
+unchanged), returning per-object results + masks + `object_origins`.
+
+**Per-granule DVC surface selector + "All granules" composite (V1.74).** A
+Granule Volume Mask → DVC edge on Objects scope solves one surface DVC per granule;
+`_store_dvc_objects` now keeps every granule's full bundle in
+`_dvc_obj_full_by_m = {m:{oid:{"series","bg","increment","mask","n_voxels","origin"}}}`
+(per-object backdrops/increments/masks were previously discarded, only the largest
+survived). `_populate_dvc_panel` feeds it as `DVCPanel.set_data(objects=...)`, which
+shows an **Object** selector (`cmb_object`): pick a granule (swaps the active
+series/masks) or **"All granules"** to composite every surface. The composite is one
+merged `SurfaceField` via `backend/viz3d/overlays.merge_surface_fields(fields,
+offsets_um)` — each granule's crop-local surface translated by its crop origin
+(`origin` × mask voxel size) so components sit at true relative positions; built
+off-thread by `_MultiSurfaceFieldWorker` and rendered by the **unchanged**
+`_add_surface_field_overlay` under a shared colour scale (per-granule MDM / 2-D
+unwrap need a single granule selected).
+
+**DVC export / reload as a portable checkpoint (V1.76).** The DVC viewer's **Export**
+button (`DVCPanel.export_requested`) writes every DVC output — all multipoints'
+`DVCResult` series (cumulative + increments), per-frame backdrops, 3-D object masks
+and per-granule `_dvc_obj_full_by_m` bundles — plus a read-only **provenance** record
+to a single portable **`.nd2dvc`** file. Format + I/O live in the Qt-free
+**`backend/dvc_export.py`** (`save_dvc_bundle` / `load_dvc_bundle`): an NPZ (zip) with a
+UTF-8 JSON `__manifest__` (structure + metadata + provenance, no pickle) plus arrays
+**deduplicated by identity** (a mask broadcast across frames is stored once); run off
+the GUI thread by `workers/dvc_export_worker.py` (`DVCExportWorker` / `DVCImportWorker`).
+Importing (page `_import_dvc_bundle` → `_apply_imported_dvc_bundle`) repopulates the
+page's DVC stores, sets `_dvc_from_bundle=True` + `_dvc_bundle_meta`, and drops a
+portable **DVC Checkpoint** input node (`SPECIAL_DVC_CHECKPOINT_OP_KEY`,
+`NodeCategory.CHECKPOINT`, port-less terminal source; `params["bundle_path"]` +
+`["provenance"]`) on the board — so a fresh session with **no ND2 loaded** re-renders
+the whole series in the same viewer with no Run. `_populate_dvc_panel` branches to
+`_populate_dvc_panel_from_bundle` when `_dvc_from_bundle` (the reload has no live record
+to derive frame counts / pixel + voxel sizes / channel names from — the bundle carries
+them; context overlay is disabled). A saved pipeline auto-re-hydrates via
+`_autoload_dvc_checkpoints()` on load; a real DVC run clears the flag. The 3-D object
+view's **Home** button (`DVCPanel._on_zoom_home` → `_view3d.reset_camera()`; the PyVista
+control bar's own `fa5s.home` button) resets the camera.
+
+**Export baked into the Output node (V1.79).** The V1.76 manual Export button is
+removed (`DVCPanel.export_requested` / `btn_export` gone). Instead the **DVC node now
+has an `ANY` output port** (`registry_adapter` `SPECIAL_DVC_OP_KEY` `output_types=[PortType.ANY]`,
+via the `can_connect` wildcard → the Analysis Output node's `BINARY` input) and wiring
+**DVC → Output** makes that Output node auto-save on Run. `_run_execute_node`'s OUTPUT
+branch routes to `_run_output(node)`: if `_output_source_node(node)` is a DVC node, it
+reuses `_gather_dvc_bundle_payload`, creates `Settings.PROJECT_DIR/results/<node.title>/`
+(`_output_node_dir` + `_safe_output_name`), and saves `<title>.nd2dvc` + a
+`provenance.json` sidecar **off-thread** (`DVCExportWorker`), finishing the node from the
+worker's done slot; any other Output node is the unchanged pass-through. Reload is
+unchanged — the **Import DVC results** toolbar button + the DVC Checkpoint node still
+load a `.nd2dvc` (now found under `results/<name>/`).
+
 ## V1.57 additions (Export cropped data from the Import tab)
 
 - **`widgets/file_panel.py`** grows an "Export" group. It now assembles an
@@ -22,6 +258,31 @@
   volume + `crop_rect`) for unprojected multi-Z, else `tiff_stack`; `movie` and
   `image_sequence` reuse `ExportPreviewDialog`. Progress/status flow through the
   panel's existing `on_progress`/`on_status` callbacks.
+
+## V1.72 additions (Split-by-axis export from the Import tab)
+
+- **`backend/exporters/split_exporter.py`** — the split engine. `export_split`
+  takes a `SplitExportSpec` (per-axis `split_m/t/z/c` flags + `write_tiff/png/movie`
+  flags) and the panel's volume, and writes one file per combination of the
+  *split* axes' indices; each file bundles the full range of the *keep* axes.
+  `_axis_groups(n, split)` produces `[[i] …]` (split) or `[[0..n-1]]` (keep); the
+  output grid is their cartesian product over M/T/Z/C. Per group it delegates to
+  the existing writers: `export_tiff_hyperstack` (TZCYX, kept M flattened into the
+  frames axis since ImageJ has no M dim), `_composite_frame`+`_draw_overlays`
+  (PNG per `(m,t,z)`), `export_movie` (one clip, timeline = flattened `(m,t)`).
+  `plan_split_export(...)` is a pure counts/description helper for the dialog.
+  Contrast is set by `spec.lut_mode` (`auto`/`manual`/`full`): `_effective_contrast`
+  resolves it into a composite LUT (PNG/movie) + TIFF rescale bounds
+  (`_dtype_max` supplies the full-scale value). Pure backend (no PySide6). XY crop
+  applied at read time; the V1.43 T/M/Z tile-strip crop is already baked into
+  `record._raw_volume`, so the volume's axis sizes drive the grid.
+- **`widgets/split_export_dialog.py`** (`SplitExportDialog`) — the Split/Keep
+  radio matrix + format checkboxes + a Contrast/LUT radio group (auto / manual /
+  full) + live summary; Z-split is disabled under a projection and C-split for
+  single-channel data; returns `spec()` + `movie_options()`.
+- **`widgets/file_panel.py`** — a primary "Export by axis…" button opens the
+  dialog and runs `ExportRequest(mode="split", split_spec=…, raw_volume=…)`; the
+  prior V1.57 single-view export is now the secondary "Quick export…" button.
 
 ## V1.51 additions (Digital Volume Correlation — ALDVC node)
 
@@ -55,6 +316,76 @@ reads `record._raw_volume.get_frame(c, m, t, z_mode="none")` for its reference /
 deformed timepoints, deliberately bypassing the Z-collapsing recipe/export path;
 recipes/exports continue to operate on the `(T,H,W)` projection, so DVC is purely
 additive.
+
+- **3D Mask Drawing node (V1.65)** — a Special pipeline-graph node
+  (`SPECIAL_MASK3D_OP_KEY = "special:mask3d"`, a HEXAGON IMAGE-input special so it
+  takes a rainbow channel wire; emits `PortType.ANY` — a pass-through in the image
+  stream like Registration, so it wires *in front of* DVC/analysis
+  (`input → 3D Mask Drawing → DVC`), both fixing connectivity (ANY pairs with DVC's
+  IMAGE input) and ordering the run so the mask is published before DVC's 3-D Object
+  view reads it). The user draws/edits an
+  object mask on each Z plane of the wired channel's raw `(Z,H,W)` volume via
+  `widgets/node_board/mask3d_editor_dialog.py` (`Mask3DEditorDialog`, embedding the
+  reusable `ImageCanvas` + a Z scrubber), launched from the param popup's "Draw 3D
+  mask…" button (`pages/pipelines_page.py::_edit_mask3d`). Three creation modes —
+  Manual (per-plane), Propagate across Z (copy or signed-distance interpolation
+  between drawn planes), and Threshold seed + edit. Drawn shapes are vector
+  geometry stored in `node.params['mask_shapes']` (`{m:{t:{z_key:[shape]}}}`, a
+  hidden param; the `manual_mask` shape schema). On Run, `_run_mask3d_node`
+  rasterizes them via **`backend/analysis/mask3d.py`** (`build_mask_volume`,
+  `threshold_seed_shapes`, `rasterize_plane` — pure numpy/scipy, reuses
+  `manual_mask._rasterize`) into a `(Z,H,W)` boolean mask per `(m,t)`, published to
+  `self._mask3d_by_m` and `record._mask3d_by_m` for a downstream consumer. This is
+  Phase 1 of the DVC-on-object feature; Phase 2 (interpolate the DVC field onto the
+  mask, render surface + interior as a new DVC subtab) will consume
+  `record._mask3d_by_m`.
+
+- **Granule Separation chain (V1.70)** — five Special nodes that separate a 3-D
+  point cloud of bead centroids into the hydrogel granules they belong to. Op keys
+  live in **`pipeline_graph/granule_ops.py`**; the shared contracts (dataclasses,
+  the `centroid_z/y/x` DATA-row schema, the `record._granule_*_by_m` storage-key
+  constants, coordinate conventions) in **`backend/analysis/granule_types.py`**.
+  All maths are pure / Qt-free backend modules; the page only orchestrates:
+  `bead_detect.py` (wraps `serialtrack/detection.ParticleDetector`; the sole
+  `(x,y,z)→(z,y,x)` flip and the app's first `centroid_z_px` writer) →
+  `granule_cluster.py` (full-covariance GMM + BIC sweep over the relaxed count;
+  optional `find_spec`-gated scikit-learn) → `granule_tessellate.py` (per-granule
+  alpha-shape **or** global Voronoi via `scipy.spatial`, then a region-adjacency
+  density-ratio merge → final labels) → `granule_mask.py` (voxelize onto the
+  confocal grid with SDF-Gaussian smoothing → per-granule `(Z,H,W) bool` +
+  combined `(Z,H,W) int32`) → `granule_boundary.py` (outward N-voxel band by
+  dilation / EDT). Each node computes per `(m,t)` on the viewed reference frame and
+  publishes to `record._granule_{points,labels,tess,masks,bands}_by_m` (mirroring
+  `_mask3d_by_m`); dispatch + handlers `_run_bead_detect` / `_run_granule_*` in
+  `pages/pipelines_page.py`. Because the mask node's per-`(m,t)` value is the same
+  `{gid:(Z,H,W) bool}` shape as a `_mask3d_by_m` object, the whole shipped back half
+  works unchanged: `op_produces_objects` (so the Frame/Object lever shows),
+  `object_scope` (a new `iter_objects_3d_labels` enumerates the combined int32
+  label volume as one 3-D region per granule), and **DVC-on-object** — wiring
+  `Granule Volume Mask → DVC` with the edge on *Objects* runs one DVC field +
+  marching-cubes surface + MDM **per granule** (the wishlist "Volume Viewer": a 3-D
+  granule surface with displacement/strain painted on, via the existing PyVista
+  `SurfaceField` path — no new viewer). `_dvc_scoped_object_regions` was extended to
+  discover `_granule_masks_by_m`. **(V1.74)** the DVC tab exposes every granule via an
+  **Object** selector + an **"All granules"** composite (see the V1.74 paragraph in
+  the DVC-on-object section) — before this only the largest granule was viewable.
+
+- **Granule node viewers (V1.73)** — each of the five granule nodes has a dedicated
+  viewer, built as gated overlay **modes** on the Pipelines-tab `_overlay_tabbar`
+  (like `segmentation`/`tracks`), NOT new panels. 2-D marks are drawn in
+  `_composite_pipeline_overlay` (`pages/pipelines_page.py`) by
+  `_paint_granule_{beads,clusters,tess,mask,boundary}` (crosshairs / colored dots /
+  tessellation lines / per-plane colored masks / solid-new+dotted-previous
+  contours), honoring the per-Z filter and the `_crop_rect()` offset. Categorical
+  color is `backend/analysis/granule_types.granule_color(gid)` (a set-independent
+  palette, a copy of `analysis_page._LABEL_PALETTE`, so cluster and mask agree).
+  3-D reuses the in-tab `_btn_view3d` toggle: `_feed_view3d_granule_overlay` builds a
+  pure-numpy **`backend/viz3d/overlays.GranuleScene`** (points/edges/label-volume/
+  boundary pair; `granule_centroid_edges` derives Delaunay/Voronoi edges) which
+  `widgets/viewer3d/pyvista_viewer._add_granule_scene_overlay` renders (glyphs,
+  line network, per-label isosurfaces, solid + VTK-stippled-dotted boundary
+  wireframes). Tabs are gated in `_update_overlay_tabs_available` and auto-selected
+  on Run from the shared `_finish_granule`. (Numbered V1.73 — V1.71/V1.72 were taken.)
 
 ## V1.46 additions (Streaming, Resource-Aware Analysis)
 
@@ -315,7 +646,11 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
     track overlays) into `PipelinesPage._checkpoint_store` when the Run reaches it,
     stamped with an *upstream hash* (`_checkpoint_upstream_hash`: the checkpoint's
     structural ancestors + params, the edges feeding them incl. channel wiring, any
-    touching loop config, plus the Processing recipe / normalized flag / crop). On
+    touching loop config, plus the Processing recipe / normalized flag — V1.59: **no
+    crop** is folded in (the preview crop is a downstream concern; the registration
+    crop is redundant with the reg node's params + file signature *and* is cleared
+    at run start, so hashing it wrongly invalidated any checkpoint after a
+    "crop to common" Registration node). On
     the next Run, `_checkpoint_resume_target` picks the deepest checkpoint whose
     hash still matches and `_on_run` builds `GraphRunner(sl, frozen=<ancestors>)` —
     which marks the ancestors done and reaches their successors, so the walk skips
@@ -332,6 +667,24 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
     survives restarts (toggling it back off removes the stale cache on next save);
     the upstream hash folds in a source-file signature (`_record_signature`) so a
     cache reloaded against a different file invalidates through the same gate.
+    **Registration + cropped resume (V1.59):** a checkpoint also freezes the
+    Registration node's state (per-M transforms + common crop + viewer bundle live
+    on the record, not the accumulators, and are cleared at run start) —
+    `_run_checkpoint` snapshots it and `_restore_checkpoint` →
+    `_restore_registration_state` re-publishes it, so a resume that skips the frozen
+    Registration node keeps its drift correction downstream. Because no crop
+    invalidates the hash, *Run cropped region* resumes from the checkpoint and
+    re-scopes the frozen data to the crop — `_recrop_restored_checkpoint` slices
+    each frozen `AnalysisResult`'s masks (origin-aware via `_crop_analysis_result`,
+    so masks frozen in registration-crop space slice correctly) and re-derives the
+    rows/tracks from the sliced masks + cropped channels (`_ensure_run_rows`),
+    matching a fresh cropped Run's measurement path while still skipping the frozen
+    segmentation. The crop-containment guard in `_checkpoint_resume_target`
+    (`_crop_contains` / `_effective_run_crop`) applies **only when masks were
+    frozen** (a registration-only checkpoint is always resumable — nothing to slice
+    out of bounds); otherwise it falls back to a correct full re-run. DVC honors the
+    same drift correction + crop: `_DVCJob._read_volume` applies the frame-`t`
+    transform to each Z-slice then crops (register → crop).
     **Run spans the whole file:** an analysis
     node loops every multipoint (`_advance_run_m`) — per-M analysis job →
     measurement job → accumulate rows tagged `m_position` — so the if-else and
@@ -395,6 +748,42 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
   disconnect and migrates pre-V1.48 nodes (`ensure_rainbow_ports` /
   `_sync_rainbow_ports`), and hosts the **scissors** cut mode (`set_cut_mode`: a
   drag stroke or click removes any crossed wire, structural or channel).
+  **V1.61 overhaul (Phase 1):** the Processing + Analysis sub-tabs are **merged
+  into one connected chain** — a single **universal input** (all loaded files) →
+  processing → analysis → **output nodes at the ends**; the old
+  Processing-OUTPUT / Analysis-INPUT bridge nodes are gone.
+  `PipelineDoc.slice_for(PROCESSING|ANALYSIS)` both resolve to the merged slice;
+  `io._migrate_to_connected` folds saved two-slice docs, drops the bridge nodes and
+  reconnects the processing tail → analysis heads on load (schema → 6). The page
+  hides the sub-tab selector, drives one scene aliased under both stage keys,
+  `self._stage` **tracks the previewed node** (processing node → processed-image
+  preview; else analysis overlay), and `_show_base_image()` is always called so the
+  viewer is never blank. Execution stays dual-engine (enhancement recipe vs
+  `GraphRunner`): stage-grouping helpers (`_node_group`/`_stage_output_nodes`/
+  `_stage_input_node`/`_processing_tail_node`) anchor recipe derivation on the
+  processing tail, unified **Run** commits the recipe then walks the analysis graph
+  from the universal input, and the Run pump passes PROCESSING-stage nodes through.
+  Also: the board view (`_BoardView`) pans on a plain left-drag over empty
+  canvas (Ctrl/Shift-drag keeps the rubber-band marquee; suppressed while a scene
+  tool is armed via `_tool_active`); the right-click add menu groups specs into
+  **per-category submenus** (`_CATEGORY_MENU_ORDER`/`_LABEL` over
+  `NodeSpec.effective_category()`, Checkpoint folded under Special); and `NodeItem`
+  inline rename now also covers **INPUT** nodes and opens on **double-click**
+  (input/output = rename, ACTION = promote to previewed). **Right pane:** the
+  `MultiAxisViewer` is **never hidden** — it lives permanently in a vertical
+  splitter (`_viewer_split`); the specialized result panels (Spatial Maps /
+  SerialTrack / DVC / Registration) show in a separate `_panel_stack` **below** the
+  viewer (`_set_active_panel`) only while their overlay tab is active, and results
+  "table" mode no longer hides the viewer — so the base image + Preview-Crop tool
+  stay available after any analysis node. **V1.62 (Phase 2 R3):** every file loaded
+  in the Import tab appears as its **own input node** (titled by basename, bound to
+  its record's `exp_id` in `node.params["source_exp_id"]`); `_sync_input_nodes`
+  enumerates `main_window.pages["import"]._panels` + the active record, creates one
+  input node per file, and disables (keeps) an input whose file was closed.
+  `_active_record()` resolves through a **focused input node** (`_focused_input_id`,
+  set on double-click via `_input_node_for`) so previewing/running a file's chain
+  uses that file's data (all `_active_record()` sites follow it; single-file
+  behaviour is unchanged). Channels-on-body (R8) + spacing (R9) are next.
 - **`pages/pipelines_page.py` (new)** — 50/50 `QSplitter`: node board (sub-tab
   selector + control bar with Add / Preview / Apply / Undo and a slim preview
   `QProgressBar` + one `QGraphicsView` swapping scenes) and a reused
@@ -557,6 +946,17 @@ export source (measurements CSV / overlay frames / label-mask TIFF via
   `qtawesome` icon factories (`make_icon`, `icon_button`, `tool_button`,
   `bind_toggle_icon`). The single source of DPI scaling and modern vector
   icons for the chrome (title bar, top tabs, play controls).
+
+  **V1.64 — screen-size text scaling.** `screen_scale()` adds a clamped
+  screen-size growth factor (`1.0` at/below 1080p → `1.5` at 4K); `ui_scale()`
+  is now `dpi_factor × screen_scale()` so all `scaled()` geometry grows with the
+  text. `scale_qss(style, factor=None)` scales every `pt`/`px` token in a
+  stylesheet string and is the single scaling primitive: `core/theme.py`'s
+  `build_stylesheet()` runs the global QSS through it, and the app's inline
+  `setStyleSheet(...)` calls (which override the global sheet) are wrapped in it.
+  `scaled_pt()` scales `QPainter` `QFont` point sizes. Because fonts and their
+  containers scale by the same factor, enlarged text cannot overflow its button,
+  and at the 1080p baseline the rendered UI is byte-identical to prior versions.
 - **Top tab bar** replaces the left sidebar in `core/main_window.py`
   (`_build_top_tabs`); the `QStackedWidget` page model and `_navigate`
   are unchanged. New `#topTabBar` / `#topTabBtn` / `#sessionTabBtn` QSS.
@@ -806,10 +1206,11 @@ built, opens `MainWindow`.
 | `recipes.py` | `build_recipe`, `save_recipe`, `load_recipe` for `.nd2s_recipe.json` (kind = `nd2studios.recipe`) |
 | `serialtrack_analysis.py` (V1.47) | Qt-free PTV analysis data layer for the SerialTrack tab. `build_track_data(rows, m, …)` → `TrackData` (per-frame coords/track_ids + a chained `(N_tracks, n_frames, D)` trajectory matrix; `D` auto-inferred from `centroid_z_px`). `particle_displacement(td, t, mode)` gives cumulative/incremental per-particle vectors; `compute_field_bundle(td, t, …)` scatters them to a grid and computes `DisplacementField`+`StrainField` via `serialtrack.fields.compute_gridded_strain`. Derived helpers: `displacement_magnitude`, `velocity_components`, `divergence`, `curl` (2D scalar / 3D vorticity), `jacobian` (det(I+∂u/∂x)), `effective_strain`, `compute_stress` (linear-isotropic Hooke) + `von_mises_from_sigma`, and a `scalar_field(fb, key)` dispatcher. Exists because `object_tracker._link_group_serialtrack` runs SerialTrack only to chain `track_id` and discards its fields |
 | `spatial_templates.py` (V1.46) | Global JSON library of named Spatial Maps configurations under `~/.nd2studios/spatial_map_templates` (one `*.nd2s_spatialmap.json` per template). `list_templates` / `load_template` / `save_template` / `delete_template`; `read_template_file` parses a single-template or bundle file, `import_file` merges it into the library (cross-machine portability), `export_file` writes a bundle. Pure stdlib (no Qt/numpy). Consumed by `widgets/spatial_maps_panel.py` and the Spatial Maps nodes (which store template **names**) |
-| `exporters/tiff_exporter.py` | `export_tiff_stack(stack, filepath, bit_depth, pixel_size_um, progress_cb)` (single-channel `(T,H,W)` or `(T,Z,H,W)`, used by label-mask export); `export_tiff_hyperstack(channels, enabled, filepath, bit_depth, pixel_size_um, progress_cb)` (V1.29 — multi-channel, writes a single `(T,Z,C,H,W)` ImageJ TZCYX hyperstack with `Labels=[<channel names>]`, `unit=um`, `spacing`, resolution; same file construction as `export_stitched_tiff`). BigTIFF auto-switch |
+| `exporters/tiff_exporter.py` | `export_tiff_stack(stack, filepath, bit_depth, pixel_size_um, progress_cb)` (single-channel `(T,H,W)` or `(T,Z,H,W)`, used by label-mask export); `export_tiff_hyperstack(channels, enabled, filepath, bit_depth, pixel_size_um, lut_bounds, progress_cb)` (V1.29 — multi-channel, writes a single `(T,Z,C,H,W)` ImageJ TZCYX hyperstack with `Labels=[<channel names>]`, `unit=um`, `spacing`, resolution; same file construction as `export_stitched_tiff`; **V1.72** optional `lut_bounds={name:(lo,hi)}` overrides the auto percentile stretch per channel for uint8/uint16 rescale — ignored for passthrough). BigTIFF auto-switch |
 | `exporters/composite_exporter.py` | `export_rgb_composite_tiff(channels, colors, enabled, filepath, …, image_adjustments)`, `_composite_frame(…, image_adjustments)`, `CHANNEL_COLORS`. V1.32: `ImageAdjustments` dataclass (`brightness`, `contrast`, `saturation`, `hue`, `fade`); vectorised `apply_image_adjustments(rgb, adj)` for contrast / saturation / hue / fade on the final RGB; `_apply_brightness_to_gray(gray, brightness)` applies brightness as **multiplicative gain** (`gain = 1 + brightness/100`) inside the composite loop *before* the channel colour LUT is mixed in. The gain semantic keeps background pixels near zero (only signal scales visibly — additive offset would lift the noise floor as much as the peaks) and the per-channel placement keeps a red-only channel pure red rather than washing toward white. `ImageAdjustments.is_identity_post_composite()` lets the composite pass skip the post-RGB pass when only brightness is set |
 | `exporters/movie_exporter.py` | `MovieOptions` dataclass + `export_movie(channels, colors, enabled, filepath, options, pixel_size_um, frame_timestamps_s, lut_settings, image_adjustments, progress_cb, status_cb)`. Uses `imageio` (libx264 for MP4, pillow for GIF). PIL-rendered overlays for scale bar, timestamp, channel labels |
 | `exporters/image_sequence_exporter.py` (V1.32) | `format_frame_name(basename, t, m, z, n_t, n_m, n_z, extension)` — pure naming helper that only includes axis suffixes (`_T01`, `_M02`, `_Z03`) when the corresponding axis has more than one frame. `ImageSequenceRequest` dataclass; `export_image_sequence(request, progress_cb, status_cb)` writes one PNG per frame via PIL. Two iteration paths: in-memory channels (T-only, recipe-applied) or `LazyND2Volume` (M × T × Z, raw — no recipe). Reuses `_composite_frame` and `_draw_overlays` so the colour pipeline matches movie exports byte-for-byte |
+| `exporters/split_exporter.py` (V1.72) | Split-by-axis export. `SplitExportSpec` (per-axis `split_m/t/z/c` + `write_tiff/png/movie` flags, `z_mode`, `bit_depth`, `lut_mode` = auto/manual/full); `export_split(volume, spec, colors, enabled, lut_settings, image_adjustments, movie_options, pixel_size_um, frame_timestamps_s, crop_rect, progress_cb, status_cb) -> List[str]` writes one file per cartesian combination of the *split* axes' indices (kept axes bundled per file) by delegating to `export_tiff_hyperstack` / `_composite_frame`+`_draw_overlays` / `export_movie`. Kept M >1 is flattened into the frames axis (ImageJ has no M dim); kept Z >1 is max-projected for movies. `_effective_contrast(lut_mode, names, viewer_lut, dtype_max)` → composite LUT + TIFF `lut_bounds`; `_dtype_max` = integer full-scale. `plan_split_export(...)` = pure counts/description for the dialog summary; `_axis_groups(n, split)` = `[[i]…]` vs `[[0..n-1]]`. Pure backend (no PySide6); split flags normalized against real dims |
 | `analysis/manual_mask.py` (V1.30, V1.31 per-Z shapes, **V1.40 Custom Mask Creator**) | `ManualMaskPipeline` (registered name `"Mask Analysis"`; renamed from `"Manual Mask"` in V1.40) — rasterizes user-drawn shapes *and* auto-tiled rectangular strips into a `(T, H, W)` int32 label stack. **V1.40**: new `tiled_masks` hidden param (list of `{shape_type, direction, height_px, width_px, x_offset_px, start_offset_px}` dicts); `generate_tiled_label_boxes(tiled_masks, H, W)` returns `(y0,y1,x0,x1)` tuples for every *complete* strip (partial strips at the image boundary are excluded); `generate_tiled_mask(tiled_masks, H, W)` returns a `(H,W)` int32 overlay array for live preview. In `run()` tiled strips receive stable IDs 1..N across all frames so each strip is the same measurement object at every timepoint; hand-drawn shapes are assigned IDs N+1, N+2, … per frame. `rasterize_shapes()` gains a `label_offset` kwarg so the drawing overlay uses the same stable offset. `AnalysisPage` stores `_tiled_masks: List[Dict]` (persisted to `ND2StudiosRecord.tiled_mask_specs`), exposes a **Custom Mask Creator** `QGroupBox` (shape type, direction, strip height, optional custom width+x-offset, start offset, Generate/Clear buttons), and extends `_composite_overlay()` to paint tiled strips below drawn shapes in the live preview |
 | `analysis/nuclei_segmentation.py` (V1.19, GPU flag V1.39) | `NucleiSegmentationPipeline` — Cellpose 3 per-frame 2D segmentation. Optional dep (`pip install cellpose`); raises `ImportError` with install message when absent. Uses `skimage.measure.regionprops` for per-object measurements. Registered via `@AnalysisPipeline.register`. **V1.39 Phase 7**: `models.Cellpose(gpu=is_gpu_enabled())` honours the runtime `compute.gpu` flag — Cellpose owns its own CUDA initialization; we only forward the boolean |
 | `analysis/stardist_segmentation.py` (V1.45) | `StarDistSegmentationPipeline` — per-frame 2D StarDist instance segmentation (ported from CellTracker; its only segmentation method). Optional dep (`pip install stardist tensorflow csbdeep`); raises `ImportError` when absent. Mirrors the Cellpose node: `is_gpu_enabled()` → `disable_gpu`, per-frame via `plane_runner.run_planes_to_labels(n_workers=1)`, area filter + contiguous relabel in one `O(pixels)` pass via `source_utils.filter_and_relabel` (np.bincount + LUT — replaced the old per-object full-frame `mask[mask==label]` / `_relabel_contiguous` loops), `AnalysisResult(..., overlay_outline=params["outline"])`. When `outline` is on the result also sets `overlay_color=(255,50,50)` + `overlay_alpha=1.0` so `_overlay_labels` paints every `find_boundaries(mode="outer")` pixel in that exact colour at full opacity — byte-for-byte CellTracker's boundary rendering. Params: `channel_name`, `model_name` (`2D_versatile_fluo`/`_he`/`_paper_dsb2018`), `prob_thresh`, `nms_thresh`, `scale`, `min_area`/`max_area`, `outline`. Backend is the vendored `backend/celltracker/segmentation.py` (`get_stardist_model`, `segment_frame`, `_ensure_tf_threading` — TF pinned to a single inter/intra-op thread exactly as CellTracker's repo does, which is ~10× faster than multi-threaded for StarDist's tiled inference; Windows csbdeep-symlink patch; GPU flag honored by clearing `CUDA_VISIBLE_DEVICES` before the first TF import) |
@@ -937,6 +1338,109 @@ the full-res materialized `set_channels`. For consistency
 `_processed_channels_for_m` also registers the full frame before cropping a cropped
 Run (register → crop). This is **preview-only** — a resumed Run stays full-frame.
 
+### Save Data + Crop nodes (V1.71)
+
+Two **special** pass-through pipeline-graph nodes (both `PortType.ANY` in/out, so
+they wire *upstream* of analysis and get no rainbow channel port; specs +
+`param_specs_for` in `registry_adapter.py`, dispatch + handlers in
+`pages/pipelines_page.py`).
+
+- **Save Data** (`SPECIAL_SAVE_DATA_OP_KEY = "special:save_data"`, HEXAGON) —
+  `_run_save_data` writes the dataset *as it is at this node* to a chosen folder:
+  one multi-channel ImageJ TZCYX TIFF hyperstack per multipoint (reusing
+  `backend/exporters/tiff_exporter.export_tiff_hyperstack`, which accepts both
+  `(T,H,W)` and `(T,Z,H,W)`) or a compressed NPZ. The `data` param chooses the Z
+  handling: **`Full Z-stack (raw voxels)`** (default) reads every Z plane via the
+  new `_zstack_channels_for_m` helper (`vol.get_volume` per `(c,m,t)` — the same
+  read path DVC / 3D-mask nodes use — registration applied per-Z, XY crop),
+  producing `(T,Z,H,W)` with no enhancement recipe (the recipe is a 2-D
+  projection operation); `Z-projection (recipe-processed)` uses
+  `_processed_channels_for_m` (recipe + registration + crop, `(T,H,W)`);
+  `Z-projection (raw)` uses `_materialize_channels_for_m` (registration + crop).
+  `all_multipoints` (default on) saves every M — one file per M
+  (`pipeline_data_M01.tif`, …) — preserving the M axis; else the viewed M. All
+  three helpers route through `_crop_rect()`, so a Save Data node downstream of a
+  Crop node automatically saves the cropped data. Loaders without a `get_volume`
+  fall back to the raw Z-projection. A pass-through: the run continues after it.
+
+  **Metadata / architecture conservation.** Each TIFF embeds the ND2's
+  calibration via `_save_data_calibration` → the extended
+  `export_tiff_hyperstack(pixel_size_um, z_step_um, finterval_s)`: XY pixel size
+  (TIFF resolution), Z-step (ImageJ `spacing` = axial voxel depth — previously
+  `spacing` was mis-set to the XY pixel size), and frame interval (ImageJ
+  `finterval`, median of `frame_timestamps_s`). A sidecar
+  `pipeline_data_metadata.json` (`_write_save_data_sidecar`) records the full
+  architecture (T, M, C, Z, H, W), channel names + display, calibration, the
+  applied crop rect, and the M→file mapping. The Crop node is XY-only, so
+  T/M/C/Z and the pixel/Z/T calibration are conserved under a crop (only H/W
+  shrink); the sidecar records the crop origin for coordinate recovery.
+- **Crop** (`SPECIAL_CROP_OP_KEY = "special:crop"`, HEXAGON, *manual mode only*) —
+  the rectangle is picked via the popup's **"Pick crop region…"** edit button
+  (`_edit_crop_region` → reuses `_show_preview_crop_dialog`; stored in the hidden
+  `rect` param as `(x,y,w,h)` raw-image px by `_set_crop_region`). On a Run,
+  `_run_crop` publishes `record._pipeline_crop = (x,y,w,h)`, which
+  `_pipeline_crop_rect()` feeds as a **third term** into `_crop_rect()` /
+  `_effective_run_crop()` (intersected with the preview + registration crops via
+  `_intersect_crop_rects`) — the same crop chokepoint the preview/registration
+  crops use, so every downstream node (analysis, tracking, export, Save Data) and
+  the viewer read the cropped image with no per-node changes. `_run_crop` also
+  updates `_run_results_crop = _crop_rect()` (the geometry the overlay guard
+  `_overlay_result_for`/`_label_stack_for_m` compares) so the freshly committed
+  crop-sized downstream masks aren't suppressed as a geometry mismatch, and
+  redraws the base image. `record._pipeline_crop` is reset to `None` at each Run
+  start alongside `record._registration_crop`; `pixel_size_um` is preserved (only
+  H/W shrink — `_preview_metadata` reports the crop dims). The standalone
+  V1.46 preview-crop tool is unchanged and still covers interactive/preview
+  cropping.
+- **Exclude** (`SPECIAL_EXCLUDE_OP_KEY = "special:exclude"`, HEXAGON, red like
+  Dismiss) — V1.75. The **inverse** of the Frame/Object scope lever: wire a
+  region-producing node (`special:mask3d` / `special:granule_mask`) **into** it and
+  every downstream analysis **ignores** the voxels inside that region (all Z / M /
+  T). Same "publish on `record`, consume at a chokepoint" mechanism as Crop, but the
+  artifact is a boolean volume, not a rect: `_resolve_run_exclusions()` (called from
+  `_on_run` **before** the walk) builds `record._exclude_by_m = {m:(Z,H,W) bool}` by
+  unioning each Exclude node's wired region — 3-D-mask sources **rasterized up front**
+  from the drawn shapes (`_build_mask3d_by_m`, extracted from `_run_mask3d_node`) so
+  exclusion is **order-independent** (the Exclude branch is independent of the
+  analysis branch). The shared analysis reads then zero the excluded voxels:
+  `_apply_exclusion_channels` in `_processed_channels_for_m` (all `AnalysisPipeline`
+  nodes; `(Z,H,W)`→`(H,W)` footprint via `.any(axis=0)`, sliced to `_crop_rect()`) and
+  `_materialize_channels_for_m` (Spatial Maps), and `_DVCJob._read_volume`
+  (`exclude_by_m=`, zeroed after the rect crop, per-object aligned). `_run_exclude`
+  is a pass-through that re-resolves in-walk (catches a granule source that finished
+  earlier in the Run). Deliberately **not** applied to Save Data / Export (they write
+  the real image); tracking is covered transitively. `record._exclude_by_m` is reset
+  each Run start. Follow-ons: analysis-label / tracked-object sources, a viewer
+  overlay of the excluded footprint.
+- **Prism** (`SPECIAL_PRISM_OP_KEY = "special:prism"`, `ShapeKind.GEM`, orange) — V1.77.
+  A 2.5D faceted-gem channel splicer / overlay converger. Ports copy the Registration
+  recipe (`IMAGE` in, `ANY` out) so it gains rainbow `ch_in`/`ch_out`. Fed a channel via
+  its rainbow port, its `channel_op` param **add / remove / replace**s the analysis
+  channels flowing downstream — implemented purely in `executor.channel_sets` (which now
+  splits each node's incoming into structural vs rainbow-channel contributions and applies
+  the Prism directive; every non-Prism node stays the plain union). On a **view-only
+  (dotted) edge** it instead converges that channel into a downstream node as a
+  viewer-only overlay. **View-only edges** (`edge.params["view_only"]`,
+  `model.edge_view_only`/`set_edge_view_only`, toggled by clicking the wire →
+  `node_scene.toggle_edge_view_only`, drawn dotted in `edge_item`) are **skipped by
+  `channel_sets`** (so they never enter analysis or propagate as analysis channels — the
+  guarantee that a view-only channel can't confuse an analysis pipeline) and instead flow
+  through the new **`executor.display_channel_sets`** to the viewers. `node_scene._try_connect`
+  keeps the legacy one-wire-per-port replace for normal nodes but lets a **DVC** input port
+  take a second convergent wire as a view-only overlay (so `Granule Mask → DVC` and
+  `Prism → DVC` **reconverge** on DVC) — the object-producing source stays the analysis wire
+  regardless of wiring order; `structural_edge_into_port` prefers the analysis wire for
+  recipe/run linearization, and `_apply_edge_scope_lever` hides the scope pill on view-only
+  edges. `_run_prism` (pass-through)
+  publishes `record._prism_overlay_by_m = {m: {channel, channel_idx, shell, render}}`; the
+  `shell` is the union of the granule boundary bands (`record._granule_bands_by_m` combined
+  labels > 0 — the volume between the volume-mask and boundary-extraction boundaries) when a
+  Granule Boundary node is upstream. `_populate_dvc_panel` wraps the DVC `context_provider`
+  to clip the overlay channel to the shell and `DVCPanel.set_context_default` auto-selects
+  it as the surrounding-channel overlay (`_CONTEXT_MODES` iso/volume/mip). Reset each Run
+  start. Follow-ons: per-gid shell tied to the DVC object selector; view-only overlays for
+  non-DVC viewers.
+
 ### `workers/`
 
 | File | Purpose |
@@ -944,7 +1448,7 @@ Run (register → crop). This is **preview-only** — a resumed Run stays full-f
 | `base_worker.py` | `BaseWorker(QThread)` with `progress(int)`, `status(str)`, `finished(object)`, `error(str)` signals and `cancel()` |
 | `load_worker.py` | `LoadWorker` — opens an ND2 (extended metadata + lazy channels) or TIFF (single-channel TYX) file off the GUI thread |
 | `recipe_worker.py` | `RecipeWorker` — applies an ordered recipe to each channel; lazy proxies are materialized once per channel; optional frame-mean normalization first |
-| `export_worker.py` | `ExportRequest` dataclass + `ExportWorker` dispatching to `tiff_stack`, `tiff_zstack`, `rgb_composite`, `movie`, or `image_sequence` (V1.32) mode. `ExportRequest` carries an optional `image_adjustments: ImageAdjustments` shared across modes, plus `basename` / `iterate_volume` / `z_mode` / `z_view_index` for image-sequence jobs |
+| `export_worker.py` | `ExportRequest` dataclass + `ExportWorker` dispatching to `tiff_stack`, `tiff_zstack`, `rgb_composite`, `movie`, `image_sequence` (V1.32), or `split` (V1.72) mode. `ExportRequest` carries an optional `image_adjustments: ImageAdjustments` shared across modes, plus `basename` / `iterate_volume` / `z_mode` / `z_view_index` for image-sequence jobs, and `split_spec: SplitExportSpec` for the split-by-axis job (`_export_split` → `backend/exporters/split_exporter.export_split`) |
 | `stitch_worker.py` (V1.1 → V1.54) | `StitchRequest` (volume + `stage_xy_um` + `StitchConfig` + m/channel indices + filepath) + `StitchWorker` wrapping `backend.stitch.run_stitch` with progress / status; exposes `.result` (`StitchResult`: out_path, regime, engine, canvas, positions, QC paths) |
 | `analysis_worker.py` (V1.19, deprecated V1.37) | `AnalysisWorker(BaseWorker)` — runs any `AnalysisPipeline.run()` in a background thread; passes `progress_cb` and `cancelled_cb` (Qt-free lambda). **Deprecated** in V1.37: new analysis code submits `PipelinePreviewJob` / `PipelineCommitJob` to the project-wide `JobRunner` (see `compute/`). Kept for `BatchWorker` and any out-of-tree callers |
 | `batch_worker.py` (V1.23) | `BatchWorker(BaseWorker)` — sequential per-file pipeline runner. Extra signal `file_done(int, int)`. For each file: calls `LoadWorker.run_task()` → `RecipeWorker.run_task()` → `pipeline.run()` → `results_engine.compute_measurements()` synchronously within the thread. Errors per file are caught and reported without aborting. Writes `batch_results.csv` to output dir at end |

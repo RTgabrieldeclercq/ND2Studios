@@ -27,8 +27,8 @@ from nd2studios.utils.progress import FrameProgress
 @dataclass
 class ExportRequest:
     """Description of one export job."""
-    mode: str                       # "tiff_stack" | "tiff_zstack" | "rgb_composite" | "movie" | "image_sequence"
-    filepath: str                   # output file (or directory, for image_sequence)
+    mode: str                       # "tiff_stack" | "tiff_zstack" | "rgb_composite" | "movie" | "image_sequence" | "split"
+    filepath: str                   # output file (or directory, for image_sequence / split)
     channels: Dict[str, np.ndarray] = field(default_factory=dict)
     colors: Dict[str, Tuple[int, int, int]] = field(default_factory=dict)
     enabled: Dict[str, bool] = field(default_factory=dict)
@@ -53,6 +53,8 @@ class ExportRequest:
     iterate_volume: bool = False      # if True and raw_volume set, iterate (M, T, Z)
     z_mode: str = "none"
     z_view_index: int = 0
+    # split mode only — a SplitExportSpec (backend.exporters.split_exporter).
+    split_spec: Optional[Any] = None
 
 
 class ExportWorker(BaseWorker):
@@ -74,6 +76,8 @@ class ExportWorker(BaseWorker):
             return self._export_movie(req)
         if req.mode == "image_sequence":
             return self._export_image_sequence(req)
+        if req.mode == "split":
+            return self._export_split(req)
         raise ValueError(f"Unknown export mode: {req.mode}")
 
     def _export_tiff_stack(self, req: ExportRequest) -> str:
@@ -220,3 +224,27 @@ class ExportWorker(BaseWorker):
             progress_cb=self.set_progress,
             status_cb=self.set_status,
         )
+
+    def _export_split(self, req: ExportRequest) -> str:
+        """Split the (cropped) volume along M/T/Z/C into multiple files."""
+        from nd2studios.backend.exporters.split_exporter import export_split
+
+        spec = req.split_spec
+        if spec is None or req.raw_volume is None:
+            raise ValueError("split export: missing split_spec or raw_volume")
+
+        paths = export_split(
+            volume=req.raw_volume,
+            spec=spec,
+            colors=req.colors,
+            enabled=req.enabled,
+            lut_settings=req.lut_settings or None,
+            image_adjustments=req.image_adjustments,
+            movie_options=req.movie_options or MovieOptions(),
+            pixel_size_um=req.pixel_size_um,
+            frame_timestamps_s=req.frame_timestamps_s,
+            crop_rect=req.crop_rect,
+            progress_cb=self.set_progress,
+            status_cb=self.set_status,
+        )
+        return f"{len(paths)} file(s) → {spec.output_dir}"

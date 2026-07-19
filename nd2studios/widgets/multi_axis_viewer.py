@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 from nd2studios.backend.materialized_dataset import MaterializedDataset
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.frame_strip import FrameStrip
-from nd2studios.widgets.icon_button import bind_toggle_icon, icon_button
+from nd2studios.widgets.icon_button import bind_toggle_icon, icon_button, scale_qss, scaled
 from nd2studios.widgets.image_viewer import (
     CHANNEL_COLORS, ImageCanvas, ZoomToolbar,
 )
@@ -88,7 +88,7 @@ class ChannelChip(QWidget):
         self.combo_color.addItems(list(CHANNEL_COLORS.keys()))
         if color_default in CHANNEL_COLORS:
             self.combo_color.setCurrentText(color_default)
-        self.combo_color.setFixedWidth(86)
+        self.combo_color.setFixedWidth(scaled(86))
         self.combo_color.currentTextChanged.connect(
             lambda _t: self.state_changed.emit())
         layout.addWidget(self.combo_color)
@@ -390,7 +390,7 @@ class MultiAxisViewer(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(4)
         lbl = QLabel(label + ":")
-        lbl.setFixedWidth(20)
+        lbl.setFixedWidth(scaled(20))
         lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         row.addWidget(lbl)
         # V1.43 — NIS-Elements-style rectangular tile strip is the visible
@@ -412,18 +412,18 @@ class MultiAxisViewer(QWidget):
         info_edit = QLineEdit("1")
         info_edit.setObjectName("axisFrameEdit")
         info_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        info_edit.setFixedWidth(36)
-        info_edit.setFixedHeight(26)
+        info_edit.setFixedWidth(scaled(36))
+        info_edit.setFixedHeight(scaled(26))
         info_edit.setToolTip("Current frame — type a number and press Enter to jump")
         row.addWidget(info_edit)
         # Static total — same font size as the counter and vertically centred
         # to its height so "/N" reads cleanly next to the current frame (V1.44).
         info_total = QLabel("/1")
-        info_total.setFixedWidth(30)
-        info_total.setFixedHeight(26)
+        info_total.setFixedWidth(scaled(30))
+        info_total.setFixedHeight(scaled(26))
         info_total.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        info_total.setStyleSheet(
-            f"color: {Settings.FG_SECONDARY}; font: 10pt 'Helvetica Neue';")
+        info_total.setStyleSheet(scale_qss(
+            f"color: {Settings.FG_SECONDARY}; font: 10pt 'Helvetica Neue';"))
         row.addWidget(info_total)
         play_btn = icon_button("fa5s.play", f"Play / pause {label} axis",
                                checkable=True, object_name="playBtn",
@@ -436,7 +436,7 @@ class MultiAxisViewer(QWidget):
         fps_spin.setValue(5.0)
         fps_spin.setSingleStep(0.5)
         fps_spin.setSuffix(" fps")
-        fps_spin.setFixedWidth(72)
+        fps_spin.setFixedWidth(scaled(72))
         fps_spin.setToolTip("Playback speed")
         fps_spin.setSizePolicy(fps_spin.sizePolicy().horizontalPolicy(),
                                QSizePolicy.Policy.Fixed)
@@ -1000,8 +1000,8 @@ class MultiAxisViewer(QWidget):
                 except Exception:
                     continue
                 f_2d = self._normalize_to_2d(f)
-                if f_2d is None:
-                    continue
+                if f_2d is None or f_2d.size == 0:
+                    continue  # skip degenerate (e.g. zero-size crop) frames
                 samples.append(f_2d.ravel())
                 last_shape = f_2d.shape
             if not samples or last_shape is None:

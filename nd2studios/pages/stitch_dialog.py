@@ -41,6 +41,7 @@ from nd2studios.backend.stitch.config import (
 )
 from nd2studios.backend.nd2_volume import LazyND2Volume
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled
 from nd2studios.widgets.tile_layout import TileLayoutWidget
 from nd2studios.workers.stitch_worker import StitchRequest, StitchWorker
 
@@ -77,7 +78,7 @@ class StitchDialog(QDialog):
                  parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("Stitch M positions")
-        self.setMinimumSize(680, 760)
+        self.setMinimumSize(scaled(680), scaled(760))
 
         self.volume = volume
         self.stage_xy_um = list(stage_xy_um or [])
@@ -120,7 +121,7 @@ class StitchDialog(QDialog):
         bulk_row.addWidget(btn_none)
         bulk_row.addStretch(1)
         self.lbl_summary = QLabel("")
-        self.lbl_summary.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_summary.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         bulk_row.addWidget(self.lbl_summary)
         lg_layout.addLayout(bulk_row)
         layout.addWidget(layout_group)
@@ -143,7 +144,7 @@ class StitchDialog(QDialog):
         self.lbl_stitch_hint = QLabel(
             "Auto detects overlap from stage coordinates: overlapping tiles are "
             "registered, non-overlapping tiles placed by coordinates.")
-        self.lbl_stitch_hint.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_stitch_hint.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         self.lbl_stitch_hint.setWordWrap(True)
         sform.addRow(self.lbl_stitch_hint)
         layout.addWidget(stitch_group)
@@ -171,7 +172,7 @@ class StitchDialog(QDialog):
         z_form.addRow("Z mode", self.combo_z)
         z_outer.addLayout(z_form)
         self.lbl_z_hint = QLabel("")
-        self.lbl_z_hint.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_z_hint.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         self.lbl_z_hint.setWordWrap(True)
         z_outer.addWidget(self.lbl_z_hint)
         layout.addWidget(z_group)
@@ -182,7 +183,7 @@ class StitchDialog(QDialog):
         out_group = QGroupBox("Output (pyramidal OME-TIFF)")
         out_form = QHBoxLayout(out_group)
         self.lbl_out = QLabel("(no path chosen)")
-        self.lbl_out.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_out.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         out_form.addWidget(self.lbl_out, stretch=1)
         btn_browse = QPushButton("Browse…")
         btn_browse.clicked.connect(self._browse)

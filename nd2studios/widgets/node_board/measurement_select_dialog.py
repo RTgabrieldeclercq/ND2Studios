@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from nd2studios.core.settings import Settings
-from nd2studios.widgets.icon_button import scaled
+from nd2studios.widgets.icon_button import scaled, scale_qss
 
 # (group, [(metric_key, label)]). ``mean_intensity`` / ``std_intensity`` are
 # group tokens that apply to every channel.
@@ -86,7 +86,7 @@ class MeasurementSelectDialog(QDialog):
             "metrics are computed — fewer metrics run faster. The analysis is not "
             "re-run; measurements come from the existing segmentation.")
         intro.setWordWrap(True)
-        intro.setStyleSheet(f"color:{Settings.FG_SECONDARY}; font:9pt;")
+        intro.setStyleSheet(scale_qss(f"color:{Settings.FG_SECONDARY}; font:9pt;"))
         outer.addWidget(intro)
 
         # Select-all / none.
@@ -108,14 +108,14 @@ class MeasurementSelectDialog(QDialog):
         for group, items in METRIC_GROUPS:
             frame = QFrame()
             frame.setObjectName("metricGroup")
-            frame.setStyleSheet(
+            frame.setStyleSheet(scale_qss(
                 f"#metricGroup{{border:1px solid {Settings.BORDER_COLOR};"
-                f"border-radius:6px;background:{Settings.BG_SECONDARY};}}")
+                f"border-radius:6px;background:{Settings.BG_SECONDARY};}}"))
             gl = QVBoxLayout(frame)
             gl.setContentsMargins(10, 8, 10, 8)
             gl.setSpacing(4)
             head = QLabel(group)
-            head.setStyleSheet(f"color:{Settings.ACCENT_GREEN}; font:bold 9.5pt;")
+            head.setStyleSheet(scale_qss(f"color:{Settings.ACCENT_GREEN}; font:bold 9.5pt;"))
             gl.addWidget(head)
             grid = QGridLayout()
             grid.setHorizontalSpacing(16)

@@ -32,7 +32,7 @@ from nd2studios.pipeline_graph.conditions import (  # noqa: E402
 )
 from nd2studios.backend.object_tracker import link_objects  # noqa: E402
 from nd2studios.pipeline_graph.io import (  # noqa: E402
-    _migrate_v1_to_v2, _migrate_v2_to_v3,
+    PIPELINE_VERSION, _migrate_v1_to_v2, _migrate_v2_to_v3, _migrate_to_connected,
 )
 from nd2studios.pipeline_graph.registry_adapter import (  # noqa: E402
     INPUT_OP_KEY, OUTPUT_OP_KEY, SPECIAL_DISMISS_OP_KEY, SPECIAL_REVIEW_OP_KEY,
@@ -162,7 +162,8 @@ def main() -> int:
         "st_mode", "st_n_neighbors", "st_n_neighbors_min", "st_solver",
         "st_loc_solver", "st_smoothness", "st_outlier_threshold", "st_max_iter",
         "st_iter_stop_threshold", "st_dist_missing", "st_use_prev_results",
-        "ct_n_neighbors", "ct_topo_weight", "ct_area_weight", "ct_max_gap"}, track.params
+        "ct_n_neighbors", "ct_topo_weight", "ct_area_weight", "ct_max_gap",
+        "ct_min_iou"}, track.params
     st_specs = {s.name: s for s in param_specs_for(SPECIAL_TRACK_OP_KEY)}
     method_choices = st_specs["method"].choices
     assert "SerialTrack (topology PTV)" in method_choices
@@ -171,7 +172,7 @@ def main() -> int:
     # The ADMM global solver is routed in as a SerialTrack option.
     assert set(st_specs["st_solver"].choices) == {"MLS", "Regularization", "ADMM"}
     # CellTracker supportive special nodes: Metrics augments rows; Field Maps
-    # renders Eulerian heatmaps. Both carry flat params (no custom editor).
+    # renders Eulerian heatmaps via a template library (custom editor).
     from nd2studios.pipeline_graph.registry_adapter import (
         SPECIAL_CT_METRICS_OP_KEY, SPECIAL_CT_FIELDS_OP_KEY,
     )
@@ -179,7 +180,7 @@ def main() -> int:
     ctm = build_node(sp[SPECIAL_CT_METRICS_OP_KEY])
     assert set(ctm.params) == {"n_neighbors", "intensity_channel"}, ctm.params
     ctf = build_node(sp[SPECIAL_CT_FIELDS_OP_KEY])
-    assert "field" in ctf.params and "grid_step" in ctf.params, ctf.params
+    assert "templates" in ctf.params, ctf.params
     # Review Objects (was "Review Object") carries a 'mode' choice.
     assert sp[SPECIAL_REVIEW_OP_KEY].title == "Review Objects"
     review = build_node(sp[SPECIAL_REVIEW_OP_KEY])
@@ -256,6 +257,45 @@ def main() -> int:
     assert mig3.analysis.nodes["rv"].title == "Review Objects"
     assert mig3.analysis.nodes["rv"].params.get("mode") == "Single objects"
     print("[ok] io v2->v3 migration: Validate->Track, Review Object->Review Objects")
+
+    # 12c. io -> v6 (V1.61): the two sub-tabs merge into ONE connected chain. The
+    # Processing slice folds into the merged slice; the Processing-OUTPUT and
+    # Analysis-INPUT bridge nodes are dropped and the processing tail is wired
+    # directly to the analysis head.
+    two = PipelineDoc.empty()
+    pin = _make_input(two.processing)
+    pblur = _make_action(two.processing, "Gaussian Blur", {"sigma": 1.0})
+    pout = _make_output(two.processing, "Processing #1")
+    _wire(two.processing, pin, pblur)
+    _wire(two.processing, pblur, pout)
+    ain = build_node(analysis_input_spec()); ain.id = "ain6"
+    two.analysis.add_node(ain)
+    ahead = Node(id="ahead", stage=Stage.ANALYSIS, role=NodeRole.ACTION,
+                 op_key="analysis:Test", title="AnaTest",
+                 inputs=[Port(new_id("p"), "img", PortType.IMAGE, True)],
+                 outputs=[Port(new_id("p"), "mask", PortType.BINARY, False)])
+    two.analysis.add_node(ahead)
+    two.analysis.add_edge(Edge(new_id("e"), "ain6", ain.outputs[0].id,
+                               "ahead", ahead.inputs[0].id))
+    mig6 = _migrate_to_connected(two)
+    assert "ain6" not in mig6.analysis.nodes, "analysis input bridge dropped"
+    assert pout.id not in mig6.analysis.nodes, "processing output bridge dropped"
+    assert len(mig6.processing.nodes) == 0, "processing slice emptied"
+    assert any(e.src_node == pblur.id and e.dst_node == "ahead"
+               for e in mig6.analysis.edges.values()), "tail wired to analysis head"
+    assert mig6.analysis.nodes[pblur.id].stage is Stage.PROCESSING, "stage kept"
+    assert recipe_for_node(mig6.analysis, pblur.id) == [
+        ("Gaussian Blur", {"sigma": 1.0})], "recipe still linearizes from the tail"
+    assert mig6.schema_version == PIPELINE_VERSION == 6
+    print("[ok] io -> v6 migration: one connected chain (bridge nodes dropped)")
+
+    # 12d. Full save/load of the connected doc round-trips at v6.
+    path6 = os.path.join(tempfile.gettempdir(), "selftest_v6.nd2s_pipeline.json")
+    save_pipeline(path6, mig6, name="v6")
+    mig6b = load_pipeline(path6)
+    os.remove(path6)
+    assert mig6b.to_dict() == mig6.to_dict(), "v6 round-trip mismatch"
+    print("[ok] v6 round-trip (connected chain)")
 
     # 13. Condition model (Phase 2): build, round-trip, evaluate, describe.
     cond = Condition("ALL", [

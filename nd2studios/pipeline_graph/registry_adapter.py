@@ -18,6 +18,13 @@ from typing import Any, Dict, List
 
 from nd2studios.core.analysis_registry import AnalysisPipeline
 from nd2studios.core.plugin_registry import ParamSpec, PluginBase
+from nd2studios.pipeline_graph.granule_ops import (
+    SPECIAL_BEAD_DETECT_OP_KEY,
+    SPECIAL_GRANULE_BOUNDARY_OP_KEY,
+    SPECIAL_GRANULE_CLUSTER_OP_KEY,
+    SPECIAL_GRANULE_MASK_OP_KEY,
+    SPECIAL_GRANULE_TESSELLATE_OP_KEY,
+)
 from nd2studios.pipeline_graph.model import (
     Node, NodeCategory, NodeRole, Port, PortType, ShapeKind, Stage,
     category_for_stage, new_id,
@@ -45,6 +52,25 @@ SPECIAL_DISMISS_OP_KEY = "special:dismiss"
 SPECIAL_EXPORT_OP_KEY = "special:export"
 SPECIAL_SEND_RESULTS_OP_KEY = "special:send_to_results"
 SPECIAL_PAUSE_OP_KEY = "special:pause"
+# Save Data (V1.71) — a pass-through node that writes the dataset *as it is at
+# this point in the pipeline* (recipe + registration + any upstream crop applied)
+# to disk (TIFF hyperstack / NPZ) when a Run reaches it, then passes the stream
+# through unchanged so it can sit mid-pipeline.
+SPECIAL_SAVE_DATA_OP_KEY = "special:save_data"
+# Crop (V1.71, manual mode only) — a pass-through node that applies a user-picked
+# rectangular crop to every downstream node. Like the Registration "crop to
+# common region", it publishes the rect (record._pipeline_crop) where the page's
+# _crop_rect() composition reads it, so the whole downstream pipeline sees the
+# cropped image with no per-node changes.
+SPECIAL_CROP_OP_KEY = "special:crop"
+# Exclude (V1.75) — a pass-through node that marks a wired region (a 3D Mask
+# Drawing / Granule Volume Mask object) as "ignore": every downstream analysis
+# node skips the voxels inside it, across all Z / M / T. The inverse of the V1.68
+# Frame/Object scope lever (which crops analysis TO an object). Like the Crop
+# node it publishes a record side-artifact (record._exclude_by_m, a per-M (Z,H,W)
+# boolean volume) that the page's shared image-read chokepoints zero out, so the
+# whole downstream pipeline honours it with no per-node changes.
+SPECIAL_EXCLUDE_OP_KEY = "special:exclude"
 # CellTracker-derived analyses (V1.45) — supportive nodes for cell-tracking
 # pipelines. Metrics augments tracked rows with per-cell columns; Field Maps
 # renders Eulerian gridded heatmaps to image files.
@@ -66,6 +92,41 @@ SPECIAL_DVC_OP_KEY = "special:dvc"
 # reference channel and applied to all channels (register once, apply to all),
 # then results (before/after + drift plot) open in the Registration viewer tab.
 SPECIAL_REGISTER_OP_KEY = "special:register"
+# 3D Mask Drawing (V1.65) — like DVC/Registration, takes an IMAGE (rainbow channel
+# wiring): the user draws/edits a 3D object mask over the wired channel's raw
+# (Z,H,W) volume (per-Z shapes, propagate-across-Z, or threshold-seed + edit). It
+# emits a BINARY output so the drawn mask can feed analysis / DVC-render nodes. The
+# drawn shapes live in node.params['mask_shapes'] (hidden); Run rasterizes them into
+# a (Z,H,W) boolean volume per (m,t). Phase 1 of the DVC-on-object feature.
+SPECIAL_MASK3D_OP_KEY = "special:mask3d"
+# 2D Digital Image Correlation (V1.77) — pyALDIC (the optional 'al-dic' package):
+# the 2D sibling of the DVC node. Like DVC, a Special node with an IMAGE input
+# (rainbow channel wiring) that reads the wired channel's frames, correlates them
+# with the al-dic AL-DIC solver off-thread and opens its own "DIC" viewer tab
+# (a 2D DVCResult series rendered by the reused DVCPanel). Terminal (no output).
+SPECIAL_DIC_OP_KEY = "special:dic"
+# DIC Mesh Region (V1.77) — reproduces pyALDIC's ROI toolbar: draw the mesh domain
+# (rectangle / polygon / circle, Add/Cut, Refine Brush, Invert/Clear). A pass-through
+# (IMAGE in → ANY out) wired UPSTREAM of the DIC node; on Run it rasterizes the drawn
+# shapes into a boolean ROI mask published to record._dic_roi_by_m, which the DIC job
+# uses as the AL-DIC mesh domain. Shapes live in node.params['roi_shapes'] (hidden).
+SPECIAL_DIC_ROI_OP_KEY = "special:dic_roi"
+# DIC Mesh Refinement (V1.77) — pyALDIC's adaptive-quadtree workflow: paint a brush
+# region + pick refinement criteria (mask boundary / ROI edge / brush). A pass-through
+# wired UPSTREAM of the DIC node; on Run it publishes record._dic_refine_by_m, which
+# the DIC job turns into an al-dic RefinementPolicy. Brush lives in
+# node.params['brush_shapes'] (hidden).
+SPECIAL_DIC_REFINE_OP_KEY = "special:dic_refine"
+# Prism (V1.77) — a channel splicer / overlay converger, rendered as a 2.5D faceted
+# gem (``ShapeKind.GEM``). Like DVC/Registration/Mask3D it takes an IMAGE (so it grows
+# rainbow channel ports) and emits ANY (so it wires UPSTREAM of DVC / analysis, e.g.
+# input → … → Prism → DVC). Fed a channel via its rainbow port, it can **add / remove /
+# replace** the analysis channels flowing downstream (``channel_op`` param), and — on a
+# **view-only** (dotted) outgoing edge — **converge that channel into another node as a
+# viewer-only overlay** (never into analysis). Its flagship use converges a granule
+# boundary channel into DVC as a volumetric overlay clipped to the shell between the
+# volume-mask boundary and the boundary-extraction boundary.
+SPECIAL_PRISM_OP_KEY = "special:prism"
 # Checkpoint (V1.53) — a white pass-through node that freezes everything computed
 # upstream (analysis label masks, measurement rows, tracks) on a Run. A later Run
 # whose upstream graph is unchanged resumes *from* the checkpoint with the frozen
@@ -73,6 +134,15 @@ SPECIAL_REGISTER_OP_KEY = "special:register"
 # re-runs — the user iterates on the downstream pipeline instantly. Ports are
 # wildcard (ANY) so it accepts any upstream and passes it through.
 SPECIAL_CHECKPOINT_OP_KEY = "special:checkpoint"
+# DVC Checkpoint (V1.76) — a portable, self-contained *input* node created only by the
+# DVC viewer's Import flow (NOT offered in the Add dialog — an empty one is
+# meaningless). It carries a reloaded ``.nd2dvc`` bundle (every multipoint's DVCResult
+# series, backdrops, masks and per-granule bundles) via ``params["bundle_path"]`` plus
+# a read-only ``params["provenance"]`` record (how the field was produced). On import /
+# pipeline-load it re-publishes the saved field to the DVC viewer with NO Run. Modelled
+# on the white Checkpoint node (``NodeCategory.CHECKPOINT``); DVC is terminal, so it has
+# no input and no output ports (a pure source that drives the viewer).
+SPECIAL_DVC_CHECKPOINT_OP_KEY = "special:dvc_checkpoint"
 # Channel source nodes (V1.48) — one per loaded channel + an "All" node, rendered
 # under the Input node. Each emits a CHANNEL payload wired (rainbow port) into a
 # process to say "run on this channel". ``channel:__all__`` emits every channel.
@@ -184,6 +254,28 @@ def channel_name_for_op_key(op_key: str) -> str:
 
 def is_channel_source_op(op_key: str) -> bool:
     return op_key.startswith(CHANNEL_PREFIX)
+
+
+def op_produces_objects(op_key: str) -> bool:
+    """True if a node with this ``op_key`` yields **objects** (masks / labels).
+
+    'Objects' = something :func:`nd2studios.backend.analysis.object_scope.iter_objects`
+    can enumerate for per-object scoping (V1.68): the 3D Mask Drawing node
+    (``special:mask3d`` — a drawn ``(Z,H,W)`` mask, output ``PortType.ANY``), the
+    Track Objects node (``special:track_objects``), or any analysis node (output
+    ``PortType.BINARY`` = ``AnalysisResult.label_masks``). Gating on the op_key
+    (not the port type) is deliberate: mask3d emits ``ANY`` so it would pair with a
+    DVC ``IMAGE`` input, and a pure BINARY-port check would miss it.
+    """
+    return (op_key == SPECIAL_MASK3D_OP_KEY
+            or op_key == SPECIAL_TRACK_OP_KEY
+            or op_key == SPECIAL_GRANULE_MASK_OP_KEY  # V1.70 per-granule (Z,H,W) bool masks
+            or op_key.startswith(ANALYSIS_PREFIX))
+
+
+def node_produces_objects(node: Any) -> bool:
+    """:func:`op_produces_objects` for a model ``Node`` (drives the scope lever)."""
+    return op_produces_objects(getattr(node, "op_key", ""))
 
 
 def spec_takes_channels(op_key: str, role: NodeRole, input_types: List[PortType]) -> bool:
@@ -418,6 +510,38 @@ _SPECIAL_OPS = [
      "Halt the run and drop the whole page back to editor mode so you can "
      "modify the downstream pipeline before continuing.",
      ShapeKind.HEXAGON, [PortType.ANY]),
+    # Save Data (V1.71) — a pass-through (ANY→ANY) so it can sit mid-pipeline: it
+    # writes the dataset as it is at this point (recipe + registration + upstream
+    # crop applied) to disk and passes the stream through unchanged.
+    (SPECIAL_SAVE_DATA_OP_KEY, "Save Data",
+     "Write the dataset exactly as it is at this point in the pipeline "
+     "(enhancement recipe + registration + any upstream crop applied) to disk — "
+     "a multi-channel TIFF hyperstack or an NPZ, one file per multipoint. A "
+     "pass-through: place it anywhere and the run continues unchanged.",
+     ShapeKind.HEXAGON, [PortType.ANY]),
+    # Crop (V1.71, manual) — a pass-through (ANY→ANY) so it wires UPSTREAM of
+    # analysis / tracking / export; its rect is published where _crop_rect() picks
+    # it up, cropping every downstream node.
+    (SPECIAL_CROP_OP_KEY, "Crop",
+     "Crop the image to a rectangle you pick, and apply that crop to the rest of "
+     "the pipeline — every downstream node (analysis, tracking, export, Save "
+     "Data) and the viewer read the cropped image. Manual mode only for now: set "
+     "the region with 'Pick crop region…' in the node settings. Pixel size is "
+     "preserved; only width/height shrink.",
+     ShapeKind.HEXAGON, [PortType.ANY]),
+    # Exclude (V1.75) — a pass-through (ANY→ANY): wire a region-producing node
+    # (3D Mask Drawing / Granule Volume Mask) INTO it and every downstream analysis
+    # ignores the voxels inside that region. Its exclusion volume is published where
+    # the page's analysis / DVC image reads zero it out — the inverse of the crop.
+    (SPECIAL_EXCLUDE_OP_KEY, "Exclude",
+     "Ignore a region during analysis. Wire an object / mask / region node (e.g. "
+     "3D Mask Drawing or Granule Volume Mask) into this node and every downstream "
+     "analysis node (segmentation, spots, DVC, measurements, spatial maps) skips "
+     "the voxels inside that region — across all Z, all multipoints and all "
+     "timepoints. Use it to blank out artefacts, dead cells or air bubbles so they "
+     "never enter the analysis. The image itself is untouched (Save Data / Export "
+     "still write the full frame); only what analysis 'sees' is masked.",
+     ShapeKind.HEXAGON, [PortType.ANY]),
     (SPECIAL_CHECKPOINT_OP_KEY, "Checkpoint",
      "Freeze everything computed upstream (segmentation / analysis masks, "
      "measurements, tracks) when the run reaches this node. A later Run whose "
@@ -426,6 +550,14 @@ _SPECIAL_OPS = [
      "on the downstream pipeline instantly. Edit anything upstream and the "
      "checkpoint re-freezes automatically on the next full Run.",
      ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.CHECKPOINT),
+    (SPECIAL_DVC_CHECKPOINT_OP_KEY, "DVC Checkpoint",
+     "A reloaded DVC result bundle (.nd2dvc file). Created by the DVC viewer's "
+     "Export → Import flow (not from the Add menu): it re-publishes every saved "
+     "multipoint / frame / object displacement + strain field to the DVC viewer with "
+     "no Run, and records how the field was produced (provenance). A portable "
+     "checkpoint you can open in a fresh session with no ND2 file loaded. Terminal "
+     "(no ports) — it drives the DVC viewer, like the DVC node.",
+     ShapeKind.HEXAGON, [], NodeCategory.CHECKPOINT, []),
     (SPECIAL_CT_METRICS_OP_KEY, "Cell-Tracker Metrics",
      "Augment tracked objects with per-cell spatial metrics (neighbor distance, "
      "cell density, local divergence / curl), motion (speed + velocity_x/y) and "
@@ -453,8 +585,46 @@ _SPECIAL_OPS = [
      "displacement + strain field between a reference and a deformed timepoint "
      "of the wired channel. Reads full Z-volumes for true 3D DVC (2D DIC when "
      "there is no Z). Set the reference / deformed frames + subset size in the "
-     "node settings; results open in the DVC viewer tab.",
+     "node settings; results open in the DVC viewer tab. Wire its output into an "
+     "Output node to auto-save every field (the .nd2dvc bundle) to a folder named "
+     "after that Output node on Run.",
+     ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.SPECIAL, [PortType.IMAGE]),
+    # 2D DIC (V1.77) — pyALDIC. Like DVC, takes an IMAGE (rainbow channel wiring)
+    # and is terminal (opens its own DIC viewer tab). Reads 2D frames of the wired
+    # channel and correlates them with the optional 'al-dic' AL-DIC solver.
+    (SPECIAL_DIC_OP_KEY, "DIC (pyALDIC)",
+     "2D Augmented-Lagrangian Digital Image Correlation (pyALDIC): measure the "
+     "dense in-plane displacement + strain field across the timelapse of the wired "
+     "channel. The 2D sibling of the DVC node — hybrid local IC-GN + global ADMM "
+     "over an adaptive mesh. Wire a DIC Mesh Region node in front to restrict the "
+     "mesh to a drawn ROI, and a DIC Mesh Refinement node to refine it. Needs the "
+     "optional 'al-dic' package (pip install al-dic); results open in the DIC "
+     "viewer tab.",
      ShapeKind.HEXAGON, [], NodeCategory.SPECIAL, [PortType.IMAGE]),
+    # DIC Mesh Region (V1.77) — pyALDIC's ROI toolbar as a node: draw the mesh
+    # domain (rectangle / polygon / circle, Add/Cut, Refine Brush, Invert/Clear).
+    # A pass-through (IMAGE in → ANY out) so it wires input → DIC Mesh Region → DIC;
+    # on Run its shapes rasterize to record._dic_roi_by_m (the AL-DIC mesh domain).
+    (SPECIAL_DIC_ROI_OP_KEY, "DIC Mesh Region",
+     "Draw the region of interest / mesh domain for a downstream DIC node, exactly "
+     "like pyALDIC's ROI tools: add or cut rectangles, polygons and circles, paint "
+     "a freehand brush, and invert / clear. Wire it in front of a DIC node "
+     "(input → DIC Mesh Region → DIC) — on Run the drawn shapes are rasterized to a "
+     "boolean ROI mask that becomes the AL-DIC finite-element mesh domain (the "
+     "correlation runs only inside it). Edit it with 'Draw mesh region…'.",
+     ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.SPECIAL, [PortType.IMAGE]),
+    # DIC Mesh Refinement (V1.77) — pyALDIC's adaptive-quadtree workflow as a node:
+    # paint a brush region + pick refinement criteria. A pass-through wired UPSTREAM
+    # of the DIC node; on Run it publishes record._dic_refine_by_m (an al-dic
+    # RefinementPolicy spec) so the DIC mesh refines where it matters.
+    (SPECIAL_DIC_REFINE_OP_KEY, "DIC Mesh Refinement",
+     "Drive pyALDIC's adaptive quadtree mesh refinement for a downstream DIC node. "
+     "Paint a 'brush' region to resolve finer displacement where you need it, and "
+     "toggle refinement criteria (mask boundary, ROI edge, brush region). Wire it "
+     "in front of a DIC node (… → DIC Mesh Refinement → DIC) — on Run it builds an "
+     "AL-DIC refinement policy so the mesh subdivides in the chosen regions. Edit "
+     "it with 'Draw refinement brush…'.",
+     ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.SPECIAL, [PortType.IMAGE]),
     # Registration (V1.56) — like DVC, takes an IMAGE (rainbow channel wiring):
     # estimate the drift/rigid transform on the wired reference channel, apply to
     # all channels. Unlike DVC (a terminal viewer), registration is a *transform*
@@ -469,6 +639,75 @@ _SPECIAL_OPS = [
      "— they then run on the drift-corrected image. Results (before/after + a "
      "drift-vs-time plot) open in the Registration viewer tab.",
      ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.SPECIAL, [PortType.IMAGE]),
+    # 3D Mask Drawing (V1.65) — like Registration, a pass-through in the image
+    # stream: takes an IMAGE (rainbow channel wiring) so the user draws over the
+    # wired channel's raw (Z,H,W) volume, and emits ANY so it wires UPSTREAM of DVC /
+    # analysis (e.g. input → 3D Mask Drawing → DVC), which both fixes connectivity
+    # (an ANY output pairs with DVC's IMAGE input, unlike a BINARY one) and orders
+    # the run so the mask is published to record._mask3d_by_m *before* the DVC node's
+    # 3-D Object view reads it. The drawn mask is a side artifact on the record, not
+    # a payload threaded through the wire. Edited via the popup's "Draw 3D mask…"
+    # button; rasterized to a (Z,H,W) volume on Run.
+    (SPECIAL_MASK3D_OP_KEY, "3D Mask Drawing",
+     "Draw and edit a 3D object mask across the Z-stack of the wired channel, then "
+     "wire it in front of a DVC node (input → 3D Mask Drawing → DVC) so the DVC "
+     "viewer's '3D Object' tab can render the field on the object. Draw a rectangle "
+     "/ ellipse / polygon on each Z plane (Manual), draw a few planes and fill the "
+     "rest by copying or smoothly interpolating between them (Propagate across Z), "
+     "or seed each plane's outline from an intensity threshold and hand-correct it "
+     "(Threshold seed + edit). On Run the shapes are rasterized into a (Z,H,W) mask "
+     "volume the DVC object render consumes.",
+     ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.SPECIAL, [PortType.IMAGE]),
+    # Prism (V1.77) — a 2.5D faceted gem that splices into any analysis chain. It
+    # takes an IMAGE (rainbow channel wiring) and emits ANY (so it wires upstream of
+    # DVC / analysis). Fed a channel via its rainbow port, it ADDs / REMOVEs / REPLACEs
+    # the analysis channels flowing downstream, and on a VIEW-ONLY (dotted) outgoing
+    # edge converges that channel into a downstream node as a viewer-only overlay.
+    (SPECIAL_PRISM_OP_KEY, "Prism",
+     "Load in, remove, or converge a channel at this point in the pipeline. Wire a "
+     "channel (a rainbow channel-source pill) into the Prism, then wire the Prism into "
+     "any analysis node. On a normal (solid) edge it ADDs / REMOVEs / REPLACEs the "
+     "channels that node analyses (choose with 'Channel operation'). On a VIEW-ONLY "
+     "edge — click the wire to make it dotted — the channel is fed to the viewers only, "
+     "never to analysis, so it can't confuse the analysis pipeline. Its flagship use: "
+     "wire Granule Boundary Extraction → Prism (green) → DVC on a dotted edge so DVC "
+     "keeps correlating its own channel while the green channel is drawn in DVC's 3-D "
+     "object overlay, clipped to the shell between the volume-mask boundary and the "
+     "boundary-extraction boundary.",
+     ShapeKind.GEM, [PortType.ANY], NodeCategory.SPECIAL, [PortType.IMAGE]),
+    # ── Granule Separation (V1.70) ──────────────────────────────────────────
+    # A five-node chain that separates a 3-D point cloud of bead centroids into the
+    # hydrogel granules they belong to. Bead Detection takes an IMAGE (rainbow
+    # channel wiring, like DVC/Mask3D) and emits a DATA point cloud; the middle
+    # nodes flow DATA; the Volume Mask emits ANY (like Mask3D) so it wires into DVC
+    # / a Boundary node. Artifacts live on record._granule_*_by_m, not on the wire.
+    (SPECIAL_BEAD_DETECT_OP_KEY, "Bead Detection",
+     "Detect bead / particle centroids in the wired channel's raw (Z,H,W) volume "
+     "and emit them as a 3-D point cloud (measurement rows carrying centroid_z/y/x). "
+     "First stage of granule separation — feed it into a Granule Clustering node.",
+     ShapeKind.HEXAGON, [PortType.DATA], NodeCategory.SPECIAL, [PortType.IMAGE]),
+    (SPECIAL_GRANULE_CLUSTER_OP_KEY, "Granule Clustering",
+     "Assign each bead in the point cloud to a hydrogel granule with a Gaussian "
+     "mixture model, choosing the granule count by a BIC sweep over your seeded "
+     "estimate relaxed by a percentage. Wire a Bead Detection node in; feed the "
+     "labelled points into a Granule Tessellation node.",
+     ShapeKind.HEXAGON, [PortType.DATA], NodeCategory.SPECIAL, [PortType.DATA]),
+    (SPECIAL_GRANULE_TESSELLATE_OP_KEY, "Granule Tessellation",
+     "Turn each granule's beads into a boundary (per-granule alpha-shape or global "
+     "Voronoi) and merge neighbouring regions of similar point density into one "
+     "granule. Produces the final granule boundaries for the Granule Volume Mask.",
+     ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.SPECIAL, [PortType.DATA]),
+    (SPECIAL_GRANULE_MASK_OP_KEY, "Granule Volume Mask",
+     "Voxelize the tessellated granule boundaries onto the confocal grid (with a "
+     "smoothing parameter) into per-granule (Z,H,W) masks plus a combined label "
+     "volume. Object-producing: wire it into DVC and flip the edge to Objects to "
+     "run one DVC field per granule, or into a Granule Boundary node.",
+     ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.SPECIAL, [PortType.ANY]),
+    (SPECIAL_GRANULE_BOUNDARY_OP_KEY, "Granule Boundary Extraction",
+     "Extract an outward boundary band (N voxels, by dilation or Euclidean "
+     "distance transform) around each granule mask — reaching into background and "
+     "neighbouring granules — to recover the data surrounding each granule.",
+     ShapeKind.HEXAGON, [PortType.ANY], NodeCategory.SPECIAL, [PortType.ANY]),
 ]
 
 
@@ -494,6 +733,21 @@ def special_specs() -> List[NodeSpec]:
             )
         )
     return specs
+
+
+def dvc_checkpoint_spec() -> NodeSpec:
+    """The portable DVC Checkpoint input node spec (V1.76).
+
+    Created only by the DVC viewer's Import flow — the page passes this to
+    ``NodeScene.add_node_from_spec`` directly. It is kept **out** of the Add dialog
+    (``PipelinesPage`` filters it from ``scene.action_specs``) but stays in
+    :func:`special_specs` so its white ``CHECKPOINT`` category round-trips through
+    ``save_pipeline`` / ``load_pipeline`` (``io.py`` re-derives category from
+    ``special_specs`` on load)."""
+    for s in special_specs():
+        if s.op_key == SPECIAL_DVC_CHECKPOINT_OP_KEY:
+            return s
+    raise KeyError(SPECIAL_DVC_CHECKPOINT_OP_KEY)
 
 
 def merged_action_specs() -> List[NodeSpec]:
@@ -645,6 +899,118 @@ def param_specs_for(op_key: str) -> List[ParamSpec]:
         ]
         specs.extend(ALDVCMethod().get_params())
         return specs
+    if op_key == SPECIAL_DIC_OP_KEY:
+        # 2D DIC node params (V1.78): how to walk the timelapse + XY downsample,
+        # then the pyALDIC engine knobs from PyALDICMethod.get_params() (the single
+        # source of truth). No Z knobs — DIC is 2D. The channel comes from a wired
+        # channel pill (rainbow port), the ROI/refinement from upstream DIC Mesh
+        # nodes; both are not params here.
+        from nd2studios.backend.dic.method import PyALDICMethod
+        specs = [
+            ParamSpec(
+                name="tracking_mode", label="Tracking mode", param_type="choice",
+                default="cumulative", choices=["cumulative", "incremental"],
+                tooltip="How AL-DIC walks the timelapse. 'Cumulative' correlates "
+                        "the fixed reference frame against every frame (total "
+                        "deformation from reference → accumulative mode). "
+                        "'Incremental' correlates each frame against the previous "
+                        "one — more robust for large accumulating motion.",
+            ),
+            ParamSpec(
+                name="ref_frame", label="Reference frame (T)", param_type="int",
+                default=0, min_val=0, max_val=100000, step=1,
+                visible_when={"tracking_mode": "cumulative"},
+                tooltip="The fixed undeformed reference timepoint (cumulative mode).",
+            ),
+            ParamSpec(
+                name="all_multipoints", label="All multipoints", param_type="bool",
+                default=False,
+                tooltip="Run the DIC series for every multipoint (switch between "
+                        "them in the DIC tab). Off = only the currently viewed M.",
+            ),
+            ParamSpec(
+                name="downsample", label="XY downsample", param_type="int",
+                default=1, min_val=1, max_val=16, step=1,
+                tooltip="Block-average the frame by this factor in X and Y before "
+                        "correlating — for very large frames. Displacements are "
+                        "reported in physical units (the pixel size is scaled).",
+            ),
+        ]
+        specs.extend(PyALDICMethod().get_params())
+        return specs
+    if op_key == SPECIAL_DIC_ROI_OP_KEY:
+        # DIC Mesh Region node (V1.78): a live mesh-grid preview pitch for the editor
+        # + the hidden drawn ROI shapes (keyed {str(m): [shape,...]}). The shapes are
+        # edited via the popup's "Draw mesh region…" button and rasterized on Run.
+        return [
+            ParamSpec(
+                name="mesh_preview_step", label="Mesh preview pitch (px)",
+                param_type="int", default=16, min_val=2, max_val=128, step=2,
+                tooltip="Grid spacing used only for the live mesh-dot preview in the "
+                        "drawing editor. The actual mesh pitch is the downstream DIC "
+                        "node's 'Subset spacing / step'.",
+            ),
+            ParamSpec(name="roi_shapes", label="ROI shapes",
+                      param_type="hidden", default={}),
+        ]
+    if op_key == SPECIAL_DIC_REFINE_OP_KEY:
+        # DIC Mesh Refinement node (V1.78): the adaptive-quadtree criteria toggles +
+        # the hidden brush shapes (keyed {str(m): [shape,...]}), edited via the
+        # popup's "Draw refinement brush…" button and turned into an al-dic
+        # RefinementPolicy on Run.
+        return [
+            ParamSpec(
+                name="refine_mask_boundary", label="Refine at mask/inner boundary",
+                param_type="bool", default=False,
+                tooltip="Subdivide mesh elements straddling holes / inner ROI "
+                        "boundaries (pyALDIC MaskBoundaryCriterion).",
+            ),
+            ParamSpec(
+                name="refine_roi_edge", label="Refine at ROI edge",
+                param_type="bool", default=True,
+                tooltip="Subdivide elements along the outer ROI boundary so the "
+                        "field resolves the domain edge (pyALDIC ROIEdgeCriterion).",
+            ),
+            ParamSpec(
+                name="refine_brush", label="Refine in brush region",
+                param_type="bool", default=True,
+                tooltip="Subdivide elements inside the painted brush region "
+                        "(pyALDIC BrushRegionCriterion).",
+            ),
+            ParamSpec(
+                name="min_element_size", label="Min element size (px)",
+                param_type="int", default=8, min_val=2, max_val=128, step=2,
+                tooltip="Smallest element the quadtree may refine to (power of two).",
+            ),
+            ParamSpec(name="brush_shapes", label="Brush shapes",
+                      param_type="hidden", default={}),
+        ]
+    if op_key == SPECIAL_PRISM_OP_KEY:
+        # Prism (V1.77). The channel(s) are chosen by wiring a channel-source pill into
+        # the rainbow port (like analysis/DVC nodes) — no channel dropdown here.
+        return [
+            ParamSpec(
+                name="channel_op", label="Channel operation", param_type="choice",
+                default="add", choices=["add", "remove", "replace"],
+                tooltip="How the channel(s) fed into this Prism combine with the "
+                        "channels already flowing here, for ANALYSIS (solid) edges:\n"
+                        "  add — also analyse the Prism's channel(s) downstream\n"
+                        "  remove — stop analysing the Prism's channel(s) downstream\n"
+                        "  replace — analyse ONLY the Prism's channel(s) downstream.\n"
+                        "Ignored on a view-only (dotted) edge — that always feeds the "
+                        "viewers only, never analysis.",
+            ),
+            ParamSpec(
+                name="overlay_render", label="Overlay render", param_type="choice",
+                default="Shell (iso)",
+                choices=["Shell (iso)", "Cloud (volume)", "Cloud (MIP)"],
+                tooltip="How a VIEW-ONLY (dotted-edge) channel is drawn in the DVC "
+                        "viewer's 3-D object overlay: an iso-surface shell, a "
+                        "translucent volume cloud, or a maximum-intensity projection. "
+                        "The overlay is auto-clipped to the shell between the two "
+                        "granule boundaries when a Granule Boundary node is upstream.",
+            ),
+        ]
     if op_key == SPECIAL_REGISTER_OP_KEY:
         # Registration node params: multipoint scope + apply-to-all toggle, then
         # the RigidRegistration engine knobs (model / reference / upsample / …),
@@ -687,6 +1053,231 @@ def param_specs_for(op_key: str) -> List[ParamSpec]:
                       tooltip="Region the transform is estimated on (whole frame if "
                               "unset). Set it with 'Pick ROI…'."))
         return specs
+    if op_key == SPECIAL_EXCLUDE_OP_KEY:
+        # Exclude node (V1.75). No region is drawn here — the region comes from the
+        # wired upstream node (3D Mask Drawing / Granule Volume Mask); this only
+        # tunes how it is applied. `dilate_px` grows the ignored footprint by a
+        # safety margin (e.g. to also skip the halo around a bright artefact).
+        return [
+            ParamSpec(
+                name="dilate_px", label="Grow margin (px)", param_type="int",
+                default=0, min_val=0, max_val=200, step=1,
+                tooltip="Expand the excluded region outward by this many pixels "
+                        "before analysis ignores it — a safety margin around the "
+                        "wired mask (e.g. to also skip the halo of a bright "
+                        "artefact). 0 = ignore exactly the region as drawn.",
+            ),
+        ]
+    if op_key == SPECIAL_MASK3D_OP_KEY:
+        # 3D Mask Drawing node params. The mask itself is drawn interactively via
+        # the popup's "Draw 3D mask…" button and stored as vector shapes in the
+        # hidden ``mask_shapes`` param; these flat params only choose how the drawn
+        # planes are turned into a (Z,H,W) volume on Run.
+        return [
+            ParamSpec(
+                name="mode", label="Creation mode", param_type="choice",
+                default="Propagate across Z",
+                choices=["Manual (per-plane)", "Propagate across Z",
+                         "Threshold seed + edit"],
+                tooltip="How the 3D mask is built. 'Manual' fills only the Z planes "
+                        "you draw on. 'Propagate across Z' fills the planes between "
+                        "the ones you draw (see Propagate). 'Threshold seed + edit' "
+                        "seeds each plane's outline from an intensity threshold that "
+                        "you then correct by drawing.",
+            ),
+            ParamSpec(
+                name="propagate", label="Propagate", param_type="choice",
+                default="Interpolate between planes",
+                choices=["Copy to all Z", "Interpolate between planes"],
+                visible_when={"mode": "Propagate across Z"},
+                tooltip="'Copy to all Z' extrudes the union of the drawn planes "
+                        "through the whole stack (a prism). 'Interpolate between "
+                        "planes' smoothly morphs the outline between consecutive "
+                        "drawn planes (signed-distance blend) so the object surface "
+                        "is higher-resolution than the planes you drew.",
+            ),
+            ParamSpec(
+                name="apply_all_frames", label="Apply to all frames (T)",
+                param_type="bool", default=True,
+                tooltip="Reuse the drawn mask on every timepoint (the object is the "
+                        "same across the timelapse). Off = only the frame(s) you "
+                        "drew on carry a mask.",
+            ),
+            # V1.68 — the only *surface* knob on the node (all other DVC-on-object
+            # display choices — colour scalar, context channel, 2D projection —
+            # live in the DVC panel and need no re-Run). Feeds the Taubin smoothing
+            # pass in backend.viz3d.surface.build_object_surface when the drawn
+            # mask is rendered as a deformation surface (Stout et al. 2016).
+            ParamSpec(
+                name="surface_smooth_iterations", label="Surface smoothing (iter)",
+                param_type="int", default=10, min_val=0, max_val=100, step=1,
+                tooltip="Taubin smoothing iterations for the marching-cubes surface "
+                        "built from this mask in the DVC '3D Object' view. 0 = raw "
+                        "voxel surface (blocky); higher = smoother object boundary. "
+                        "Does not change the drawn mask or any measurement.",
+            ),
+            # The drawn shapes: {str(m): {str(t): {z_key: [shape, …]}}} with z_key an
+            # int Z index or 'all'. Hidden so the popup's full-params rewrite never
+            # clobbers it; captured via "Draw 3D mask…".
+            ParamSpec(
+                name="mask_shapes", label="Mask shapes", param_type="hidden",
+                default={},
+                tooltip="The drawn per-Z shapes. Edit with 'Draw 3D mask…'."),
+        ]
+    if op_key == SPECIAL_BEAD_DETECT_OP_KEY:
+        # Bead detection knobs (backend/analysis/bead_detect.detect_beads). The
+        # channel is chosen by wiring a channel pill into the rainbow port.
+        return [
+            ParamSpec(
+                name="detect_mode", label="Detection mode", param_type="choice",
+                default="log", choices=["log", "components"],
+                tooltip="'log' = Laplacian-of-Gaussian blob maxima (bright compact "
+                        "beads). 'components' = connected-component centroids "
+                        "(after thresholding). Both are sub-voxel refined."),
+            ParamSpec(
+                name="min_distance_px", label="Min bead distance (px)",
+                param_type="int", default=3, min_val=1, max_val=1000, step=1,
+                tooltip="Minimum separation between detected beads (suppresses "
+                        "duplicate maxima on one bead)."),
+            ParamSpec(
+                name="threshold", label="Intensity threshold (0 = auto)",
+                param_type="float", default=0.0, min_val=0.0, max_val=1e9, step=1.0,
+                tooltip="Absolute intensity threshold for detection. 0 = auto "
+                        "(Otsu / percentile)."),
+            ParamSpec(
+                name="min_intensity", label="Min peak intensity",
+                param_type="float", default=0.0, min_val=0.0, max_val=1e9, step=1.0,
+                tooltip="Drop detected peaks dimmer than this."),
+            ParamSpec(
+                name="subpixel", label="Sub-voxel refinement", param_type="bool",
+                default=True,
+                tooltip="Refine each centroid to sub-voxel accuracy (parabola / "
+                        "radial-symmetry fit)."),
+            ParamSpec(
+                name="all_multipoints", label="All multipoints", param_type="bool",
+                default=False,
+                tooltip="Detect in every multipoint. Off = only the current M."),
+        ]
+    if op_key == SPECIAL_GRANULE_CLUSTER_OP_KEY:
+        # GMM (or KMeans) granule assignment with a BIC sweep over the relaxed
+        # count (backend/analysis/granule_cluster.cluster_granules). Needs
+        # scikit-learn (optional/lazy, find_spec-gated like cellpose/stardist).
+        return [
+            ParamSpec(
+                name="n_granules", label="Granule count (seed)", param_type="int",
+                default=10, min_val=1, max_val=100000, step=1,
+                tooltip="Your initial estimate of the number of granules in the "
+                        "volume. The actual count is chosen within ± the relaxation "
+                        "below by lowest BIC."),
+            ParamSpec(
+                name="relax_pct", label="Relax count by (%)", param_type="float",
+                default=25.0, min_val=0.0, max_val=100.0, step=5.0,
+                tooltip="Sweep the granule count over [n·(1−p), n·(1+p)] and pick "
+                        "the model with the lowest BIC. 0 = fixed at the seed."),
+            ParamSpec(
+                name="method", label="Method", param_type="choice",
+                default="gmm", choices=["gmm", "kmeans"],
+                tooltip="'gmm' = full-covariance Gaussian mixture (handles "
+                        "elongated granules). 'kmeans' = spherical, faster, weaker "
+                        "for elongated shapes."),
+            ParamSpec(
+                name="n_init", label="Fit restarts", param_type="int",
+                default=3, min_val=1, max_val=50, step=1,
+                tooltip="Number of random restarts per candidate count (best kept)."),
+            ParamSpec(
+                name="all_multipoints", label="All multipoints", param_type="bool",
+                default=False,
+                tooltip="Cluster every multipoint. Off = only the current M."),
+        ]
+    if op_key == SPECIAL_GRANULE_TESSELLATE_OP_KEY:
+        # Boundary construction + density-merge
+        # (backend/analysis/granule_tessellate.tessellate_granules).
+        return [
+            ParamSpec(
+                name="tess_mode", label="Tessellation", param_type="choice",
+                default="alpha_shape", choices=["alpha_shape", "voronoi"],
+                tooltip="'alpha_shape' = per-granule concave hull (captures "
+                        "roughness / elongation). 'voronoi' = global Voronoi cells; "
+                        "a granule is the union of its beads' cells."),
+            ParamSpec(
+                name="alpha", label="Alpha (concavity)", param_type="float",
+                default=0.0, min_val=0.0, max_val=1e6, step=1.0,
+                visible_when={"tess_mode": "alpha_shape"},
+                tooltip="Alpha-shape radius (µm). Smaller = tighter, more concave "
+                        "boundary; 0 = auto; very large ⇒ the convex hull."),
+            ParamSpec(
+                name="merge_tol", label="Density-merge tolerance",
+                param_type="float", default=0.2, min_val=0.0, max_val=1.0, step=0.05,
+                tooltip="Merge adjacent granules whose point densities differ by no "
+                        "more than this fraction (|ρi−ρj|/max ≤ tol), iteratively. "
+                        "0 = never merge."),
+            ParamSpec(
+                name="adj_dist_um", label="Adjacency distance (µm)",
+                param_type="float", default=0.0, min_val=0.0, max_val=1e6, step=1.0,
+                visible_when={"tess_mode": "alpha_shape"},
+                tooltip="Two alpha-shape granules are neighbours if their hulls "
+                        "touch or their centroids are within this distance. "
+                        "0 = auto (from the mean nearest-neighbour spacing)."),
+            ParamSpec(
+                name="min_granule_points", label="Min beads per granule",
+                param_type="int", default=4, min_val=1, max_val=100000, step=1,
+                tooltip="Granules with fewer beads than this are dropped or merged "
+                        "into a neighbour (a hull needs ≥4 points)."),
+        ]
+    if op_key == SPECIAL_GRANULE_MASK_OP_KEY:
+        # Voxelize + SDF-Gaussian smoothing
+        # (backend/analysis/granule_mask.build_granule_masks).
+        return [
+            ParamSpec(
+                name="smooth_sigma", label="Surface smoothing (µm)",
+                param_type="float", default=0.0, min_val=0.0, max_val=1e4, step=0.5,
+                tooltip="Signed-distance Gaussian smoothing of each granule volume "
+                        "(µm). 0 = raw voxelized boundary; higher = smoother, "
+                        "non-shrinking surface."),
+            ParamSpec(
+                name="fill_holes", label="Fill interior holes", param_type="bool",
+                default=True,
+                tooltip="Fill any interior voids so each granule is solid."),
+            ParamSpec(
+                name="min_object_voxels", label="Min granule voxels",
+                param_type="int", default=8, min_val=1, max_val=10**9, step=1,
+                tooltip="Drop voxelized granules smaller than this (specks)."),
+            ParamSpec(
+                name="all_multipoints", label="All multipoints", param_type="bool",
+                default=False,
+                tooltip="Mask every multipoint. Off = only the current M."),
+        ]
+    if op_key == SPECIAL_GRANULE_BOUNDARY_OP_KEY:
+        # Outward boundary band (backend/analysis/granule_boundary.extract_boundary_bands).
+        return [
+            ParamSpec(
+                name="band_voxels", label="Band thickness (voxels)",
+                param_type="int", default=3, min_val=1, max_val=1000, step=1,
+                tooltip="How many voxels outward from each granule surface to "
+                        "include in the boundary band."),
+            ParamSpec(
+                name="band_method", label="Band method", param_type="choice",
+                default="dilation", choices=["dilation", "edt"],
+                tooltip="'dilation' = N binary dilations (voxel band). 'edt' = "
+                        "Euclidean distance transform ≤ a physical distance "
+                        "(honours anisotropic voxel size)."),
+            ParamSpec(
+                name="band_um", label="Band distance (µm, EDT)",
+                param_type="float", default=0.0, min_val=0.0, max_val=1e4, step=0.5,
+                visible_when={"band_method": "edt"},
+                tooltip="Metric band thickness for the EDT method (µm). "
+                        "0 = use band thickness × smallest voxel dimension."),
+            ParamSpec(
+                name="include_neighbors", label="Reach into neighbour granules",
+                param_type="bool", default=True,
+                tooltip="Include voxels belonging to adjacent granules in the band "
+                        "(the shared matrix between packed granules). Off = "
+                        "background only."),
+            ParamSpec(
+                name="all_multipoints", label="All multipoints", param_type="bool",
+                default=False,
+                tooltip="Band every multipoint. Off = only the current M."),
+        ]
     if op_key == SPECIAL_REVIEW_OP_KEY:
         return [
             ParamSpec(
@@ -928,6 +1519,74 @@ def param_specs_for(op_key: str) -> List[ParamSpec]:
                 default=[],
                 tooltip="Saved Spatial Maps configuration(s) auto-loaded into the "
                         "tab when this node runs.",
+            ),
+        ]
+    if op_key == SPECIAL_SAVE_DATA_OP_KEY:
+        # Save the current pipeline image data to disk. TIFF hyperstack reuses
+        # backend.exporters.tiff_exporter.export_tiff_hyperstack (which accepts
+        # both (T,H,W) and (T,Z,H,W)); NPZ writes the raw channel arrays. The
+        # enhancement recipe is a 2-D operation on the Z-projected view, so it is
+        # only available for the projection modes — the full Z-stack saves raw
+        # voxels (registration + crop applied).
+        return [
+            ParamSpec(
+                name="data", label="Data", param_type="choice",
+                default="Full Z-stack (raw voxels)",
+                choices=["Full Z-stack (raw voxels)",
+                         "Z-projection (recipe-processed)",
+                         "Z-projection (raw)"],
+                tooltip="What to save. 'Full Z-stack (raw voxels)' writes every Z "
+                        "plane as a (T,Z,H,W) hyperstack (registration + any "
+                        "upstream crop applied; no enhancement recipe — that is a "
+                        "2-D projection operation). 'Z-projection (recipe-"
+                        "processed)' writes the Z-collapsed image the pipeline "
+                        "analyzes (recipe + registration + crop). 'Z-projection "
+                        "(raw)' writes the Z-collapsed raw image (registration + "
+                        "crop, no recipe).",
+            ),
+            ParamSpec(
+                name="image_format", label="Format", param_type="choice",
+                default="TIFF hyperstack", choices=["TIFF hyperstack", "NPZ"],
+                tooltip="'TIFF hyperstack' writes one multi-channel ImageJ TZCYX "
+                        ".tif per multipoint (opens in Fiji / napari with the "
+                        "correct pixel size). 'NPZ' writes a compressed .npz of "
+                        "the channel arrays keyed by channel name.",
+            ),
+            ParamSpec(
+                name="bit_depth", label="Bit depth", param_type="choice",
+                default="passthrough", choices=["passthrough", "uint16", "uint8"],
+                visible_when={"image_format": "TIFF hyperstack"},
+                tooltip="TIFF output bit depth. 'passthrough' keeps the source "
+                        "dtype; uint16 / uint8 apply a per-channel percentile "
+                        "stretch so each channel keeps its own contrast.",
+            ),
+            ParamSpec(
+                name="all_multipoints", label="All multipoints", param_type="bool",
+                default=True,
+                tooltip="Save every multipoint — one file per M "
+                        "(pipeline_data_M01.tif, …) — so the full M axis is "
+                        "preserved. Off = only the currently viewed multipoint.",
+            ),
+        ]
+    if op_key == SPECIAL_CROP_OP_KEY:
+        # Manual crop node. The rectangle is picked interactively via the popup's
+        # "Pick crop region…" button (reusing the page's crop dialog) and stored
+        # in the hidden ``rect`` param as (x, y, w, h) raw-image pixels; ``mode``
+        # is a single-choice placeholder documenting that only manual is wired.
+        return [
+            ParamSpec(
+                name="mode", label="Crop mode", param_type="choice",
+                default="Manual (draw / enter rectangle)",
+                choices=["Manual (draw / enter rectangle)"],
+                tooltip="How the crop rectangle is chosen. Manual: pick it "
+                        "yourself with 'Pick crop region…'. (Automatic "
+                        "content-based cropping may be added later.)",
+            ),
+            ParamSpec(
+                name="rect", label="Crop rectangle", param_type="hidden",
+                default=None,
+                tooltip="(x, y, w, h) in raw-image pixels. Set it with "
+                        "'Pick crop region…'.",
             ),
         ]
     if op_key == SPECIAL_EXPORT_OP_KEY:

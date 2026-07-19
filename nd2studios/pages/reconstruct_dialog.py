@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from nd2studios.widgets.icon_button import scaled
+
 
 CHAIN_AXES = ("T", "M", "Z", "C")
 
@@ -227,13 +229,14 @@ class AxisBlocksWidget(QListWidget):
     are not overridden by the application stylesheet.
     """
 
-    BLOCK_SIZE = QSize(78, 38)
-
     reordered = Signal()
 
     def __init__(self, axis_label: str, draggable: bool,
                  parent: Optional[QWidget] = None):
         super().__init__(parent)
+        # Computed here (not at class scope) so scaled() runs after the
+        # QApplication/screen exists rather than at import time.
+        self.BLOCK_SIZE = QSize(scaled(78), scaled(38))
         self.axis_label = axis_label
         self._draggable = draggable
 
@@ -242,7 +245,7 @@ class AxisBlocksWidget(QListWidget):
         self.setResizeMode(QListView.Adjust)
         self.setSpacing(3)
         self.setUniformItemSizes(True)
-        self.setMaximumHeight(160)  # enough for ~3 wrapped rows of blocks
+        self.setMaximumHeight(scaled(160))  # enough for ~3 wrapped rows of blocks
         self.setMovement(QListView.Snap)
         self.setItemDelegate(_BlockDelegate(self))
         # Local style override: clear the QSS item rules so the
@@ -359,7 +362,7 @@ class ReconstructDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("Reconstruct from multiple files")
-        self.setMinimumSize(900, 720)
+        self.setMinimumSize(scaled(900), scaled(720))
 
         self._entries: List[Dict[str, Any]] = []   # one dict per file row
         self._file_type: Optional[str] = None      # "ND2" or "TIFF" once locked
@@ -451,7 +454,7 @@ class ReconstructDialog(QDialog):
             row_wrap = QHBoxLayout()
             row_wrap.setContentsMargins(0, 0, 0, 0)
             label = QLabel(f"<b>{axis}</b>")
-            label.setMinimumWidth(24)
+            label.setMinimumWidth(scaled(24))
             label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
             row_wrap.addWidget(label)
             row = AxisBlocksWidget(axis_label=axis, draggable=False)

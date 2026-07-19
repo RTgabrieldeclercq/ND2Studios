@@ -16,7 +16,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDoubleSpinBox, QFrame, QHBoxLayout, QLabel
 
 from nd2studios.core.settings import Settings
-from nd2studios.widgets.icon_button import bind_toggle_icon, icon_button
+from nd2studios.widgets.icon_button import bind_toggle_icon, icon_button, scaled
 
 
 class PlayAllBanner(QFrame):
@@ -50,7 +50,7 @@ class PlayAllBanner(QFrame):
         self._fps.setValue(10.0)
         self._fps.setSingleStep(0.5)
         self._fps.setSuffix(" fps")
-        self._fps.setFixedWidth(84)
+        self._fps.setFixedWidth(scaled(84))
         self._fps.setToolTip("Playback speed for Play All")
         layout.addWidget(self._fps)
 

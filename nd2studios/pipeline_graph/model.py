@@ -72,6 +72,7 @@ class ShapeKind(Enum):
     TRIANGLE = "triangle"  # upright triangle (if-else: 1 in top, 2 out bottom)
     HEXAGON = "hexagon"    # special action nodes
     PILL = "pill"          # V1.48 channel source nodes (small rounded capsule)
+    GEM = "gem"            # V1.77 Prism node — upright faceted 2.5D gem / prism
 
 
 _STAGE_CATEGORY = {
@@ -100,6 +101,28 @@ def new_id(prefix: str = "n") -> str:
 # them — so a graph without loops behaves exactly as before.
 STRUCTURAL_KIND = "structural"
 LOOP_KIND = "loop"
+
+# V1.68 — per-edge analysis **scope** (Frame / Object toggle). Stored on
+# ``Edge.params["scope"]`` (a free-form dict that already round-trips through
+# ``to_dict``/``from_dict``), so scope persists in the saved pipeline with **no
+# schema bump**. The key is meaningful only on an edge whose source node produces
+# objects (a 3D-mask / track / analysis label node); absent ⇒ ``whole_frame`` ⇒
+# every existing graph behaves exactly as before.
+SCOPE_WHOLE = "whole_frame"
+SCOPE_OBJECTS = "objects"
+_EDGE_SCOPE_KEY = "scope"
+
+# V1.77 — per-edge **view-only** flag (the dotted-wire toggle). Stored on
+# ``Edge.params["view_only"]`` (like the scope lever, so it round-trips through
+# ``to_dict``/``from_dict`` with **no schema bump**). A view-only edge feeds its
+# channel(s) to the *viewers only* — analysis channel propagation
+# (:func:`~nd2studios.pipeline_graph.executor.channel_sets`) skips it entirely, so a
+# view-only channel can never enter an analysis node's computation nor propagate
+# downstream as an analysis channel. Absent ⇒ a normal (solid, analysis) edge, so
+# every existing graph behaves exactly as before. The edge still counts for run
+# ordering (``GraphRunner`` gates on structural edges regardless of this flag), so the
+# upstream producer of a view-only overlay still runs before its consumer.
+_EDGE_VIEW_ONLY_KEY = "view_only"
 
 
 # ── dataclasses ────────────────────────────────────────────────────────────
@@ -342,11 +365,19 @@ class GraphSlice:
     def structural_edge_into_port(
         self, node_id: str, port_id: str
     ) -> Optional[Edge]:
+        # V1.77: prefer the ANALYSIS wire — a view-only (overlay) wire coexisting on
+        # the same port is display-only and must not be a recipe/run predecessor. So a
+        # port with one analysis + N view-only wires still linearizes off the analysis
+        # one. (A port with only a view-only wire returns it as a last resort so the
+        # node still has a source.)
+        fallback: Optional[Edge] = None
         for e in self.edges.values():
             if (e.dst_node == node_id and e.dst_port == port_id
                     and e.kind != LOOP_KIND):
-                return e
-        return None
+                if not edge_view_only(e):
+                    return e
+                fallback = fallback or e
+        return fallback
 
     def port_owner(self, port_id: str) -> Optional[Node]:
         for node in self.nodes.values():
@@ -386,7 +417,12 @@ class PipelineDoc:
     analysis: GraphSlice
     results: GraphSlice
     bridges: Dict[str, Bridge] = field(default_factory=dict)
-    schema_version: int = 3  # V3 (V1.45): Track Objects node (was Validate)
+    # Must match ``io.PIPELINE_VERSION`` so a freshly-created doc round-trips
+    # cleanly. V6 (V1.61): Processing folded into the merged slice AND the
+    # intermediate bridge nodes dropped — one connected chain from a universal
+    # input through processing into analysis to output nodes. V4 (V1.49) added
+    # edge ``kind``; V3 (V1.45) the Track Objects node.
+    schema_version: int = 6
 
     @classmethod
     def empty(cls) -> "PipelineDoc":
@@ -397,11 +433,15 @@ class PipelineDoc:
         )
 
     def slice_for(self, stage: Stage) -> GraphSlice:
-        return {
-            Stage.PROCESSING: self.processing,
-            Stage.ANALYSIS: self.analysis,
-            Stage.RESULTS: self.results,
-        }[stage]
+        # V1.61 merge: Processing is folded into the merged (analysis) slice, so
+        # both PROCESSING and ANALYSIS resolve to it — the page edits one graph
+        # across what used to be two sub-tabs. Node ``stage`` still distinguishes
+        # enhancement nodes from analysis nodes for execution dispatch. The empty
+        # ``processing`` slice is retained for serialization back-compat (older
+        # two-slice docs fold into ``analysis`` on load via io._migrate_v4_to_v5).
+        if stage is Stage.RESULTS:
+            return self.results
+        return self.analysis
 
     @property
     def merged(self) -> GraphSlice:
@@ -460,6 +500,59 @@ def can_connect(src: Port, dst: Port) -> bool:
     if PortType.ANY in (src.type, dst.type):
         return True
     return src.type == dst.type
+
+
+# ── edge scope (V1.68 Frame / Object toggle) ────────────────────────────────
+
+def edge_scope(edge: Edge) -> str:
+    """Return an edge's analysis scope: :data:`SCOPE_WHOLE` (default) or
+    :data:`SCOPE_OBJECTS`.
+
+    Reads ``edge.params["scope"]``. Absent ⇒ ``whole_frame`` so legacy graphs
+    (and every structural edge that never toggled the lever) run exactly as
+    before. Any unrecognized value also degrades to ``whole_frame``.
+    """
+    val = (edge.params or {}).get(_EDGE_SCOPE_KEY, SCOPE_WHOLE)
+    return SCOPE_OBJECTS if val == SCOPE_OBJECTS else SCOPE_WHOLE
+
+
+def set_edge_scope(edge: Edge, scope: str) -> None:
+    """Write an edge's scope into ``edge.params`` (persists via ``to_dict``).
+
+    ``whole_frame`` clears the key (keeping the saved params tidy and legacy-
+    identical); ``objects`` writes it. No ``schema_version`` change is needed.
+    """
+    if edge.params is None:
+        edge.params = {}
+    if scope == SCOPE_OBJECTS:
+        edge.params[_EDGE_SCOPE_KEY] = SCOPE_OBJECTS
+    else:
+        edge.params.pop(_EDGE_SCOPE_KEY, None)
+
+
+def edge_view_only(edge: Edge) -> bool:
+    """Return whether ``edge`` is a **view-only** overlay wire (V1.77).
+
+    Reads ``edge.params["view_only"]``. Absent / falsey ⇒ a normal analysis edge, so
+    legacy graphs (and every edge that never toggled the dotted-wire lever) behave
+    exactly as before. A view-only edge feeds channels to the viewers only — it is
+    skipped by analysis channel propagation but still gates run ordering.
+    """
+    return bool((edge.params or {}).get(_EDGE_VIEW_ONLY_KEY, False))
+
+
+def set_edge_view_only(edge: Edge, on: bool) -> None:
+    """Set / clear an edge's view-only flag (persists via ``to_dict``, V1.77).
+
+    ``True`` writes the key; ``False`` clears it (keeping saved params tidy and
+    legacy-identical). No ``schema_version`` change is needed.
+    """
+    if edge.params is None:
+        edge.params = {}
+    if on:
+        edge.params[_EDGE_VIEW_ONLY_KEY] = True
+    else:
+        edge.params.pop(_EDGE_VIEW_ONLY_KEY, None)
 
 
 def is_channel_port(port: Port) -> bool:

@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.common import MplCanvas
+from nd2studios.widgets.icon_button import scaled
 
 
 MAX_SAMPLE_FRAMES = 32
@@ -67,8 +68,8 @@ class LutHistogramWidget(QWidget):
         # Tiny histogram canvas. Height kept small so a row of these
         # under the viewer doesn't dominate the screen.
         self.canvas = MplCanvas(self, width=3.5, height=0.9, dpi=90)
-        self.canvas.setMinimumHeight(80)
-        self.canvas.setMaximumHeight(110)
+        self.canvas.setMinimumHeight(scaled(80))
+        self.canvas.setMaximumHeight(scaled(110))
         self.ax = self.canvas.add_subplot(111)
         self.ax.set_yticks([])
         self.ax.set_xticks([])
@@ -89,7 +90,7 @@ class LutHistogramWidget(QWidget):
         self.spin_lo = QDoubleSpinBox()
         self.spin_lo.setRange(0.0, 1e9)
         self.spin_lo.setDecimals(0)
-        self.spin_lo.setMaximumWidth(80)
+        self.spin_lo.setMaximumWidth(scaled(80))
         self.spin_lo.editingFinished.connect(self._on_spin_changed)
         row.addWidget(self.spin_lo)
 
@@ -98,7 +99,7 @@ class LutHistogramWidget(QWidget):
         self.spin_hi = QDoubleSpinBox()
         self.spin_hi.setRange(0.0, 1e9)
         self.spin_hi.setDecimals(0)
-        self.spin_hi.setMaximumWidth(80)
+        self.spin_hi.setMaximumWidth(scaled(80))
         self.spin_hi.editingFinished.connect(self._on_spin_changed)
         row.addWidget(self.spin_hi)
 
@@ -106,19 +107,19 @@ class LutHistogramWidget(QWidget):
         self.slider_gamma = QSlider(Qt.Orientation.Horizontal)
         self.slider_gamma.setRange(20, 500)  # 0.20 .. 5.00 with /100
         self.slider_gamma.setValue(100)
-        self.slider_gamma.setFixedWidth(80)
+        self.slider_gamma.setFixedWidth(scaled(80))
         self.slider_gamma.valueChanged.connect(self._on_gamma_changed)
         row.addWidget(self.slider_gamma)
 
         self.btn_auto = QPushButton("Auto")
         self.btn_auto.setObjectName("compactBtn")
-        self.btn_auto.setFixedWidth(48)
+        self.btn_auto.setFixedWidth(scaled(48))
         self.btn_auto.clicked.connect(self._on_auto)
         row.addWidget(self.btn_auto)
 
         self.btn_reset = QPushButton("Reset")
         self.btn_reset.setObjectName("compactBtn")
-        self.btn_reset.setFixedWidth(54)
+        self.btn_reset.setFixedWidth(scaled(54))
         self.btn_reset.clicked.connect(self._on_reset)
         row.addWidget(self.btn_reset)
 
@@ -154,6 +155,11 @@ class LutHistogramWidget(QWidget):
         if not samples:
             return
         flat = np.concatenate(samples)
+        # Guard against all-empty samples (e.g. a degenerate crop yields
+        # zero-size frames): every reduction below (max / percentile / histogram)
+        # errors on a zero-size array. Leave the histogram unchanged.
+        if flat.size == 0:
+            return
 
         # Determine the natural dtype range (for the Reset button).
         sample_dtype = dtype if dtype is not None else flat.dtype

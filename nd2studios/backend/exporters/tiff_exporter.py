@@ -232,6 +232,9 @@ def export_tiff_hyperstack(
     filepath: str,
     bit_depth: str = "passthrough",
     pixel_size_um: Optional[float] = None,
+    lut_bounds: Optional[Dict[str, tuple]] = None,
+    z_step_um: Optional[float] = None,
+    finterval_s: Optional[float] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
 ) -> str:
     """Write enabled channels as a single ImageJ TZCYX hyperstack.
@@ -248,8 +251,21 @@ def export_tiff_hyperstack(
     bit_depth : ``"passthrough"`` | ``"uint16"`` | ``"uint8"``. Per-channel
         0.5–99.5 percentile stretch is applied for the rescaling modes so
         each channel keeps its own contrast.
-    pixel_size_um : if given, written as resolution + ``unit=um`` +
-        ``spacing`` so downstream tools (Fiji, napari) read scale correctly.
+    pixel_size_um : XY pixel size (µm). If given, written as the TIFF
+        resolution + ``unit=um`` so downstream tools (Fiji, napari) read the
+        lateral scale correctly.
+    z_step_um : Z voxel depth (µm) for a Z-stack. Written as the ImageJ
+        ``spacing`` (which ImageJ interprets as the inter-slice distance) so a
+        ``(T, Z, …)`` stack keeps its axial calibration. Falls back to
+        ``pixel_size_um`` when not given (back-compat).
+    finterval_s : frame interval (seconds) for a timelapse. Written as the
+        ImageJ ``finterval`` so the T axis keeps its temporal calibration.
+    lut_bounds : optional ``{channel_name: (lo, hi)}`` explicit contrast
+        bounds used *instead of* the auto percentile stretch when a
+        rescaling ``bit_depth`` (``uint8`` / ``uint16``) is chosen. Channels
+        absent from the dict fall back to the percentile stretch. Ignored for
+        ``passthrough`` (raw quantitative data is preserved). This lets callers
+        bake a manual viewer window or a full-range mapping into the file.
     progress_cb : 0–100 progress callback.
 
     Returns
@@ -291,18 +307,28 @@ def export_tiff_hyperstack(
     n_t, n_z, h, w = ref_shape
     n_c = len(arrays)
 
-    # Per-channel contrast bounds for rescale modes. Computed on a 1M
-    # pixel subsample so we don't pay a full-stack float32 copy (which
-    # would double the RAM peak on top of the channel data already in
-    # memory).
+    # Per-channel contrast bounds for rescale modes. An explicit
+    # ``lut_bounds`` entry (manual viewer window / full-range mapping) wins;
+    # otherwise a 1M-pixel subsample picks the percentile bounds so we don't
+    # pay a full-stack float32 copy (which would double the RAM peak on top of
+    # the channel data already in memory).
     bounds: List[Optional[tuple]] = [None] * n_c
     out_dtype = arrays[0].dtype
+
+    def _bounds_for(i: int) -> tuple:
+        name = enabled_names[i]
+        if lut_bounds and name in lut_bounds:
+            lo, hi = lut_bounds[name]
+            lo, hi = float(lo), float(hi)
+            return (lo, hi if hi > lo else lo + 1.0)
+        return _percentile_bounds_subsample(arrays[i])
+
     if bit_depth == "uint8":
         out_dtype = np.uint8  # type: ignore[assignment]
-        bounds = [_percentile_bounds_subsample(a) for a in arrays]
+        bounds = [_bounds_for(i) for i in range(n_c)]
     elif bit_depth == "uint16":
         out_dtype = np.uint16  # type: ignore[assignment]
-        bounds = [_percentile_bounds_subsample(a) for a in arrays]
+        bounds = [_bounds_for(i) for i in range(n_c)]
 
     # Estimate total output bytes for the BigTIFF threshold without
     # building the hyperstack in memory.
@@ -318,7 +344,16 @@ def export_tiff_hyperstack(
     if pixel_size_um is not None and pixel_size_um > 0:
         resolution = (1.0 / pixel_size_um, 1.0 / pixel_size_um)
         ij_meta["unit"] = "um"
-        ij_meta["spacing"] = float(pixel_size_um)
+    # ImageJ ``spacing`` is the axial (Z) voxel depth. Prefer an explicit
+    # ``z_step_um``; fall back to the XY pixel size only when no Z calibration
+    # was supplied (preserves the pre-existing behavior for older callers).
+    spacing = (z_step_um if (z_step_um is not None and z_step_um > 0)
+               else (pixel_size_um if (pixel_size_um and pixel_size_um > 0)
+                     else None))
+    if spacing is not None:
+        ij_meta["spacing"] = float(spacing)
+    if finterval_s is not None and finterval_s > 0:
+        ij_meta["finterval"] = float(finterval_s)
 
     fp = FrameProgress(n_t * n_z * n_c, progress_cb)
 

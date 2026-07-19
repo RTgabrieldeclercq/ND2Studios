@@ -113,6 +113,24 @@ HARD_CAP_MULTIPLE = 2.0
 """Refuse to load files whose projected footprint exceeds this multiple
 of available RAM, even via override.  Surfaces as :class:`StrategyError`."""
 
+EAGER_MAX_BYTES_DEFAULT = 2 * 1024 ** 3
+"""Absolute ceiling (bytes) for eager preallocation, independent of RAM %.
+
+V1.66 — NIS-Elements-style streaming-first policy: a file whose full in-RAM
+footprint exceeds this always streams (``LAZY_CACHED``) even on a big-RAM host,
+so a huge acquisition opens instantly instead of blocking on a multi-GB decode.
+Small files still load fully for zero per-frame latency."""
+
+STREAM_ALWAYS_DEFAULT = True
+"""V1.66 — streaming is the *overarching* viewing setup for ND2Studios.
+
+When True (the default), :func:`choose_strategy` returns ``LAZY_CACHED`` for
+every file regardless of size: it opens instantly (memory-map / lazy reads) and
+streams frames on demand with a bounded cache + prefetch, so viewing is
+uniformly fast and smooth. Eager full-RAM loading becomes opt-in via
+``FORCED_LOAD_STRATEGY`` (Performance dialog) for workflows that want zero
+per-frame latency on a small file already resident in RAM."""
+
 
 class StrategyError(RuntimeError):
     """Raised when no load strategy can fit the dataset on the host."""
@@ -165,7 +183,9 @@ def choose_strategy(
     *,
     override: Optional[LoadStrategy] = None,
     eager_max_fraction: float = EAGER_MAX_FRACTION_DEFAULT,
+    eager_max_bytes: int = EAGER_MAX_BYTES_DEFAULT,
     reserve_overhead: float = RESERVE_OVERHEAD,
+    stream_always: bool = STREAM_ALWAYS_DEFAULT,
 ) -> StrategyDecision:
     """Pick a load strategy based on ``meta`` and host resources.
 
@@ -192,7 +212,10 @@ def choose_strategy(
     projected = estimate_footprint(meta, project_z=True)
     avail = _available_bytes()
 
-    if projected > avail * HARD_CAP_MULTIPLE:
+    # Streaming never materializes the full volume, so the hard cap (which
+    # guards eager preallocation against OOM) is exempt when we will stream.
+    will_stream = stream_always or override == LoadStrategy.LAZY_CACHED
+    if not will_stream and projected > avail * HARD_CAP_MULTIPLE:
         raise StrategyError(
             f"Dataset too large to load: projected footprint "
             f"{projected / 1024**3:.2f} GB exceeds {HARD_CAP_MULTIPLE:.1f}× "
@@ -200,10 +223,10 @@ def choose_strategy(
             f"Close other applications or use a machine with more RAM."
         )
 
-    eager_cap = int(avail * eager_max_fraction)
+    # V1.66 — cap eager preallocation by BOTH a RAM fraction and an absolute
+    # byte ceiling, so a large file streams instead of blocking on a huge decode.
+    eager_cap = min(int(avail * eager_max_fraction), int(eager_max_bytes))
     full_fits = (full * reserve_overhead) <= eager_cap
-    projected_fits = (projected * reserve_overhead) <= eager_cap
-    n_z = max(1, int(getattr(meta, "n_zslices", 1)))
 
     worker_count = recommended_worker_count()
     if path:
@@ -223,6 +246,16 @@ def choose_strategy(
             else 0
         )
         reason = f"override={strat.value}"
+    elif stream_always:
+        # V1.66 — streaming is the overarching viewing setup: open instantly,
+        # stream on demand (Z preserved for the 3-D viewer / navigation).
+        strat = LoadStrategy.LAZY_CACHED
+        z_collapsed = False
+        cache_budget = recommended_cache_budget_bytes()
+        reason = (
+            "streaming (overarching viewing default) — opens instantly, streams "
+            f"on demand with {cache_budget / 1024**3:.2f} GB cache"
+        )
     elif full_fits:
         strat = LoadStrategy.EAGER_FULL
         z_collapsed = False
@@ -232,22 +265,17 @@ def choose_strategy(
             f"{eager_max_fraction*100:.0f}% of available "
             f"{avail / 1024**3:.2f} GB"
         )
-    elif projected_fits and n_z > 1:
-        strat = LoadStrategy.EAGER_REDUCED
-        z_collapsed = True
-        cache_budget = 0
-        reason = (
-            f"full footprint {full / 1024**3:.2f} GB exceeds eager budget "
-            f"{eager_cap / 1024**3:.2f} GB; Z-collapsed "
-            f"{projected / 1024**3:.2f} GB fits"
-        )
     else:
+        # V1.66 streaming-first: when the full volume doesn't fit the eager
+        # budget, stream on demand (LAZY_CACHED) — this preserves Z for the 3-D
+        # viewer / Z navigation. EAGER_REDUCED (collapse Z at load) is now
+        # opt-in only via a forced override.
         strat = LoadStrategy.LAZY_CACHED
         z_collapsed = False
         cache_budget = recommended_cache_budget_bytes()
         reason = (
-            f"projected footprint {projected / 1024**3:.2f} GB exceeds eager "
-            f"budget {eager_cap / 1024**3:.2f} GB; lazy with "
+            f"full footprint {full / 1024**3:.2f} GB exceeds eager budget "
+            f"{eager_cap / 1024**3:.2f} GB → streaming on demand with "
             f"{cache_budget / 1024**3:.2f} GB cache"
         )
 
@@ -316,7 +344,10 @@ def should_stream_analysis(
             else:
                 cls_name = type(volume).__name__
                 if getattr(volume, "is_lazy", False) or "Lazy" in cls_name:
-                    return True
+                    # V1.66 smart split: a streamed dataset that fits comfortably
+                    # in RAM is materialized for fast in-RAM analysis; only one
+                    # too big to fit streams (spilling labels to disk).
+                    return not fits_resident(volume, monitor=monitor)
         except Exception:  # noqa: BLE001
             pass
 
@@ -339,3 +370,56 @@ def should_stream_analysis(
             pass
 
     return False
+
+
+def fits_resident(volume, *, monitor=None,
+                  eager_max_fraction: float = EAGER_MAX_FRACTION_DEFAULT) -> bool:
+    """True if ``volume``'s full ``(M,T,Z,H,W)`` footprint fits comfortably in
+    RAM (≤ ``eager_max_fraction`` of available, no memory pressure) — i.e. it is
+    safe to materialize for fast in-RAM compute.
+
+    This is the "materialize-for-analysis" decision. Unlike the *view*-open
+    decision (which also applies the small absolute ``EAGER_MAX_BYTES`` cap so
+    huge files stream instantly), the compute fit check is purely RAM-relative:
+    on a big-RAM host a multi-GB stack can be materialized for analysis even
+    though it streams for viewing.
+    """
+    if volume is None:
+        return False
+    if monitor is not None:
+        try:
+            if int(monitor.current_band()) >= 2:   # CRITICAL+ → don't materialize
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        full = estimate_footprint(volume, project_z=False)
+    except Exception:  # noqa: BLE001
+        return False
+    avail = _available_bytes()
+    return (full * RESERVE_OVERHEAD) <= int(avail * eager_max_fraction)
+
+
+def materialize_channels_if_fits(channels, volume, *, monitor=None):
+    """Return analysis-input channels as resident ndarrays when the dataset fits
+    in RAM (fast in-RAM compute), else return them unchanged (lazy → streamed
+    compute). The "materialize-for-analysis" half of the stream-for-view /
+    materialize-for-analysis split (V1.66).
+
+    ``channels`` is a ``{name: (T,H,W) array-or-proxy}`` dict; ``volume`` is the
+    source dataset used for the fit check. Lazy proxies are read via
+    ``.materialize()`` (or ``np.asarray``); resident ndarrays pass through.
+    """
+    if not channels or not fits_resident(volume, monitor=monitor):
+        return channels
+    resident = {}
+    for name, ch in channels.items():
+        if isinstance(ch, np.ndarray):
+            resident[name] = ch          # already resident (incl. _ChannelView)
+            continue
+        mat = getattr(ch, "materialize", None)
+        try:
+            resident[name] = np.asarray(mat() if callable(mat) else ch)
+        except Exception:  # noqa: BLE001 — never fail compute over materialization
+            resident[name] = ch
+    return resident

@@ -29,6 +29,7 @@ from nd2studios.backend.macro_engine import (
     MACRO_EXTENSION, MacroAction, load_macro, save_macro,
 )
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled
 
 # Maps action_type → (path_param_key, picker_mode)
 # picker_mode: "save_file" | "open_file" | "open_dir"
@@ -65,7 +66,7 @@ class _ActionRowWidget(QFrame):
         super().__init__(parent)
         self.setObjectName("actionRow")
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setFixedHeight(36)
+        self.setFixedHeight(scaled(36))
         self.setAutoFillBackground(True)  # opaque — prevents list item text from bleeding through
         self._action = action
 
@@ -74,8 +75,8 @@ class _ActionRowWidget(QFrame):
         h.setSpacing(6)
 
         drag_lbl = QLabel("⠿")
-        drag_lbl.setFixedWidth(18)
-        drag_lbl.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font-size: 14px;")
+        drag_lbl.setFixedWidth(scaled(18))
+        drag_lbl.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font-size: 14px;"))
         drag_lbl.setToolTip("Drag to reorder")
         h.addWidget(drag_lbl)
 
@@ -95,13 +96,13 @@ class _ActionRowWidget(QFrame):
         h.addWidget(self._lbl, stretch=1)
 
         btn_edit = QPushButton("Edit")
-        btn_edit.setFixedWidth(52)
+        btn_edit.setFixedWidth(scaled(52))
         btn_edit.setObjectName("sessionBtn")
         btn_edit.clicked.connect(self.edit_requested)
         h.addWidget(btn_edit)
 
         btn_del = QPushButton("✕")
-        btn_del.setFixedWidth(28)
+        btn_del.setFixedWidth(scaled(28))
         btn_del.setObjectName("dangerBtn")
         btn_del.clicked.connect(self.delete_requested)
         h.addWidget(btn_del)
@@ -134,7 +135,7 @@ class _ActionEditDialog(QDialog):
     def __init__(self, action: MacroAction, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("Edit Action")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(scaled(480))
         self._action = action
         self._editors: Dict[str, QLineEdit] = {}
 
@@ -146,7 +147,7 @@ class _ActionEditDialog(QDialog):
         layout.addWidget(info)
 
         type_lbl = QLabel(f"Type: <code>{action.action_type}</code>")
-        type_lbl.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        type_lbl.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         layout.addWidget(type_lbl)
 
         sep = QFrame()
@@ -180,7 +181,7 @@ class _ActionEditDialog(QDialog):
                     row_l.setSpacing(4)
                     row_l.addWidget(edit, stretch=1)
                     btn = QPushButton("Browse…")
-                    btn.setMaximumWidth(80)
+                    btn.setMaximumWidth(scaled(80))
                     btn.clicked.connect(
                         lambda checked=False, e=edit, m=picker_mode:
                         self._browse_path(e, m)
@@ -276,9 +277,9 @@ class _ActionListWidget(QWidget):
         """Highlight row *idx* as the currently-replaying action; -1 clears all."""
         for i, rw in enumerate(self._row_widgets):
             if i == idx:
-                rw.setStyleSheet(
+                rw.setStyleSheet(scale_qss(
                     "background: #283593; border: 1px solid #8be9fd; border-radius: 3px;"
-                )
+                ))
             else:
                 rw.setStyleSheet("")
         if 0 <= idx < self._list.count():
@@ -292,7 +293,7 @@ class _ActionListWidget(QWidget):
         for i, action in enumerate(self._actions):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, i)
-            item.setSizeHint(QSize(0, 38))
+            item.setSizeHint(QSize(0, scaled(38)))
             # Keep item text empty — the _ActionRowWidget renders the label.
             # Populated text bleeds through the widget's transparent edges.
             item.setFlags(
@@ -354,7 +355,7 @@ class MacroDialog(QDialog):
         self._recorded_actions: List[MacroAction] = []
 
         self.setWindowTitle("Macro Recorder")
-        self.setMinimumSize(480, 560)
+        self.setMinimumSize(scaled(480), scaled(560))
         # Use a plain Window so it floats freely alongside the app without
         # sitting on top of OS file pickers or other pop-ups.
         self.setWindowFlags(Qt.WindowType.Window)
@@ -442,7 +443,7 @@ class MacroDialog(QDialog):
         v.addLayout(header)
 
         self._lbl_rec_status = QLabel("Interact with the application — actions will appear here.")
-        self._lbl_rec_status.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self._lbl_rec_status.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         self._lbl_rec_status.setWordWrap(True)
         v.addWidget(self._lbl_rec_status)
 
@@ -454,7 +455,7 @@ class MacroDialog(QDialog):
 
         # Count label
         self._lbl_rec_count = QLabel("0 actions recorded")
-        self._lbl_rec_count.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self._lbl_rec_count.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         v.addWidget(self._lbl_rec_count)
 
         # Control buttons
@@ -495,12 +496,12 @@ class MacroDialog(QDialog):
         v.addLayout(name_row)
 
         self._lbl_edit_path = QLabel()
-        self._lbl_edit_path.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        self._lbl_edit_path.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 8pt;"))
         self._lbl_edit_path.setWordWrap(True)
         v.addWidget(self._lbl_edit_path)
 
         hint = QLabel("Drag rows to reorder · check/uncheck to enable/disable · Edit to change params")
-        hint.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        hint.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 8pt;"))
         hint.setWordWrap(True)
         v.addWidget(hint)
 
@@ -509,14 +510,14 @@ class MacroDialog(QDialog):
 
         # Replay progress (hidden until Run Macro is clicked)
         self._replay_step_label = QLabel("")
-        self._replay_step_label.setStyleSheet(
+        self._replay_step_label.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 8pt;"
-        )
+        ))
         self._replay_step_label.setVisible(False)
         v.addWidget(self._replay_step_label)
 
         self._replay_progress_bar = QProgressBar()
-        self._replay_progress_bar.setMaximumHeight(14)
+        self._replay_progress_bar.setMaximumHeight(scaled(14))
         self._replay_progress_bar.setVisible(False)
         v.addWidget(self._replay_progress_bar)
 

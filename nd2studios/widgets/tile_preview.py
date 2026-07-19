@@ -31,6 +31,7 @@ from nd2studios.backend.exporters.stitch_exporter import (
     StitchLayout, compute_tile_layout,
 )
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled_pt
 
 
 class TilePreviewWidget(QFrame):
@@ -46,11 +47,11 @@ class TilePreviewWidget(QFrame):
         self.margin_px = margin_px
         self.setCursor(Qt.PointingHandCursor)
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet(
+        self.setStyleSheet(scale_qss(
             f"background-color: rgba(33, 37, 43, 220);"
             f"border: 1px solid {Settings.BORDER_COLOR};"
             f"border-radius: 4px;"
-        )
+        ))
         self.setToolTip(
             "Tile layout preview — click to open the stitch dialog.\n"
             "Highlighted rectangle is the currently displayed M position."
@@ -117,7 +118,7 @@ class TilePreviewWidget(QFrame):
 
         # Inset for the title strip at top.
         title = "Tile layout"
-        font = QFont("Helvetica Neue", 8)
+        font = QFont("Helvetica Neue", int(round(scaled_pt(8))))
         painter.setFont(font)
         fm = QFontMetrics(font)
         title_h = fm.height() + 4

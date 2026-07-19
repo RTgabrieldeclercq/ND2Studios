@@ -41,6 +41,9 @@ def main() -> None:
         QGuiApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     if hasattr(Qt, "AA_UseHighDpiPixmaps"):
         QGuiApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    # V1.66 — share GL contexts for the (off-screen) 3-D viewer / VTK.
+    if hasattr(Qt, "AA_ShareOpenGLContexts"):
+        QGuiApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
 
     from nd2studios.core.settings import Settings
     from nd2studios.core.theme import build_stylesheet
@@ -85,6 +88,7 @@ def main() -> None:
     import nd2studios.backend.analysis.spots_pipeline  # noqa: F401
     import nd2studios.backend.analysis.manual_mask  # noqa: F401
     import nd2studios.backend.dvc.method  # noqa: F401  # registers ALDVCMethod (DVC node)
+    import nd2studios.backend.dic.method  # noqa: F401  # registers PyALDICMethod (2D DIC node)
     import nd2studios.backend.registration.method  # noqa: F401  # registers RigidRegistration (registration node)
 
     app = QApplication(sys.argv)

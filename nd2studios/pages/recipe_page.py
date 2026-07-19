@@ -40,6 +40,7 @@ from nd2studios.core.plugin_registry import PluginBase
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.collapsible_sidebar import CollapsibleSidebar
 from nd2studios.widgets.common import ParamEditor
+from nd2studios.widgets.icon_button import scale_qss, scaled
 from nd2studios.widgets.image_viewer import CHANNEL_COLORS
 from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
 from nd2studios.workers.recipe_worker import RecipeWorker
@@ -211,7 +212,7 @@ class RecipePage(QWidget):
 
         # Left column: plugin picker + params + buttons.
         left = QWidget()
-        left.setFixedWidth(420)
+        left.setFixedWidth(scaled(420))
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(8)
@@ -224,8 +225,8 @@ class RecipePage(QWidget):
         pl.addWidget(self.combo_plugin)
         self.lbl_plugin_desc = QLabel("")
         self.lbl_plugin_desc.setWordWrap(True)
-        self.lbl_plugin_desc.setStyleSheet(
-            f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_plugin_desc.setStyleSheet(scale_qss(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         pl.addWidget(self.lbl_plugin_desc)
         self.param_editor = ParamEditor()
         pl.addWidget(self.param_editor)
@@ -274,8 +275,8 @@ class RecipePage(QWidget):
         )
         cl.addWidget(self.btn_crop_mode)
         self.lbl_crop_status = QLabel("No crop applied")
-        self.lbl_crop_status.setStyleSheet(
-            f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_crop_status.setStyleSheet(scale_qss(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         cl.addWidget(self.lbl_crop_status)
         self.btn_reset_crop = QPushButton("Reset Crop")
         self.btn_reset_crop.setEnabled(False)
@@ -650,7 +651,7 @@ class RecipePage(QWidget):
 
         info = QLabel(f"Image: {img_w} × {img_h} px  "
                       f"(X = columns from left, Y = rows from top)")
-        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         layout.addWidget(info)
 
         form = QFormLayout()

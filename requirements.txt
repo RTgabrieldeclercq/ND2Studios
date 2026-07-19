@@ -8,3 +8,14 @@ qtawesome>=1.3
 # (nd2studios/backend/serialtrack), used by the "Track Objects" node's
 # "SerialTrack (topology PTV)" method.
 numba>=0.60
+
+# ── V1.65 — OPTIONAL: PyVista volumetric 3-D viewer ─────────────────────────
+# Powers the 2D<->3D toggle (Import + Pipelines) and the result "View in 3D".
+# Deliberately NOT hard requirements: they are find_spec-gated exactly like the
+# cellpose / stardist segmentation backends, so ND2Studios runs identically
+# without them (the 3-D toggle just shows an install hint). Enable with:
+#     pip install pyvista pyvistaqt
+# Known-good ranges (verify against your installed PySide6):
+#     pyvista>=0.43   pyvistaqt>=0.11   vtk>=9.2
+# pyvistaqt binds through qtpy; the viewer sets QT_API=pyside6 before importing
+# it so it selects PySide6 rather than any PyQt also present.

@@ -27,6 +27,7 @@ from nd2studios.pipeline_graph.conditions import (
 from nd2studios.pipeline_graph.executor import (
     CroppedVolume,
     GraphRunner,
+    ObjectCropVolume,
     PinnedProcessedVolume,
     ProcessedFrameVolume,
     RegisteredFrameVolume,
@@ -34,6 +35,7 @@ from nd2studios.pipeline_graph.executor import (
     channel_recipes,
     channel_sets,
     channel_source_channels,
+    display_channel_sets,
     edge_channels,
     evaluate_simple_condition,
     has_channel_wiring,
@@ -85,6 +87,8 @@ from nd2studios.pipeline_graph.model import (
     PipelineDoc,
     Port,
     PortType,
+    SCOPE_OBJECTS,
+    SCOPE_WHOLE,
     STRUCTURAL_KIND,
     ShapeKind,
     Stage,
@@ -92,9 +96,13 @@ from nd2studios.pipeline_graph.model import (
     can_connect_loop,
     category_for_stage,
     clone_node,
+    edge_scope,
+    edge_view_only,
     is_channel_port,
     is_loop_edge,
     new_id,
+    set_edge_scope,
+    set_edge_view_only,
     structural_input_port,
     would_create_cycle,
 )
@@ -105,15 +113,24 @@ from nd2studios.pipeline_graph.registry_adapter import (
     RAINBOW_IN_NAME,
     RAINBOW_OUT_NAME,
     SPECIAL_CHECKPOINT_OP_KEY,
+    SPECIAL_CROP_OP_KEY,
     SPECIAL_CT_FIELDS_OP_KEY,
     SPECIAL_CT_METRICS_OP_KEY,
     SPECIAL_DISMISS_OP_KEY,
+    SPECIAL_DIC_OP_KEY,
+    SPECIAL_DIC_REFINE_OP_KEY,
+    SPECIAL_DIC_ROI_OP_KEY,
+    SPECIAL_DVC_CHECKPOINT_OP_KEY,
     SPECIAL_DVC_OP_KEY,
+    SPECIAL_EXCLUDE_OP_KEY,
     SPECIAL_EXPORT_OP_KEY,
     SPECIAL_INTERP_MAP_OP_KEY,
+    SPECIAL_MASK3D_OP_KEY,
     SPECIAL_PAUSE_OP_KEY,
+    SPECIAL_PRISM_OP_KEY,
     SPECIAL_REGISTER_OP_KEY,
     SPECIAL_REVIEW_OP_KEY,
+    SPECIAL_SAVE_DATA_OP_KEY,
     SPECIAL_SEND_RESULTS_OP_KEY,
     SPECIAL_TRACK_OP_KEY,
     SPECIAL_VALIDATE_OP_KEY,
@@ -127,6 +144,7 @@ from nd2studios.pipeline_graph.registry_adapter import (
     channel_name_for_op_key,
     channel_source_spec,
     default_params_for,
+    dvc_checkpoint_spec,
     enhancement_specs,
     if_else_spec,
     is_channel_source_op,
@@ -143,6 +161,14 @@ from nd2studios.pipeline_graph.registry_adapter import (
     special_op_name_for_op_key,
     special_specs,
 )
+from nd2studios.pipeline_graph.granule_ops import (
+    GRANULE_OP_KEYS,
+    SPECIAL_BEAD_DETECT_OP_KEY,
+    SPECIAL_GRANULE_BOUNDARY_OP_KEY,
+    SPECIAL_GRANULE_CLUSTER_OP_KEY,
+    SPECIAL_GRANULE_MASK_OP_KEY,
+    SPECIAL_GRANULE_TESSELLATE_OP_KEY,
+)
 
 __all__ = [
     # model
@@ -151,6 +177,8 @@ __all__ = [
     "category_for_stage", "clone_node", "is_channel_port",
     "structural_input_port", "new_id", "would_create_cycle",
     "LOOP_KIND", "STRUCTURAL_KIND", "is_loop_edge", "can_connect_loop",
+    "SCOPE_WHOLE", "SCOPE_OBJECTS", "edge_scope", "set_edge_scope",
+    "edge_view_only", "set_edge_view_only",  # V1.77 view-only (dotted) edge
     # loop (V1.49)
     "LoopRegion", "IterationResult", "LOOP_CONFIG_VERSION", "MODE_SWEEP",
     "MODE_COUNT", "MODE_UNTIL", "RULE_UNION_DEDUP", "RULE_BEST", "RULE_LAST",
@@ -164,18 +192,26 @@ __all__ = [
     "analysis_output_spec", "analysis_pipeline_name_for_op_key",
     "results_specs", "results_input_spec", "results_output_spec",
     "results_op_name_for_op_key", "if_else_spec", "special_specs",
-    "merged_action_specs", "special_op_name_for_op_key",
+    "merged_action_specs", "special_op_name_for_op_key", "dvc_checkpoint_spec",
     # channel-flow (V1.48)
     "CHANNEL_PREFIX", "CHANNEL_ALL_OP_KEY", "RAINBOW_IN_NAME", "RAINBOW_OUT_NAME",
     "channel_source_spec", "channel_all_spec", "channel_name_for_op_key",
     "is_channel_source_op", "spec_takes_channels",
     "IF_ELSE_OP_KEY", "SPECIAL_CHECKPOINT_OP_KEY", "SPECIAL_DISMISS_OP_KEY",
-    "SPECIAL_EXPORT_OP_KEY",
+    "SPECIAL_EXPORT_OP_KEY", "SPECIAL_SAVE_DATA_OP_KEY", "SPECIAL_CROP_OP_KEY",
     "SPECIAL_PAUSE_OP_KEY", "SPECIAL_REVIEW_OP_KEY",
     "SPECIAL_SEND_RESULTS_OP_KEY", "SPECIAL_TRACK_OP_KEY",
     "SPECIAL_VALIDATE_OP_KEY", "SPECIAL_CT_METRICS_OP_KEY",
     "SPECIAL_CT_FIELDS_OP_KEY", "SPECIAL_INTERP_MAP_OP_KEY",
-    "SPECIAL_DVC_OP_KEY", "SPECIAL_REGISTER_OP_KEY",
+    "SPECIAL_DVC_OP_KEY", "SPECIAL_DVC_CHECKPOINT_OP_KEY",
+    "SPECIAL_REGISTER_OP_KEY", "SPECIAL_MASK3D_OP_KEY",
+    "SPECIAL_EXCLUDE_OP_KEY", "SPECIAL_PRISM_OP_KEY",
+    # 2D DIC (pyALDIC) — V1.78
+    "SPECIAL_DIC_OP_KEY", "SPECIAL_DIC_ROI_OP_KEY", "SPECIAL_DIC_REFINE_OP_KEY",
+    # granule separation (V1.70)
+    "GRANULE_OP_KEYS", "SPECIAL_BEAD_DETECT_OP_KEY", "SPECIAL_GRANULE_CLUSTER_OP_KEY",
+    "SPECIAL_GRANULE_TESSELLATE_OP_KEY", "SPECIAL_GRANULE_MASK_OP_KEY",
+    "SPECIAL_GRANULE_BOUNDARY_OP_KEY",
     # conditions (if-else DSL)
     "BLOCK_KINDS", "Condition", "ConditionBlock", "block_param_schema",
     "default_block_params", "default_condition", "describe_condition",
@@ -190,6 +226,7 @@ __all__ = [
     # channel-flow executor (V1.48)
     "channel_sets", "channel_recipes", "channel_source_channels",
     "has_channel_wiring", "structural_chain", "edge_channels",
+    "display_channel_sets",  # V1.77 view-only overlay channel propagation
     # io
     "PIPELINE_EXTENSION", "PIPELINE_KIND", "PIPELINE_VERSION",
     "load_pipeline", "save_pipeline",

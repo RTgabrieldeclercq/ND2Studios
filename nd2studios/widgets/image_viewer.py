@@ -17,6 +17,7 @@ from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QBrush, QColor, QPoly
 
 from nd2studios.core.settings import Settings
 from nd2studios.utils.perf import perf_log
+from nd2studios.widgets.icon_button import scale_qss, scaled
 
 
 # Standard LUT colors available for channel assignment
@@ -133,21 +134,21 @@ class ZoomToolbar(QWidget):
         self.btn_home = QPushButton("Home")
         self.btn_home.setObjectName("compactBtn")
         self.btn_home.setToolTip("Reset view (fit image to window)")
-        self.btn_home.setFixedSize(BTN_W, BTN_H)
+        self.btn_home.setFixedSize(scaled(BTN_W), scaled(BTN_H))
         self.btn_home.clicked.connect(self._on_home)
         layout.addWidget(self.btn_home)
 
         self.btn_zoom_in = QPushButton("+")
         self.btn_zoom_in.setObjectName("compactBtn")
         self.btn_zoom_in.setToolTip("Zoom in")
-        self.btn_zoom_in.setFixedSize(BTN_H, BTN_H)
+        self.btn_zoom_in.setFixedSize(scaled(BTN_H), scaled(BTN_H))
         self.btn_zoom_in.clicked.connect(self._on_zoom_in)
         layout.addWidget(self.btn_zoom_in)
 
         self.btn_zoom_out = QPushButton("-")
         self.btn_zoom_out.setObjectName("compactBtn")
         self.btn_zoom_out.setToolTip("Zoom out")
-        self.btn_zoom_out.setFixedSize(BTN_H, BTN_H)
+        self.btn_zoom_out.setFixedSize(scaled(BTN_H), scaled(BTN_H))
         self.btn_zoom_out.clicked.connect(self._on_zoom_out)
         layout.addWidget(self.btn_zoom_out)
 
@@ -159,7 +160,7 @@ class ZoomToolbar(QWidget):
             "When off, click reports pixel coordinates."
         )
         self.btn_pan.setCheckable(True)
-        self.btn_pan.setFixedSize(BTN_W, BTN_H)
+        self.btn_pan.setFixedSize(scaled(BTN_W), scaled(BTN_H))
         self.btn_pan.toggled.connect(canvas.set_pan_mode)
         layout.addWidget(self.btn_pan)
 
@@ -171,15 +172,15 @@ class ZoomToolbar(QWidget):
         self.btn_overlay.setObjectName("compactBtn")
         self.btn_overlay.setToolTip(
             "Overlay appearance: uniform color, line weight, multicolor, opacity.")
-        self.btn_overlay.setFixedSize(BTN_W, BTN_H)
+        self.btn_overlay.setFixedSize(scaled(BTN_W), scaled(BTN_H))
         self._overlay_menu = self._build_overlay_menu()
         self.btn_overlay.setMenu(self._overlay_menu)
         self.btn_overlay.setVisible(False)   # shown only when an overlay is active
         layout.addWidget(self.btn_overlay)
 
         self.lbl_zoom = QLabel("100%")
-        self.lbl_zoom.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
-        self.lbl_zoom.setMinimumWidth(48)
+        self.lbl_zoom.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
+        self.lbl_zoom.setMinimumWidth(scaled(48))
         layout.addWidget(self.lbl_zoom)
 
         # Update label whenever the canvas updates its zoom.
@@ -190,7 +191,7 @@ class ZoomToolbar(QWidget):
         self.btn_coord = QPushButton("px")
         self.btn_coord.setObjectName("compactBtn")
         self.btn_coord.setCheckable(True)
-        self.btn_coord.setFixedSize(BTN_H, BTN_H)
+        self.btn_coord.setFixedSize(scaled(BTN_H), scaled(BTN_H))
         self.btn_coord.setToolTip("Toggle hover coordinates: image pixels (px) ↔ "
                                   "stage micrometers (µm).")
         self.btn_coord.toggled.connect(self._on_coord_toggled)
@@ -198,8 +199,8 @@ class ZoomToolbar(QWidget):
 
         self.lbl_hover = QLabel("")
         self.lbl_hover.setObjectName("hoverReadout")
-        self.lbl_hover.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
-        self.lbl_hover.setMinimumWidth(60)
+        self.lbl_hover.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
+        self.lbl_hover.setMinimumWidth(scaled(60))
         layout.addWidget(self.lbl_hover)
 
     def _on_home(self):
@@ -237,7 +238,7 @@ class ZoomToolbar(QWidget):
 
         grid.addWidget(QLabel("Color"), 1, 0)
         self._ov_color_btn = QPushButton()
-        self._ov_color_btn.setFixedSize(44, 20)
+        self._ov_color_btn.setFixedSize(scaled(44), scaled(20))
         self._ov_color_btn.setToolTip("Uniform overlay color")
         self._ov_color_btn.clicked.connect(self._on_pick_color)
         grid.addWidget(self._ov_color_btn, 1, 1)
@@ -271,8 +272,8 @@ class ZoomToolbar(QWidget):
 
     def _update_color_swatch(self) -> None:
         r, g, b = self._overlay_style["color"]  # type: ignore[misc]
-        self._ov_color_btn.setStyleSheet(
-            f"background-color: rgb({r}, {g}, {b}); border: 1px solid #888;")
+        self._ov_color_btn.setStyleSheet(scale_qss(
+            f"background-color: rgb({r}, {g}, {b}); border: 1px solid #888;"))
 
     def _on_pick_color(self) -> None:
         r, g, b = self._overlay_style["color"]  # type: ignore[misc]
@@ -326,7 +327,7 @@ class ImageCanvas(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(200, 200)
+        self.setMinimumSize(scaled(200), scaled(200))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet(f"background-color: {Settings.BG_SECONDARY};")
 
@@ -886,7 +887,7 @@ class ImageViewer(QWidget):
             self.t_slider.valueChanged.connect(self._on_t_changed)
             ctrl.addWidget(self.t_slider, stretch=1)
             self.t_label = QLabel("0/0")
-            self.t_label.setMinimumWidth(55)
+            self.t_label.setMinimumWidth(scaled(55))
             ctrl.addWidget(self.t_label)
 
             self.auto_contrast_cb = QCheckBox("Auto")

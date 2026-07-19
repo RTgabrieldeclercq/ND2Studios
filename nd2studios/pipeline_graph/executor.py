@@ -22,12 +22,15 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from nd2studios.core.plugin_registry import PluginBase
-from nd2studios.pipeline_graph.model import GraphSlice, Node, NodeRole, PortType
+from nd2studios.pipeline_graph.model import (
+    GraphSlice, Node, NodeRole, PortType, edge_view_only,
+)
 from nd2studios.pipeline_graph.registry_adapter import (
     CHANNEL_ALL_OP_KEY,
     CHANNEL_PREFIX,
     INPUT_OP_KEY,
     OUTPUT_OP_KEY,
+    SPECIAL_PRISM_OP_KEY,
     channel_name_for_op_key,
     plugin_name_for_op_key,
 )
@@ -163,6 +166,16 @@ def channel_sets(sl: GraphSlice, all_names: List[str]) -> Dict[str, Set[str]]:
     upstream "follows" downstream automatically). Channel source nodes seed their
     own channels.
 
+    V1.77 — two refinements, both no-ops for legacy graphs:
+    * **View-only (dotted) edges are skipped** (:func:`~nd2studios.pipeline_graph.model.edge_view_only`)
+      so a channel converged for *display only* never enters analysis nor propagates
+      downstream as an analysis channel.
+    * A **Prism** node (``special:prism``) applies its ``channel_op`` directive to the
+      channels wired into its rainbow port (``inject``) vs the structural upstream
+      channels (``struct``): ``add`` = ``struct | inject`` (the plain union, default),
+      ``remove`` = ``struct - inject``, ``replace`` = ``inject`` (or ``struct`` if
+      nothing injected). Every non-Prism node is the plain union, exactly as before.
+
     Legacy fallback: with no channel wiring anywhere, every node maps to all
     channels (the pre-V1.48 behavior)."""
     all_set = set(all_names)
@@ -176,11 +189,85 @@ def channel_sets(sl: GraphSlice, all_names: List[str]) -> Dict[str, Set[str]]:
         n = sl.nodes.get(nid)
         if n is None or n.op_key.startswith(CHANNEL_PREFIX):
             continue
-        acc: Set[str] = set()
+        struct_acc: Set[str] = set()
+        chan_acc: Set[str] = set()
         for e in sl.structural_incoming(nid):  # V1.49: ignore loop back-edges
-            acc |= sets.get(e.src_node, set())
+            if edge_view_only(e):              # V1.77: display-only, never analysis
+                continue
+            contrib = sets.get(e.src_node, set())
+            src_port = sl.find_port(e.src_port)
+            if src_port is not None and src_port.type is PortType.CHANNEL:
+                chan_acc |= contrib            # a channel-wire (rainbow) feed
+            else:
+                struct_acc |= contrib          # a structural (pipeline) feed
+        if n.op_key == SPECIAL_PRISM_OP_KEY:   # V1.77 add/remove/replace directive
+            mode = str((n.params or {}).get("channel_op", "add"))
+            if mode == "replace":
+                acc = set(chan_acc) if chan_acc else set(struct_acc)
+            elif mode == "remove":
+                acc = struct_acc - chan_acc
+            else:  # add (default) — same as the plain union
+                acc = struct_acc | chan_acc
+        else:
+            acc = struct_acc | chan_acc        # non-Prism: identical to the old union
         sets[nid] = acc
     return sets
+
+
+def _prism_injected_channels(
+    sl: GraphSlice, node: Node, all_names: List[str],
+    sets: Dict[str, Set[str]]
+) -> Set[str]:
+    """Channels wired into a Prism's rainbow (CHANNEL) input port(s) — the channel(s)
+    it "loads in" (V1.77). Union of the channel-source sets on its channel-wire
+    incoming edges; ``sets`` (a precomputed :func:`channel_sets`) resolves a wire that
+    comes from another node's rainbow *output* rather than a channel-source pill."""
+    inj: Set[str] = set()
+    for e in sl.structural_incoming(node.id):
+        src_port = sl.find_port(e.src_port)
+        if src_port is None or src_port.type is not PortType.CHANNEL:
+            continue
+        src = sl.nodes.get(e.src_node)
+        if src is None:
+            continue
+        if src.op_key.startswith(CHANNEL_PREFIX):
+            inj |= channel_source_channels(src, all_names)
+        else:
+            inj |= sets.get(e.src_node, set())
+    return inj
+
+
+def display_channel_sets(
+    sl: GraphSlice, all_names: List[str]
+) -> Dict[str, Set[str]]:
+    """Per-node **view-only overlay** channels (``node_id -> {channel names}``), V1.77.
+
+    A view-only (dotted) edge feeds channels to the viewers only. For each such edge the
+    destination node's display set gains the source's contribution: for a **Prism**
+    source that is the channel(s) injected into its rainbow port (so the overlay is
+    exactly what you plugged in, e.g. the green channel); for any other source it is the
+    source's analysis channel set (:func:`channel_sets`). This is disjoint from
+    ``channel_sets`` (which skips view-only edges) and does not propagate further — the
+    display channel is consumed at the node the dotted edge points to.
+
+    Returns an empty set per node when there are no view-only edges — so a graph that
+    never uses the dotted lever gets ``{nid: set()}`` and every viewer path is untouched.
+    """
+    analysis = channel_sets(sl, all_names)
+    out: Dict[str, Set[str]] = {nid: set() for nid in sl.nodes}
+    for e in sl.structural_edges():            # no strands on loop edges
+        if not edge_view_only(e):
+            continue
+        src = sl.nodes.get(e.src_node)
+        if src is None:
+            continue
+        if src.op_key == SPECIAL_PRISM_OP_KEY:
+            contrib = _prism_injected_channels(sl, src, all_names, analysis)
+        else:
+            contrib = analysis.get(e.src_node, set())
+        if e.dst_node in out:
+            out[e.dst_node] |= set(contrib)
+    return out
 
 
 def structural_chain(sl: GraphSlice, node_id: str) -> List[Node]:
@@ -744,6 +831,108 @@ class CroppedVolume:
         frame = np.asarray(
             self._raw.get_frame(c=c, m=m, t=t, z=z, z_mode=z_mode, **kwargs))
         return frame[self._y:self._y + self._h, self._x:self._x + self._w]
+
+
+class ObjectCropVolume:
+    """Lazy volume cropping the wrapped volume to a **single object's** box.
+
+    The per-object generalization of :class:`CroppedVolume` (V1.68 Frame/Object
+    scope toggle): when an edge's scope is ``objects``, the downstream sub-pipeline
+    runs once per object on a volume wrapped in this. XY is cropped to the object's
+    bounding box and — for a **3-D** object (``region.z_scoped``) — Z to its
+    ``[z0:z1]`` sub-stack; **T, M and channels are conserved** (the object is the
+    same across the timelapse, so only the spatial footprint shrinks). ``get_frame``
+    /``get_volume`` translate the object's local Z window onto the raw volume's
+    absolute Z, so consumers see a smaller ``n_zslices`` starting at 0.
+
+    ``mask_out`` optionally zeroes voxels **outside** ``region.mask`` (the object as
+    a hard boundary). Default ``False`` — a plain bbox crop that keeps the
+    surrounding matrix context: correlation nodes (DVC) measure displacement in the
+    field *around* the object, so hard-masking would destroy the signal.
+
+    No ``channels`` attribute → consumers use the ``get_frame`` path.
+    """
+
+    bypass_pyramid = True
+
+    def __init__(self, raw_volume: Any, region: Any, *, mask_out: bool = False):
+        self._raw = raw_volume
+        self._region = region
+        self._mask_out = bool(mask_out)
+        z0, z1, y0, y1, x0, x1 = (int(v) for v in region.bbox)
+        self._z0, self._z1 = z0, z1
+        self._y0, self._y1, self._x0, self._x1 = y0, y1, x0, x1
+        self._z_scoped = z1 > z0
+        self.channel_names = list(getattr(raw_volume, "channel_names", []))
+        self.n_multipoints = int(getattr(raw_volume, "n_multipoints", 1))
+        self.n_timepoints = int(getattr(raw_volume, "n_timepoints", 1))
+        raw_nz = int(getattr(raw_volume, "n_zslices", 1))
+        self.n_zslices = (z1 - z0) if self._z_scoped else raw_nz
+        self.height = y1 - y0
+        self.width = x1 - x0
+        self.dtype = getattr(raw_volume, "dtype", np.dtype("uint16"))
+        self.pixel_size_um = float(getattr(raw_volume, "pixel_size_um", 1.0) or 1.0)
+        self.z_step_um = float(getattr(raw_volume, "z_step_um", 1.0) or 1.0)
+        self.object_id = int(getattr(region, "object_id", 0))
+
+    @property
+    def bbox(self) -> Tuple[int, int, int, int, int, int]:
+        return tuple(self._region.bbox)  # type: ignore[return-value]
+
+    @property
+    def rect(self) -> Tuple[int, int, int, int]:
+        return (self._x0, self._y0, self._x1 - self._x0, self._y1 - self._y0)
+
+    def _z_window(self, z_start, z_end) -> Tuple[Optional[int], Optional[int]]:
+        """Map a (possibly None) local Z window onto the raw volume's absolute Z."""
+        if not self._z_scoped:
+            return z_start, z_end
+        zs = self._z0 if z_start is None else self._z0 + int(z_start)
+        ze = self._z1 if z_end is None else min(self._z1, self._z0 + int(z_end))
+        return zs, ze
+
+    def _mask_plane(self, z_local: int, shape) -> np.ndarray:
+        m = np.asarray(self._region.mask).astype(bool)
+        if m.ndim == 3:
+            if 0 <= z_local < m.shape[0]:
+                return m[z_local]
+            return np.zeros(shape, dtype=bool)
+        return m                                # 2-D mask broadcasts over Z
+
+    def get_frame(self, c: int = 0, m: int = 0, t: int = 0, z: int = 0,
+                  z_mode: str = "max", z_start: Optional[int] = None,
+                  z_end: Optional[int] = None, **kwargs) -> np.ndarray:
+        zs, ze = self._z_window(z_start, z_end)
+        zi = (self._z0 + int(z)) if self._z_scoped else int(z)
+        frame = np.asarray(self._raw.get_frame(
+            c=c, m=m, t=t, z=zi, z_mode=z_mode, z_start=zs, z_end=ze, **kwargs))
+        plane = frame[self._y0:self._y1, self._x0:self._x1]
+        if self._mask_out:
+            m3 = np.asarray(self._region.mask).astype(bool)
+            if m3.ndim == 3 and z_mode != "none":
+                # A Z-projection collapses the object's whole Z window → keep any
+                # voxel the object occupies in any plane (union), not just plane z.
+                mm = m3.any(axis=0)
+                if mm.shape != plane.shape:
+                    mm = self._mask_plane(int(z), plane.shape)
+            else:
+                mm = self._mask_plane(int(z), plane.shape)
+            plane = np.where(mm, plane, 0)
+        return plane
+
+    def get_volume(self, c: int = 0, m: int = 0, t: int = 0,
+                   z_start: Optional[int] = None,
+                   z_end: Optional[int] = None) -> np.ndarray:
+        zs, ze = self._z_window(z_start, z_end)
+        vol = np.asarray(self._raw.get_volume(c=c, m=m, t=t, z_start=zs, z_end=ze))
+        vol = vol[..., self._y0:self._y1, self._x0:self._x1]
+        if self._mask_out and vol.ndim == 3:
+            mask = np.asarray(self._region.mask).astype(bool)
+            if mask.ndim == 3 and mask.shape == vol.shape:
+                vol = np.where(mask, vol, 0)
+            elif mask.ndim == 2 and mask.shape == vol.shape[1:]:
+                vol = np.where(mask[None, ...], vol, 0)
+        return vol
 
 
 class RegisteredFrameVolume:

@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (  # noqa: E402
 import pyqtgraph as pg  # noqa: E402
 
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scaled
 
 
 # Same default cycle the chip strip uses — overridable per channel via
@@ -236,7 +237,7 @@ class GpuImageCanvas(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setMinimumSize(200, 200)
+        self.setMinimumSize(scaled(200), scaled(200))
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Expanding)
         self.setStyleSheet(f"background-color: {Settings.BG_SECONDARY};")

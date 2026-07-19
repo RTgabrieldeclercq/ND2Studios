@@ -38,6 +38,7 @@ from nd2studios.core.analysis_registry import AnalysisResult
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.export_preview_dialog import ExportPreviewDialog
+from nd2studios.widgets.icon_button import scale_qss
 from nd2studios.widgets.image_viewer import CHANNEL_COLORS
 from nd2studios.workers.export_worker import ExportRequest, ExportWorker
 
@@ -74,7 +75,7 @@ class ExportPage(QWidget):
         top_bar.addWidget(self.combo_export_type)
         top_bar.addStretch(1)
         self.lbl_summary = QLabel("")
-        self.lbl_summary.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_summary.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         top_bar.addWidget(self.lbl_summary)
         outer.addLayout(top_bar)
 
@@ -123,7 +124,7 @@ class ExportPage(QWidget):
             "size is written into the resolution + spacing tags. Same file\n"
             "construction as the Stitch dialog output."
         )
-        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -145,7 +146,7 @@ class ExportPage(QWidget):
             "Writes a single multi-page RGB TIFF (uint8) where each enabled\n"
             "channel is mapped to its assigned color and additively blended."
         )
-        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -251,7 +252,7 @@ class ExportPage(QWidget):
             "added for axes with more than one frame. Overlays (scale "
             "bar, timestamp, channel labels) reuse the Movie tab settings."
         )
-        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -275,9 +276,9 @@ class ExportPage(QWidget):
         layout.addWidget(self.cb_seq_iterate_volume)
 
         self.lbl_seq_summary = QLabel("")
-        self.lbl_seq_summary.setStyleSheet(
+        self.lbl_seq_summary.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         self.lbl_seq_summary.setWordWrap(True)
         layout.addWidget(self.lbl_seq_summary)
 
@@ -300,7 +301,7 @@ class ExportPage(QWidget):
             "optionally with image channels and mask highlight overlay. "
             "Multiple objects can be tiled side-by-side per output file."
         )
-        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -461,7 +462,7 @@ class ExportPage(QWidget):
             "an Analysis pipeline (Analysis tab) or the Pipelines tab's Analysis "
             "sub-tab (Apply). Run & Apply a pipeline first to populate this list."
         )
-        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -473,9 +474,9 @@ class ExportPage(QWidget):
         form.addRow("Pipeline result", self.combo_pipe_result)
 
         self.lbl_pipe_summary = QLabel("")
-        self.lbl_pipe_summary.setStyleSheet(
+        self.lbl_pipe_summary.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         form.addRow(self.lbl_pipe_summary)
 
         self.combo_pipe_overlay_fmt = QComboBox()

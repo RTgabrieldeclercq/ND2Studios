@@ -38,6 +38,7 @@ from nd2studios.backend.exporters.stitch_exporter import (
     StitchLayout, compute_tile_layout,
 )
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled, scaled_pt
 
 
 _MARGIN = 8
@@ -69,15 +70,16 @@ class TileLayoutWidget(QFrame):
         self._mode = mode
         self._show_expand_button = show_expand_button
 
-        self.setMinimumSize(*minimum_size)
+        # Scale here (centrally) so every caller passes RAW base pixels.
+        self.setMinimumSize(scaled(minimum_size[0]), scaled(minimum_size[1]))
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet(
+        self.setStyleSheet(scale_qss(
             f"background-color: rgba(33, 37, 43, 220);"
             f"border: 1px solid {Settings.BORDER_COLOR};"
             f"border-radius: 4px;"
-        )
+        ))
 
         # Layout state.
         self._stage_xy_um: List[Tuple[float, float]] = []
@@ -102,14 +104,14 @@ class TileLayoutWidget(QFrame):
         # top-right corner; cheaper than painting + custom hit-testing).
         if self._show_expand_button:
             self._btn_expand = QPushButton("⤢", self)
-            self._btn_expand.setFixedSize(_EXPAND_BTN_SIZE, _EXPAND_BTN_SIZE)
+            self._btn_expand.setFixedSize(scaled(_EXPAND_BTN_SIZE), scaled(_EXPAND_BTN_SIZE))
             self._btn_expand.setToolTip("Expand tile layout")
-            self._btn_expand.setStyleSheet(
+            self._btn_expand.setStyleSheet(scale_qss(
                 "QPushButton { background: transparent; border: none; "
                 f"color: {Settings.FG_SECONDARY}; "
                 "padding: 0; font: 11pt; }"
                 "QPushButton:hover { color: " + Settings.ACCENT_PURPLE + "; }"
-            )
+            ))
             self._btn_expand.clicked.connect(self.expand_requested.emit)
         else:
             self._btn_expand = None
@@ -169,7 +171,7 @@ class TileLayoutWidget(QFrame):
         n_rows = max(1, math.ceil(n / n_cols))
         natural_w = n_cols * _TARGET_TILE_PX + 2 * _MARGIN
         natural_h = _HEADER_H + 4 + n_rows * _TARGET_TILE_PX + _MARGIN + 2
-        self.setMinimumSize(max(240, natural_w), max(180, natural_h))
+        self.setMinimumSize(scaled(max(240, natural_w)), scaled(max(180, natural_h)))
 
     def set_current_m(self, m: int) -> None:
         if int(m) == self._current_m:
@@ -208,7 +210,7 @@ class TileLayoutWidget(QFrame):
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         # Header: mode-aware title.
-        title_font = QFont("Helvetica Neue", 8)
+        title_font = QFont("Helvetica Neue", int(round(scaled_pt(8))))
         painter.setFont(title_font)
         fm = QFontMetrics(title_font)
         title_text = (
@@ -241,7 +243,7 @@ class TileLayoutWidget(QFrame):
 
         # Recompute and cache widget-pixel rects.
         self._tile_rects.clear()
-        idx_font = QFont("Helvetica Neue", 7)
+        idx_font = QFont("Helvetica Neue", int(round(scaled_pt(7))))
         idx_fm = QFontMetrics(idx_font)
         for offset, m in zip(self._layout.offsets, self._m_indices):
             ty, tx = offset
@@ -432,7 +434,7 @@ class TileLayoutDialog(QDialog):
                  parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("Tile layout")
-        self.setMinimumSize(720, 600)
+        self.setMinimumSize(scaled(720), scaled(600))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)

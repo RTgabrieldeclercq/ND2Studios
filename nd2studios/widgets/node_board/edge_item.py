@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPainterPathStroker, QPen
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import (
+    QColor, QFont, QPainter, QPainterPath, QPainterPathStroker, QPen,
+)
 from PySide6.QtWidgets import QGraphicsPathItem
 
 from nd2studios.core.settings import Settings
@@ -50,6 +52,11 @@ class EdgeItem(QGraphicsPathItem):
         self._strand_colors: list = []
         self._is_channel = False
         self._is_loop = False  # V1.49 loop back-edge
+        self._view_only = False  # V1.77 view-only (dotted) overlay wire
+        # V1.68 — per-edge Frame / Object scope lever (a clickable pill at the wire
+        # midpoint), shown only on edges leaving an object-producing node.
+        self._scope_lever = False
+        self._scope_objects = False
         self.setZValue(-1)
         if self._interactive():
             self.setAcceptHoverEvents(True)
@@ -80,6 +87,12 @@ class EdgeItem(QGraphicsPathItem):
         if self._is_channel and not self._highlight and not self._is_loop:
             pen.setWidthF(scaled(2.4) if self._hover else scaled(1.8))
             pen.setStyle(Qt.PenStyle.DashLine)
+        # V1.77: a view-only (overlay) structural wire reads as a dotted line — the
+        # channel it carries feeds the viewers only, never analysis. Distinct from the
+        # channel wire's dash. (Never both — a channel wire is its own layer.)
+        if (self._view_only and not self._highlight and not self._is_loop
+                and not self._is_channel):
+            pen.setStyle(Qt.PenStyle.DotLine)
         self.setPen(pen)
         self.setZValue(
             0 if self._highlight
@@ -98,6 +111,79 @@ class EdgeItem(QGraphicsPathItem):
                             "cut with the scissors tool to remove")
         self._apply_pen()
         self._rebuild()
+
+    def set_scope_lever(self, visible: bool, objects: bool) -> None:
+        """Show/hide the Frame ↔ Objects scope lever and set its state (V1.68).
+
+        ``visible`` is driven by the scene (only edges whose source node produces
+        objects show it); ``objects`` reflects ``Edge.params['scope']``.
+        """
+        visible = bool(visible) and self._interactive() and not self._is_loop
+        objects = bool(objects)
+        if visible == self._scope_lever and objects == self._scope_objects:
+            return
+        self.prepareGeometryChange()   # the pill enlarges the bounds
+        self._scope_lever = visible
+        self._scope_objects = objects
+        if visible:
+            self.setToolTip(
+                "Analysis scope — click to toggle:\n"
+                "  Frame = run downstream on the whole frame (default)\n"
+                "  Objects = run downstream once per object (auto-cropped, T/M/Z "
+                "conserved)")
+        elif self._interactive() and not self._is_loop:
+            self.setToolTip("Double-click to disconnect")
+        self.update()
+
+    def _lever_rect(self) -> QRectF:
+        """The scope-pill rectangle, centred on the wire midpoint (item coords)."""
+        p = self.path()
+        if p.isEmpty():
+            mid = (self._p1 + self._p2) / 2.0
+        else:
+            mid = p.pointAtPercent(0.5)
+        w, h = scaled(58), scaled(17)
+        return QRectF(mid.x() - w / 2.0, mid.y() - h / 2.0, w, h)
+
+    def _paint_lever(self, painter) -> None:
+        rect = self._lever_rect()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        objects = self._scope_objects
+        fill = (QColor(Settings.ACCENT_ORANGE) if objects
+                else QColor(Settings.BG_SECONDARY))
+        if objects:
+            fill.setAlpha(215)
+        border = (QColor(Settings.ACCENT_ORANGE) if objects
+                  else QColor(Settings.BORDER_COLOR))
+        pen = QPen(border)
+        pen.setWidthF(scaled(1.2))
+        painter.setPen(pen)
+        painter.setBrush(fill)
+        painter.drawRoundedRect(rect, scaled(8), scaled(8))
+        f = QFont()
+        f.setPixelSize(max(8, int(scaled(9))))
+        painter.setFont(f)
+        painter.setPen(QColor(Settings.BG_PRIMARY if objects
+                              else Settings.FG_SECONDARY))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter,
+                         "Objects" if objects else "Frame")
+
+    def set_view_only(self, on: bool) -> None:
+        """Mark this as a V1.77 view-only (overlay) wire so it renders dotted — its
+        channel feeds the viewers only, not analysis. Toggled by clicking the wire."""
+        on = bool(on)
+        if self._view_only == on:
+            return
+        self._view_only = on
+        if self._interactive() and not self._is_loop:
+            self.setToolTip(
+                "View-only overlay wire — feeds this channel to the viewers only "
+                "(e.g. the DVC 3-D overlay), never to analysis.\n"
+                "Click the wire to switch it back to an analysis wire."
+                if on else
+                "Analysis wire — click the wire to make it view-only (overlay; "
+                "dotted). Double-click to disconnect.")
+        self._apply_pen()
 
     def set_color(self, color_hex: str) -> None:
         self._color = QColor(color_hex)
@@ -197,7 +283,10 @@ class EdgeItem(QGraphicsPathItem):
         """Widen the clickable region around the thin curve for easy grabbing."""
         stroker = QPainterPathStroker()
         stroker.setWidth(scaled(self.HIT_WIDTH))
-        return stroker.createStroke(self.path())
+        path = stroker.createStroke(self.path())
+        if self._scope_lever:                      # the pill is clickable too
+            path.addRect(self._lever_rect())
+        return path
 
     def boundingRect(self):  # noqa: N802 (Qt naming)
         r = super().boundingRect()
@@ -206,6 +295,9 @@ class EdgeItem(QGraphicsPathItem):
             r = r.adjusted(-pad, -pad, pad, pad)
         if self._is_loop:
             r = r.adjusted(0, -scaled(8), 0, scaled(8))  # room for the arrowhead
+        if self._scope_lever:
+            r = r.united(self._lever_rect().adjusted(-scaled(2), -scaled(2),
+                                                     scaled(2), scaled(2)))
         return r
 
     def paint(self, painter, option, widget=None) -> None:  # noqa: N802
@@ -225,6 +317,10 @@ class EdgeItem(QGraphicsPathItem):
             painter.setBrush(col)
             painter.drawPath(head)
             return
+        # V1.68 scope lever pill at the wire midpoint (drawn before the strands so
+        # it shows even on a wire that carries no channel strands).
+        if self._scope_lever:
+            self._paint_lever(painter)
         # …then the per-channel propagation strands, parallel copies offset
         # sideways so several channels read as distinct colored threads.
         if not self._strand_colors:
@@ -259,12 +355,32 @@ class EdgeItem(QGraphicsPathItem):
         # Accept the press so the view treats the wire as the target (no
         # rubber-band) and the follow-up double-click is delivered here.
         if self._interactive() and event.button() == Qt.MouseButton.LeftButton:
+            # A click on the scope pill flips Frame ↔ Objects (duck-typed into the
+            # scene so edge_item does not import it).
+            if self._scope_lever and self._lever_rect().contains(event.pos()):
+                fn = getattr(self.scene(), "toggle_edge_scope", None)
+                if callable(fn):
+                    fn(self.edge_id)
+                event.accept()
+                return
+            # V1.77: a plain click on a structural wire toggles it view-only (dotted
+            # overlay ↔ solid analysis). Skipped for loop / channel wires, and for a
+            # wire that carries the Frame/Objects scope pill (its own analysis lever).
+            if (not self._is_loop and not self._is_channel
+                    and not self._scope_lever):
+                fn = getattr(self.scene(), "toggle_edge_view_only", None)
+                if callable(fn):
+                    fn(self.edge_id)
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         if self._interactive() and event.button() == Qt.MouseButton.LeftButton:
+            # A double-click on the pill must not also disconnect the wire.
+            if self._scope_lever and self._lever_rect().contains(event.pos()):
+                event.accept()
+                return
             scene = self.scene()
             # A loop edge is configured (not disconnected) on double-click; it is
             # removed with the scissors tool instead.

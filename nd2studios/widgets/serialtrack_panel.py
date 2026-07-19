@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.common import MplCanvas
 from nd2studios.widgets.frame_strip import FrameStrip
+from nd2studios.widgets.icon_button import scale_qss, scaled
 from nd2studios.widgets.image_viewer import frame_to_uint8
 from nd2studios.widgets.scale_bar import draw_scale_bar
 from nd2studios.backend import serialtrack_analysis as sta
@@ -200,14 +201,14 @@ class SerialTrackPanel(QWidget):
         trow = QHBoxLayout()
         trow.setSpacing(6)
         self.btn_play = QPushButton("▶")
-        self.btn_play.setFixedWidth(32)
+        self.btn_play.setFixedWidth(scaled(32))
         self.btn_play.clicked.connect(self._toggle_play)
         self.spn_fps = QSpinBox()
         self.spn_fps.setRange(1, 60)
         self.spn_fps.setValue(8)
         self.spn_fps.setSuffix(" fps")
         self.lbl_frame = QLabel("T 0/0")
-        self.lbl_frame.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_frame.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         self.strip = FrameStrip()
         self.strip.current_changed.connect(self._on_frame_changed)
         trow.addWidget(self.btn_play)
@@ -375,7 +376,7 @@ class SerialTrackPanel(QWidget):
                     ha="center", va="center", color=Settings.FG_SECONDARY,
                     transform=ax.transAxes)
             ax.set_axis_off()
-            self.canvas.draw()
+            self.canvas.safe_draw()
             return
         view = self._view_key()
         try:
@@ -396,8 +397,8 @@ class SerialTrackPanel(QWidget):
             ax.text(0.5, 0.5, f"Render error:\n{exc}", ha="center", va="center",
                     color=Settings.ACCENT_RED, transform=ax.transAxes, fontsize=8)
             ax.set_axis_off()
-        self.canvas.fig.tight_layout()
-        self.canvas.draw()
+        self.canvas.safe_tight_layout()
+        self.canvas.safe_draw()
 
     def _draw_background(self, ax) -> None:
         H, W = self._field_shape

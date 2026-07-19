@@ -15,6 +15,7 @@ degrades to plain text buttons rather than crashing the app.
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from PySide6.QtCore import QSize, Qt
@@ -31,21 +32,92 @@ except Exception:  # noqa: BLE001
     _HAVE_QTA = False
 
 
+# Screen-size text/UI growth (V1.64). On monitors larger than the 1080p
+# baseline the whole UI — fonts *and* the controls that hold them — scales up
+# together so text is legible on big lab displays without overflowing buttons.
+# At/below the baseline the factor is 1.0, leaving the UI byte-identical to
+# earlier versions.
+SCREEN_BASELINE_HEIGHT = 1080.0  # px; a "standard" 1080p display gets 1.0
+SCREEN_SCALE_SLOPE = 0.5         # fraction of the excess height turned into growth
+SCREEN_SCALE_MAX = 1.5           # never grow the UI by more than 50% from screen size
+
+
+def screen_scale() -> float:
+    """Screen-size growth factor (``1.0`` at/below 1080p, capped at ``1.5``).
+
+    Larger monitors get proportionally larger text and controls. Uses the
+    primary screen's available **logical height** so it tracks usable desktop
+    space and is not inflated by an unusually wide (ultrawide) aspect ratio.
+    """
+    app = QGuiApplication.instance()
+    if app is not None:
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            height = screen.availableGeometry().height()
+            if height > 0:
+                excess = max(0.0, height / SCREEN_BASELINE_HEIGHT - 1.0)
+                return min(SCREEN_SCALE_MAX, 1.0 + SCREEN_SCALE_SLOPE * excess)
+    return 1.0
+
+
 def ui_scale() -> float:
-    """Logical-DPI scale factor (1.0 at 96 DPI). Never below 1.0."""
+    """Combined DPI × screen-size scale factor (``1.0`` at 96 DPI / 1080p).
+
+    The DPI term keeps physical sizes consistent across monitors of differing
+    pixel density (unchanged from earlier versions); the :func:`screen_scale`
+    term additionally enlarges the whole UI on physically larger displays.
+    Multiplying them means every ``scaled()`` control grows in lockstep with
+    the text, so enlarged type can never overflow its container.
+    """
+    dpi_factor = 1.0
     app = QGuiApplication.instance()
     if app is not None:
         screen = QGuiApplication.primaryScreen()
         if screen is not None:
             dpi = screen.logicalDotsPerInch()
             if dpi > 0:
-                return max(1.0, dpi / 96.0)
-    return 1.0
+                dpi_factor = max(1.0, dpi / 96.0)
+    return dpi_factor * screen_scale()
 
 
 def scaled(px: float) -> int:
-    """Scale a base (96-DPI) pixel value to the current display."""
+    """Scale a base (96-DPI, 1080p) pixel value to the current display."""
     return int(round(px * ui_scale()))
+
+
+def scaled_pt(base_pt: float) -> float:
+    """Scale a base (1080p) point size for the current screen (half-pt steps)."""
+    return round(base_pt * screen_scale() * 2) / 2
+
+
+_PT_RE = re.compile(r"(\d+(?:\.\d+)?)pt")
+_PX_RE = re.compile(r"(\d+(?:\.\d+)?)px")
+
+
+def scale_qss(style: str, factor: Optional[float] = None) -> str:
+    """Scale every ``pt`` font size and ``px`` dimension in a QSS string.
+
+    V1.64 — fonts and the controls that hold them grow by the same screen-size
+    *factor* (defaults to :func:`screen_scale`), so enlarged text stays
+    proportional to its button and never overflows. Point sizes keep half-point
+    precision; pixels round to a whole number ≥ 1. A *factor* of ``1.0``
+    (baseline 1080p display) returns the string unchanged, so on existing
+    setups the rendered UI is byte-identical to earlier versions. Safe to run on
+    inline ``setStyleSheet`` strings — it only touches ``…pt`` / ``…px`` tokens,
+    leaving colors, URLs, and percentages alone.
+    """
+    if factor is None:
+        factor = screen_scale()
+    if abs(factor - 1.0) < 1e-3:
+        return style
+
+    def _pt(match: "re.Match[str]") -> str:
+        return f"{round(float(match.group(1)) * factor * 2) / 2:g}pt"
+
+    def _px(match: "re.Match[str]") -> str:
+        return f"{max(1, int(round(float(match.group(1)) * factor)))}px"
+
+    return _PX_RE.sub(_px, _PT_RE.sub(_pt, style))
 
 
 def make_icon(

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled
 from nd2studios.widgets.image_viewer import CHANNEL_COLORS
 from nd2studios.widgets.lut_histogram import LutHistogramWidget
 from nd2studios.widgets.tile_layout import TileLayoutDialog, TileLayoutWidget
@@ -43,24 +44,24 @@ class _SectionHeader(QFrame):
 
     def __init__(self, title: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setFixedHeight(24)
+        self.setFixedHeight(scaled(24))
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 0, 4, 0)
         layout.setSpacing(4)
         self._lbl = QLabel(title)
-        self._lbl.setStyleSheet(
-            f"color: {Settings.ACCENT_CYAN}; font: bold 9pt 'Helvetica Neue';")
+        self._lbl.setStyleSheet(scale_qss(
+            f"color: {Settings.ACCENT_CYAN}; font: bold 9pt 'Helvetica Neue';"))
         layout.addWidget(self._lbl)
         layout.addStretch(1)
         self._btn = QPushButton("▾")
-        self._btn.setFixedSize(20, 20)
+        self._btn.setFixedSize(scaled(20), scaled(20))
         self._btn.setToolTip(f"Collapse / expand the {title} section")
-        self._btn.setStyleSheet(
+        self._btn.setStyleSheet(scale_qss(
             "QPushButton { background: transparent; "
             f"color: {Settings.FG_SECONDARY}; "
             "border: none; padding: 0; font: 10pt; }"
             "QPushButton:hover { color: " + Settings.FG_PRIMARY + "; }"
-        )
+        ))
         self._btn.clicked.connect(self._on_clicked)
         layout.addWidget(self._btn)
         self._expanded = True
@@ -91,8 +92,8 @@ class LutSidebar(QFrame):
         super().__init__(parent)
         self.setObjectName("contentArea")
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setMinimumWidth(self.EXPANDED_WIDTH)
-        self.setMaximumWidth(self.EXPANDED_WIDTH)
+        self.setMinimumWidth(scaled(self.EXPANDED_WIDTH))
+        self.setMaximumWidth(scaled(self.EXPANDED_WIDTH))
 
         self._expanded = True
         self._lut_widgets: Dict[str, LutHistogramWidget] = {}
@@ -108,24 +109,24 @@ class LutSidebar(QFrame):
 
         # Top bar with whole-sidebar collapse toggle.
         top_bar = QFrame()
-        top_bar.setFixedHeight(28)
+        top_bar.setFixedHeight(scaled(28))
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(8, 0, 4, 0)
         top_layout.setSpacing(4)
         self._title = QLabel("Panel")
-        self._title.setStyleSheet(
-            f"color: {Settings.ACCENT_PURPLE}; font: bold 9pt 'Helvetica Neue';")
+        self._title.setStyleSheet(scale_qss(
+            f"color: {Settings.ACCENT_PURPLE}; font: bold 9pt 'Helvetica Neue';"))
         top_layout.addWidget(self._title)
         top_layout.addStretch(1)
         self._collapse_btn = QPushButton("▶")
-        self._collapse_btn.setFixedSize(20, 20)
+        self._collapse_btn.setFixedSize(scaled(20), scaled(20))
         self._collapse_btn.setToolTip("Collapse / expand the side panel")
-        self._collapse_btn.setStyleSheet(
+        self._collapse_btn.setStyleSheet(scale_qss(
             "QPushButton { background: transparent; "
             f"color: {Settings.FG_SECONDARY}; "
             "border: none; padding: 0; font: 10pt; }"
             "QPushButton:hover { color: " + Settings.FG_PRIMARY + "; }"
-        )
+        ))
         self._collapse_btn.clicked.connect(self.toggle)
         top_layout.addWidget(self._collapse_btn)
         outer.addWidget(top_bar)
@@ -178,23 +179,23 @@ class LutSidebar(QFrame):
         # always visible (outside the scroll area).
         self._meta_box = QFrame()
         self._meta_box.setObjectName("metaBox")
-        self._meta_box.setStyleSheet(
+        self._meta_box.setStyleSheet(scale_qss(
             "QFrame#metaBox { background: %s; border-top: 1px solid %s; }"
             % (Settings.BG_SECONDARY, Settings.BORDER_COLOR)
-        )
+        ))
         meta_layout = QVBoxLayout(self._meta_box)
         meta_layout.setContentsMargins(8, 6, 8, 6)
         meta_layout.setSpacing(2)
         meta_title = QLabel("Metadata")
-        meta_title.setStyleSheet(
-            f"color: {Settings.ACCENT_CYAN}; font: bold 8pt 'Helvetica Neue';")
+        meta_title.setStyleSheet(scale_qss(
+            f"color: {Settings.ACCENT_CYAN}; font: bold 8pt 'Helvetica Neue';"))
         meta_layout.addWidget(meta_title)
         self._meta_label = QLabel("—")
         self._meta_label.setWordWrap(True)
         self._meta_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._meta_label.setStyleSheet(
-            f"color: {Settings.FG_SECONDARY}; font: 8pt 'Helvetica Neue';")
+        self._meta_label.setStyleSheet(scale_qss(
+            f"color: {Settings.FG_SECONDARY}; font: 8pt 'Helvetica Neue';"))
         meta_layout.addWidget(self._meta_label)
         outer.addWidget(self._meta_box)
 
@@ -218,7 +219,7 @@ class LutSidebar(QFrame):
         if value == self._expanded:
             return
         self._expanded = bool(value)
-        target = self.EXPANDED_WIDTH if self._expanded else self.COLLAPSED_WIDTH
+        target = scaled(self.EXPANDED_WIDTH if self._expanded else self.COLLAPSED_WIDTH)
         for prop, attr in (("minimumWidth", "_anim_min"),
                             ("maximumWidth", "_anim_max")):
             anim = QPropertyAnimation(self, prop.encode("utf-8"))
@@ -333,16 +334,16 @@ class LutSidebar(QFrame):
             head_layout.setContentsMargins(0, 0, 0, 0)
             head_layout.setSpacing(6)
             swatch = QFrame()
-            swatch.setFixedSize(10, 10)
-            swatch.setStyleSheet(
+            swatch.setFixedSize(scaled(10), scaled(10))
+            swatch.setStyleSheet(scale_qss(
                 f"background-color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]});"
                 f"border: 1px solid {Settings.BORDER_COLOR};"
                 f"border-radius: 2px;"
-            )
+            ))
             head_layout.addWidget(swatch)
             label = QLabel(name)
-            label.setStyleSheet(
-                f"color: {Settings.FG_PRIMARY}; font: 9pt 'Helvetica Neue';")
+            label.setStyleSheet(scale_qss(
+                f"color: {Settings.FG_PRIMARY}; font: 9pt 'Helvetica Neue';"))
             head_layout.addWidget(label, stretch=1)
             block_layout.addWidget(head)
 
@@ -369,10 +370,10 @@ class LutSidebar(QFrame):
                     swatches = w.findChildren(QFrame)
                     for s in swatches:
                         if s.width() == 10 and s.height() == 10:
-                            s.setStyleSheet(
+                            s.setStyleSheet(scale_qss(
                                 f"background-color: rgb({rgb_tuple[0]},"
                                 f" {rgb_tuple[1]}, {rgb_tuple[2]});"
                                 f"border: 1px solid {Settings.BORDER_COLOR};"
                                 f"border-radius: 2px;"
-                            )
+                            ))
                             return

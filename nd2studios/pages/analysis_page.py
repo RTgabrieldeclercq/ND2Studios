@@ -81,6 +81,7 @@ from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.collapsible_sidebar import CollapsibleSidebar
 from nd2studios.widgets.common import ParamEditor
+from nd2studios.widgets.icon_button import scale_qss, scaled
 from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
 
 
@@ -190,7 +191,7 @@ class AnalysisPage(QWidget):
 
         # ── Left panel: controls + results ───────────────────────────────────
         left = QWidget()
-        left.setMinimumWidth(280)
+        left.setMinimumWidth(scaled(280))
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 4, 0)
         left_layout.setSpacing(8)
@@ -223,9 +224,9 @@ class AnalysisPage(QWidget):
 
         self.lbl_pipeline_desc = QLabel()
         self.lbl_pipeline_desc.setWordWrap(True)
-        self.lbl_pipeline_desc.setStyleSheet(
+        self.lbl_pipeline_desc.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         pg_layout.addWidget(self.lbl_pipeline_desc)
         left_layout.addWidget(pipeline_group)
 
@@ -308,9 +309,9 @@ class AnalysisPage(QWidget):
         dg.addLayout(actions_row)
 
         self._lbl_draw_status = QLabel("—")
-        self._lbl_draw_status.setStyleSheet(
+        self._lbl_draw_status.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         dg.addWidget(self._lbl_draw_status)
 
         # ── Edit panel — appears within the Drawing tools group ──
@@ -332,7 +333,7 @@ class AnalysisPage(QWidget):
 
         edit_row1.addWidget(QLabel("Shape:"))
         self._combo_edit_shape = QComboBox()
-        self._combo_edit_shape.setMinimumWidth(110)
+        self._combo_edit_shape.setMinimumWidth(scaled(110))
         self._combo_edit_shape.setEnabled(False)
         self._combo_edit_shape.currentIndexChanged.connect(self._on_edit_shape_combo_changed)
         edit_row1.addWidget(self._combo_edit_shape)
@@ -346,7 +347,7 @@ class AnalysisPage(QWidget):
         self._spin_expand.setDecimals(1)
         self._spin_expand.setSingleStep(1.0)
         self._spin_expand.setValue(1.0)
-        self._spin_expand.setFixedWidth(80)
+        self._spin_expand.setFixedWidth(scaled(80))
         self._spin_expand.setEnabled(False)
         edit_row2.addWidget(self._spin_expand)
         self._btn_apply_expand = QPushButton("Apply")
@@ -396,7 +397,7 @@ class AnalysisPage(QWidget):
         self._spin_strip_height = QSpinBox()
         self._spin_strip_height.setRange(1, 999999)
         self._spin_strip_height.setValue(4096)
-        self._spin_strip_height.setFixedWidth(80)
+        self._spin_strip_height.setFixedWidth(scaled(80))
         dim_row.addWidget(self._spin_strip_height)
         dim_row.addStretch(1)
         cmg.addLayout(dim_row)
@@ -414,13 +415,13 @@ class AnalysisPage(QWidget):
         self._spin_strip_width = QSpinBox()
         self._spin_strip_width.setRange(1, 999999)
         self._spin_strip_width.setValue(512)
-        self._spin_strip_width.setFixedWidth(80)
+        self._spin_strip_width.setFixedWidth(scaled(80))
         cwr_layout.addWidget(self._spin_strip_width)
         cwr_layout.addWidget(QLabel("X offset (px):"))
         self._spin_x_offset = QSpinBox()
         self._spin_x_offset.setRange(0, 999999)
         self._spin_x_offset.setValue(0)
-        self._spin_x_offset.setFixedWidth(80)
+        self._spin_x_offset.setFixedWidth(scaled(80))
         cwr_layout.addWidget(self._spin_x_offset)
         cwr_layout.addStretch(1)
         self._custom_width_row.hide()
@@ -432,7 +433,7 @@ class AnalysisPage(QWidget):
         self._spin_start_offset = QSpinBox()
         self._spin_start_offset.setRange(0, 999999)
         self._spin_start_offset.setValue(0)
-        self._spin_start_offset.setFixedWidth(80)
+        self._spin_start_offset.setFixedWidth(scaled(80))
         offset_row.addWidget(self._spin_start_offset)
         offset_row.addStretch(1)
         cmg.addLayout(offset_row)
@@ -445,9 +446,9 @@ class AnalysisPage(QWidget):
         self._btn_generate_tiled = QPushButton("Generate Masks")
         self._btn_generate_tiled.clicked.connect(self._on_generate_tiled_masks)
         self._lbl_tiled_count = QLabel("—")
-        self._lbl_tiled_count.setStyleSheet(
+        self._lbl_tiled_count.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         gen_row.addWidget(self._btn_generate_tiled)
         gen_row.addWidget(self._lbl_tiled_count)
         gen_row.addStretch(1)
@@ -469,11 +470,11 @@ class AnalysisPage(QWidget):
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self._on_cancel)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedWidth(120)
+        self.progress_bar.setFixedWidth(scaled(120))
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.lbl_status = QLabel("Ready")
-        self.lbl_status.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_status.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         run_row.addWidget(self.btn_run)
         run_row.addWidget(self.btn_cancel)
         run_row.addWidget(self.progress_bar)
@@ -496,9 +497,9 @@ class AnalysisPage(QWidget):
             "you move the T / M / Z slider (300 ms debounce)."
         )
         self.lbl_screen_status = QLabel("—")
-        self.lbl_screen_status.setStyleSheet(
+        self.lbl_screen_status.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         screen_row.addWidget(self.btn_screen)
         screen_row.addWidget(self.chk_auto_screen)
         screen_row.addWidget(self.lbl_screen_status)
@@ -572,7 +573,7 @@ class AnalysisPage(QWidget):
         overlay_row.addStretch(1)
         self.btn_toggle_overlay = QPushButton("Hide Overlays")
         self.btn_toggle_overlay.setCheckable(True)
-        self.btn_toggle_overlay.setFixedWidth(130)
+        self.btn_toggle_overlay.setFixedWidth(scaled(130))
         self.btn_toggle_overlay.clicked.connect(self._on_toggle_overlay)
         overlay_row.addWidget(self.btn_toggle_overlay)
         right_layout.addLayout(overlay_row)
@@ -920,6 +921,24 @@ class AnalysisPage(QWidget):
                     channels[ch] = np.asarray(arr)
             if not channels:
                 channels = {k: np.asarray(v) for k, v in channels_raw.items()}
+
+        # V1.66 stream-for-view / materialize-for-analysis split — read the lazy
+        # channels into RAM when the dataset fits (fast in-RAM analysis, no
+        # re-reads); otherwise leave them lazy so the pipeline streams on demand.
+        if channels and vol is not None:
+            try:
+                from nd2studios.utils.resource_strategy import (
+                    materialize_channels_if_fits,
+                )
+                monitor = None
+                try:
+                    from nd2studios.core.memory_monitor import global_monitor
+                    monitor = global_monitor()
+                except Exception:  # noqa: BLE001
+                    monitor = None
+                channels = materialize_channels_if_fits(channels, vol, monitor=monitor)
+            except Exception:  # noqa: BLE001
+                pass
         return channels or None
 
     def _maybe_inject_label_streaming(

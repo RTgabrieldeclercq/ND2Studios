@@ -35,6 +35,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scaled_pt
 
 
 class FrameStrip(QWidget):
@@ -194,7 +195,7 @@ class FrameStrip(QWidget):
 
         show_labels = self._min_tile_w >= 22 and self._tiles_per_row() <= 64
         font = QFont("Helvetica Neue")
-        font.setPointSize(7)
+        font.setPointSizeF(scaled_pt(7))
         p.setFont(font)
         fm = QFontMetrics(font)
 

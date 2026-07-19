@@ -671,14 +671,21 @@ def build_stylesheet() -> str:
     cached PNGs and substitute their paths. Must be called after a
     ``QApplication`` exists (QPixmap needs it). Falls back to the bare
     stylesheet if qtawesome/rendering is unavailable.
+
+    V1.64 — the raw template is first passed through :func:`scale_qss` so all
+    fonts and control dimensions grow with the display size (see
+    :func:`nd2studios.widgets.icon_button.screen_scale`). Scaling happens
+    *before* arrow-image injection so the substituted file paths (which contain
+    no ``px``/``pt`` tokens) are never rewritten.
     """
     from nd2studios.core.settings import Settings
-    from nd2studios.widgets.icon_button import arrow_png
+    from nd2studios.widgets.icon_button import arrow_png, scale_qss
+
+    qss = scale_qss(STYLESHEET)
 
     down = arrow_png("fa5s.chevron-down", Settings.ACCENT_PURPLE, 12)
     up = arrow_png("fa5s.chevron-up", Settings.ACCENT_PURPLE, 12)
     combo = arrow_png("fa5s.chevron-down", Settings.ACCENT_PURPLE, 12)
-    qss = STYLESHEET
     if down and up and combo:
         qss = (qss.replace("__DOWN_ARROW__", down)
                   .replace("__UP_ARROW__", up)

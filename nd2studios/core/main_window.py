@@ -55,7 +55,13 @@ from nd2studios.pipeline import (
     workspace_disabled,
 )
 from nd2studios.widgets.custom_grips import CustomGrip
-from nd2studios.widgets.icon_button import icon_button, scaled, tool_button
+from nd2studios.widgets.icon_button import (
+    icon_button,
+    scale_qss,
+    scaled,
+    screen_scale,
+    tool_button,
+)
 
 # Page key → qtawesome icon name for the top tab bar (V1.44).
 _PAGE_ICONS = {
@@ -78,8 +84,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{Settings.APP_NAME} v{Settings.APP_VERSION}")
-        self.setMinimumSize(Settings.MIN_WIDTH, Settings.MIN_HEIGHT)
-        self.resize(1440, 900)
+        # V1.64 — the whole UI scales with the display (see screen_scale), so
+        # grow the minimum/opening window in the same ratio to keep content from
+        # being clipped at the minimum size on large monitors.
+        _ws = screen_scale()
+        self.setMinimumSize(
+            int(round(Settings.MIN_WIDTH * _ws)),
+            int(round(Settings.MIN_HEIGHT * _ws)),
+        )
+        self.resize(int(round(1440 * _ws)), int(round(900 * _ws)))
 
         # Frameless + translucent so the rounded #bgApp shows through cleanly.
         self.setWindowFlags(Qt.FramelessWindowHint)
@@ -182,7 +195,8 @@ class MainWindow(QMainWindow):
     def _build_title_bar(self) -> QWidget:
         bar = QWidget()
         bar.setObjectName("titleBarWidget")
-        bar.setFixedHeight(Settings.TITLE_BAR_HEIGHT)
+        # V1.64 — grow with the display so the enlarged title text has room.
+        bar.setFixedHeight(int(round(Settings.TITLE_BAR_HEIGHT * screen_scale())))
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -312,18 +326,23 @@ class MainWindow(QMainWindow):
         # Bottom bar: version + progress bar + status text.
         bottom_bar = QWidget()
         bottom_bar.setObjectName("bottomBar")
-        bottom_bar.setFixedHeight(Settings.BOTTOM_BAR_HEIGHT)
+        # V1.64 — chrome grows with the display so its enlarged text has room.
+        _s = screen_scale()
+        bottom_bar.setFixedHeight(int(round(Settings.BOTTOM_BAR_HEIGHT * _s)))
         bb_layout = QHBoxLayout(bottom_bar)
         bb_layout.setContentsMargins(16, 0, 16, 0)
 
         version_label = QLabel(f"{Settings.APP_NAME} v{Settings.APP_VERSION}")
-        version_label.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        # Inline fonts bypass the stylesheet, so scale them here to match.
+        version_label.setStyleSheet(
+            scale_qss(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        )
         bb_layout.addWidget(version_label)
         bb_layout.addStretch(1)
 
         self._progress_bar = QProgressBar()
-        self._progress_bar.setFixedWidth(220)
-        self._progress_bar.setFixedHeight(16)
+        self._progress_bar.setFixedWidth(int(round(220 * _s)))
+        self._progress_bar.setFixedHeight(int(round(16 * _s)))
         self._progress_bar.setValue(0)
         self._progress_bar.setVisible(False)
         bb_layout.addWidget(self._progress_bar)
@@ -332,12 +351,12 @@ class MainWindow(QMainWindow):
         # and status text in the bottom bar.  Colour switches at band
         # boundaries via ``_on_memory_sampled``.
         self._memory_gauge = QLabel("RAM —")
-        self._memory_gauge.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        self._memory_gauge.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 8pt;"))
         self._memory_gauge.setToolTip("System memory usage")
         bb_layout.addWidget(self._memory_gauge)
 
         self._status_text = QLabel("Ready")
-        self._status_text.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        self._status_text.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 8pt;"))
         bb_layout.addWidget(self._status_text)
 
         layout.addWidget(bottom_bar)
@@ -355,7 +374,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(w)
         lbl = QLabel(f"{key.title()} — coming soon")
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 14pt;")
+        lbl.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 14pt;"))
         layout.addWidget(lbl)
         return w
 
@@ -1186,7 +1205,7 @@ class MainWindow(QMainWindow):
             color = Settings.ACCENT_YELLOW
         else:
             color = Settings.FG_SECONDARY
-        self._memory_gauge.setStyleSheet(f"color: {color}; font: 8pt;")
+        self._memory_gauge.setStyleSheet(scale_qss(f"color: {color}; font: 8pt;"))
         self._memory_gauge.setText(text)
 
     def _on_memory_critical(self, percent: float) -> None:

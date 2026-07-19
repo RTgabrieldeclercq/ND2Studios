@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled
 
 
 class BatchPage(QWidget):
@@ -74,9 +75,9 @@ class BatchPage(QWidget):
 
         tmpl_info_row = QHBoxLayout()
         self._lbl_tmpl_name = QLabel("—")
-        self._lbl_tmpl_name.setStyleSheet(
+        self._lbl_tmpl_name.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         tmpl_info_row.addWidget(self._lbl_tmpl_name, stretch=1)
         self._btn_save_tmpl = QPushButton("Save current session as template…")
         self._btn_save_tmpl.clicked.connect(self._on_save_template)
@@ -101,15 +102,15 @@ class BatchPage(QWidget):
         file_btns.addWidget(btn_clear)
         file_btns.addStretch(1)
         self._lbl_file_count = QLabel("0 files")
-        self._lbl_file_count.setStyleSheet(
+        self._lbl_file_count.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         file_btns.addWidget(self._lbl_file_count)
         fl.addLayout(file_btns)
 
         self._file_list = QListWidget()
         self._file_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self._file_list.setMaximumHeight(180)
+        self._file_list.setMaximumHeight(scaled(180))
         fl.addWidget(self._file_list)
 
         remove_row = QHBoxLayout()
@@ -169,9 +170,9 @@ class BatchPage(QWidget):
         rl.addWidget(self._progress_bar)
 
         self._lbl_status = QLabel("Ready.")
-        self._lbl_status.setStyleSheet(
+        self._lbl_status.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 9pt;"
-        )
+        ))
         rl.addWidget(self._lbl_status)
 
         root.addWidget(run_group)

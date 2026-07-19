@@ -24,10 +24,12 @@ from nd2studios.pipeline_graph.executor import edge_channels
 from nd2studios.pipeline_graph.loop import default_loop_config
 from nd2studios.pipeline_graph.model import (
     Edge, GraphSlice, LOOP_KIND, Node, NodeCategory, NodeRole, Port, PortType,
-    can_connect, can_connect_loop, clone_node, new_id, would_create_cycle,
+    can_connect, can_connect_loop, clone_node, edge_view_only, new_id,
+    set_edge_view_only, would_create_cycle,
 )
 from nd2studios.pipeline_graph.registry_adapter import (
-    RAINBOW_IN_NAME, RAINBOW_OUT_NAME, SPECIAL_DISMISS_OP_KEY, NodeSpec,
+    RAINBOW_IN_NAME, RAINBOW_OUT_NAME, SPECIAL_DISMISS_OP_KEY,
+    SPECIAL_EXCLUDE_OP_KEY, NodeSpec,
     build_node, channel_name_for_op_key, spec_takes_channels,
 )
 from nd2studios.widgets.node_board.edge_item import EdgeItem
@@ -48,6 +50,26 @@ _CATEGORY_COLOR = {
     NodeCategory.CHANNEL: Settings.FG_SECONDARY,
 }
 
+# Order + labels for the per-category "Add" submenus (V1.61 overhaul). The merged
+# scene exposes ~30 specs across categories, so the right-click menu groups them
+# by node type into submenus (mirrors the Add-dialog category tabs) rather than
+# one flat "Add operation" list.
+_CATEGORY_MENU_ORDER = [
+    NodeCategory.PROCESSING, NodeCategory.ANALYSIS, NodeCategory.RESULTS,
+    NodeCategory.LOGIC, NodeCategory.SPECIAL, NodeCategory.CHANNEL,
+]
+_CATEGORY_MENU_LABEL = {
+    NodeCategory.PROCESSING: "Processing",
+    NodeCategory.ANALYSIS: "Analysis",
+    NodeCategory.RESULTS: "Results",
+    NodeCategory.LOGIC: "Logic",
+    NodeCategory.SPECIAL: "Special",
+    NodeCategory.CHANNEL: "Channels",
+}
+# The Checkpoint node keeps its own category (white color) but is grouped under
+# the Special submenu in the Add menu (user request V1.61) rather than its own.
+_MENU_CATEGORY_ALIAS = {NodeCategory.CHECKPOINT: NodeCategory.SPECIAL}
+
 
 class NodeScene(QGraphicsScene):
     selection_changed = Signal(str)     # node_id, or "" when not exactly one
@@ -56,6 +78,7 @@ class NodeScene(QGraphicsScene):
     node_created = Signal(str)          # node_id
     node_renamed = Signal(str, str)     # node_id, new title
     loop_edge_edit_requested = Signal(str)  # V1.49: loop edge_id to configure
+    edge_scope_changed = Signal(str, str)   # V1.68: (edge_id, scope) Frame/Objects
 
     def __init__(
         self,
@@ -110,8 +133,9 @@ class NodeScene(QGraphicsScene):
             self._add_edge_item(edge)
 
     def _color_for_node(self, node: Node) -> str:
-        """Per-category node color; Dismiss is red; falls back to scene accent."""
-        if node.op_key == SPECIAL_DISMISS_OP_KEY:
+        """Per-category node color; the 'removal' nodes (Dismiss, Exclude) are red;
+        falls back to scene accent."""
+        if node.op_key in (SPECIAL_DISMISS_OP_KEY, SPECIAL_EXCLUDE_OP_KEY):
             return Settings.ACCENT_RED
         return _CATEGORY_COLOR.get(getattr(node, "category", None), self.accent)
 
@@ -132,6 +156,8 @@ class NodeScene(QGraphicsScene):
         self.addItem(item)
         self._edge_items[edge.id] = item
         self._refresh_edge_item(item, edge)
+        self._apply_edge_scope_lever(item, edge)
+        item.set_view_only(edge_view_only(edge))   # V1.77 dotted overlay wire
         return item
 
     def _refresh_edge_item(self, item: EdgeItem, edge: Edge) -> None:
@@ -139,6 +165,78 @@ class NodeScene(QGraphicsScene):
         dst = self._port_index.get(edge.dst_port)
         if src is not None and dst is not None:
             item.set_endpoints(src.center_scene(), dst.center_scene())
+
+    def _apply_edge_scope_lever(self, item: EdgeItem, edge: Edge) -> None:
+        """Show/set the V1.68 Frame/Objects scope lever on an edge whose source
+        node produces objects (a 3D-mask / track / analysis label node) **and**
+        whose downstream node currently honors the scope.
+
+        Only the **DVC** node consumes per-object scope in this build, so the lever
+        is shown only on edges feeding a DVC node — otherwise the toggle would be a
+        silent no-op that contradicts its tooltip. (Generic per-object execution
+        for other downstream nodes is a documented follow-on; widen this gate when
+        it lands.)"""
+        from nd2studios.pipeline_graph.model import LOOP_KIND, SCOPE_OBJECTS, edge_scope
+        from nd2studios.pipeline_graph.registry_adapter import (
+            SPECIAL_DVC_OP_KEY, node_produces_objects,
+        )
+        # A loop back-edge or a V1.77 view-only (overlay) wire never carries the scope
+        # lever — the overlay is display-only, so a per-object analysis toggle on it
+        # would be meaningless (and keeping the pill off lets the click-the-wire toggle
+        # flip it back to an analysis wire).
+        if edge.kind == LOOP_KIND or edge_view_only(edge):
+            item.set_scope_lever(False, False)
+            return
+        src_node = self.slice.nodes.get(edge.src_node)
+        dst_node = self.slice.nodes.get(edge.dst_node)
+        produces = src_node is not None and node_produces_objects(src_node)
+        honored = dst_node is not None and dst_node.op_key == SPECIAL_DVC_OP_KEY
+        item.set_scope_lever(bool(produces and honored),
+                             edge_scope(edge) == SCOPE_OBJECTS)
+
+    def refresh_scope_levers(self) -> None:
+        """Re-evaluate every edge's scope lever (call after a wiring change)."""
+        for eid, item in self._edge_items.items():
+            edge = self.slice.edges.get(eid)
+            if edge is not None:
+                self._apply_edge_scope_lever(item, edge)
+
+    def toggle_edge_scope(self, edge_id: str) -> None:
+        """Flip an edge's Frame ↔ Objects scope (the pill click handler, V1.68)."""
+        from nd2studios.pipeline_graph.model import (
+            SCOPE_OBJECTS, SCOPE_WHOLE, edge_scope, set_edge_scope,
+        )
+        edge = self.slice.edges.get(edge_id)
+        if edge is None:
+            return
+        new = (SCOPE_WHOLE if edge_scope(edge) == SCOPE_OBJECTS else SCOPE_OBJECTS)
+        set_edge_scope(edge, new)
+        item = self._edge_items.get(edge_id)
+        if item is not None:
+            item.set_scope_lever(True, new == SCOPE_OBJECTS)
+        self.edge_scope_changed.emit(edge_id, new)
+        self.graph_changed.emit()
+
+    def toggle_edge_view_only(self, edge_id: str) -> None:
+        """Flip an edge between an analysis wire and a **view-only** overlay wire
+        (the click-the-wire handler, V1.77).
+
+        A view-only edge feeds its channel to the viewers only — analysis channel
+        propagation skips it — so it can never confuse the analysis pipeline. Only a
+        structural (non-channel, non-loop) wire is eligible; a channel wire is its own
+        display layer and a loop wire is control flow."""
+        edge = self.slice.edges.get(edge_id)
+        if edge is None or edge.kind == LOOP_KIND:
+            return
+        src_port = self.slice.find_port(edge.src_port)
+        if src_port is not None and src_port.type is PortType.CHANNEL:
+            return
+        new = not edge_view_only(edge)
+        set_edge_view_only(edge, new)
+        item = self._edge_items.get(edge_id)
+        if item is not None:
+            item.set_view_only(new)
+        self.graph_changed.emit()
 
     # ── public node ops (called by node corner buttons / page) ────────────
     def add_node_from_spec(self, spec: NodeSpec, pos: tuple) -> Node:
@@ -201,6 +299,14 @@ class NodeScene(QGraphicsScene):
         # signal (not graph_changed) — no preview recompute is needed; the page
         # uses it to keep the node's bridge name in sync.
         self.node_renamed.emit(node_id, title)
+
+    def set_node_tooltip(self, node_id: str, text: str) -> None:
+        """Set a per-node hover tooltip on its graphics item (V1.76 — used by the
+        DVC Checkpoint node to surface its provenance record). No-op if the node has
+        no item yet."""
+        item = self._node_items.get(node_id)
+        if item is not None:
+            item.setToolTip(text or "")
 
     # ── loop connector (V1.49) ────────────────────────────────────────────
     def set_loop_mode(self, on: bool) -> None:
@@ -356,6 +462,7 @@ class NodeScene(QGraphicsScene):
                 item.set_channel_strands([])
             else:
                 item.set_channel_strands(colors)
+            item.set_view_only(edge_view_only(edge))  # V1.77 keep dotted after recolor
         for nid, item in self._node_items.items():
             node = self.slice.nodes.get(nid)
             if node is None or getattr(node, "category", None) is not NodeCategory.CHANNEL:
@@ -541,21 +648,55 @@ class NodeScene(QGraphicsScene):
         if would_create_cycle(self.slice, out_node.id, in_node.id):
             in_item.flash_reject()
             return
-        # One wire per input port — drop any existing wire into this input.
-        existing = self.slice.edge_into_port(in_node.id, in_item.port.id)
-        if existing is not None:
-            self._remove_edge(existing.id)
+        # Input-port wiring rule (V1.77):
+        #   Channel (rainbow) port → one wire, replace (channels are their own layer).
+        #   Normal node's input port → one wire, replace (the legacy redrag-to-replace).
+        #   DVC input port → **reconvergence**: DVC accepts a primary ANALYSIS wire plus
+        #     VIEW-ONLY overlay wire(s). The OBJECT-producing source (the granule/mask
+        #     that scopes DVC per object) is kept as the analysis wire regardless of the
+        #     order the two branches were drawn; any other convergent source (e.g. a
+        #     Prism converging a channel overlay) becomes the view-only overlay.
+        from nd2studios.pipeline_graph.registry_adapter import (
+            SPECIAL_DVC_OP_KEY, node_produces_objects,
+        )
+        port_edges = [e for e in self.slice.incoming(in_node.id)
+                      if e.dst_port == in_item.port.id and e.kind != LOOP_KIND]
+        make_view_only = False
+        if in_item.port.type is PortType.CHANNEL:
+            for e in port_edges:
+                self._remove_edge(e.id)
+        elif port_edges and in_node.op_key == SPECIAL_DVC_OP_KEY:
+            analysis_edges = [e for e in port_edges if not edge_view_only(e)]
+            existing_obj = any(
+                node_produces_objects(self.slice.nodes.get(e.src_node))
+                for e in analysis_edges
+                if self.slice.nodes.get(e.src_node) is not None)
+            if node_produces_objects(out_node) and not existing_obj:
+                for e in analysis_edges:        # demote the existing overlay-only feed
+                    set_edge_view_only(e, True)
+                    it = self._edge_items.get(e.id)
+                    if it is not None:
+                        it.set_view_only(True)
+                make_view_only = False           # the new object source is the analysis wire
+            else:
+                make_view_only = True            # convergent non-scope source → overlay
+        elif port_edges:
+            for e in port_edges:                 # normal node: one wire, replace (legacy)
+                self._remove_edge(e.id)
         edge = Edge(
             id=new_id("e"),
             src_node=out_node.id, src_port=out_item.port.id,
             dst_node=in_node.id, dst_port=in_item.port.id,
         )
+        if make_view_only:
+            set_edge_view_only(edge, True)
         self.slice.add_edge(edge)
         self._add_edge_item(edge)
         # V1.48: wiring a channel into a rainbow input spawns a fresh free rainbow
         # port for the next channel (so there's always one free to grab).
         if in_item.port.type is PortType.CHANNEL:
             self._sync_rainbow_ports(in_node.id)
+        self.refresh_scope_levers()   # a demoted/added edge changes which show the lever
         self.graph_changed.emit()
 
     # ── context menu (add nodes) ──────────────────────────────────────────
@@ -575,14 +716,27 @@ class NodeScene(QGraphicsScene):
         scene_pos = (pos.x(), pos.y())
 
         if self.action_specs:
-            ops_menu = menu.addMenu("Add operation")
+            # V1.61: group specs by node category into per-type submenus so the
+            # merged scene's large catalog stays navigable. A single-category
+            # scene (e.g. Processing-only) still shows just its one submenu.
+            by_cat: Dict[NodeCategory, List[NodeSpec]] = {}
             for spec in self.action_specs:
-                act = ops_menu.addAction(spec.title)
-                act.setToolTip(spec.description)
-                act.triggered.connect(
-                    lambda _checked=False, s=spec, p=scene_pos:
-                    self.add_node_from_spec(s, p)
-                )
+                cat = spec.effective_category() or NodeCategory.ANALYSIS
+                cat = _MENU_CATEGORY_ALIAS.get(cat, cat)  # Checkpoint → Special
+                by_cat.setdefault(cat, []).append(spec)
+            ordered = [c for c in _CATEGORY_MENU_ORDER if c in by_cat]
+            ordered += [c for c in by_cat if c not in ordered]
+            for cat in ordered:
+                label = _CATEGORY_MENU_LABEL.get(cat) or (
+                    cat.value.title() if cat else "Other")
+                cat_menu = menu.addMenu(label)
+                for spec in by_cat[cat]:
+                    act = cat_menu.addAction(spec.title)
+                    act.setToolTip(spec.description)
+                    act.triggered.connect(
+                        lambda _checked=False, s=spec, p=scene_pos:
+                        self.add_node_from_spec(s, p)
+                    )
         if self.output_spec is not None:
             menu.addSeparator()
             out_act = menu.addAction("Add output node")

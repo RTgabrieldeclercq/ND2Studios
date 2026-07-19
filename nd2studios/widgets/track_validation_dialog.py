@@ -48,6 +48,7 @@ from nd2studios.backend.exporters.composite_exporter import (
 )
 from nd2studios.core.settings import Settings
 from nd2studios.widgets.common import MplCanvas
+from nd2studios.widgets.icon_button import scale_qss, scaled
 from nd2studios.widgets.image_viewer import ImageCanvas
 
 
@@ -132,26 +133,26 @@ class _TrackPanel(QWidget):
         # Unit info label.
         self._lbl = QLabel("")
         self._lbl.setAlignment(Qt.AlignCenter)
-        self._lbl.setStyleSheet(
+        self._lbl.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 8pt;"
-        )
+        ))
         layout.addWidget(self._lbl)
 
         # Image canvas (cropped cell with red boundary outline).
         self._canvas = ImageCanvas(self)
-        self._canvas.setMinimumSize(120, 120)
+        self._canvas.setMinimumSize(scaled(120), scaled(120))
         layout.addWidget(self._canvas, stretch=2)
 
         # Per-frame cell-detail text (frame / area / ecc / intensity).
         self._info = QLabel("")
         self._info.setAlignment(Qt.AlignCenter)
         self._info.setWordWrap(True)
-        self._info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 8pt;")
+        self._info.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 8pt;"))
         layout.addWidget(self._info)
 
         # Per-cell metric trace over the unit's frames (CellTracker-style).
         self._trace = MplCanvas(self, width=3.0, height=1.4, dpi=90)
-        self._trace.setMinimumHeight(96)
+        self._trace.setMinimumHeight(scaled(96))
         self._trace_ax = self._trace.add_subplot(111)
         layout.addWidget(self._trace, stretch=1)
 
@@ -251,14 +252,14 @@ class _TrackPanel(QWidget):
         self._btn_reject.setEnabled(False)
         if decision == "accepted":
             self._set_border(self._BORDER_ACCEPTED)
-            self._lbl.setStyleSheet(
+            self._lbl.setStyleSheet(scale_qss(
                 f"color: {self._BORDER_ACCEPTED}; font: 8pt bold;"
-            )
+            ))
         else:
             self._set_border(self._BORDER_REJECTED)
-            self._lbl.setStyleSheet(
+            self._lbl.setStyleSheet(scale_qss(
                 f"color: {self._BORDER_REJECTED}; font: 8pt bold;"
-            )
+            ))
 
     @property
     def uid(self) -> Optional[str]:
@@ -271,9 +272,9 @@ class _TrackPanel(QWidget):
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _set_border(self, colour: str) -> None:
-        self.setStyleSheet(
+        self.setStyleSheet(scale_qss(
             f"QWidget#trackPanel {{ border: 2px solid {colour}; border-radius: 4px; }}"
-        )
+        ))
 
 
 # ── Main dialog ───────────────────────────────────────────────────────────────
@@ -363,7 +364,7 @@ class TrackValidationDialog(QDialog):
             sz = screen.size()
             self.resize(int(sz.width() * 0.90), int(sz.height() * 0.90))
         else:
-            self.resize(1400, 900)
+            self.resize(scaled(1400), scaled(900))
 
         self._build_ui()
         self._apply_style()
@@ -384,9 +385,9 @@ class TrackValidationDialog(QDialog):
         top_bar = QHBoxLayout()
 
         self._lbl_progress = QLabel("")
-        self._lbl_progress.setStyleSheet(
+        self._lbl_progress.setStyleSheet(scale_qss(
             f"color: {Settings.FG_PRIMARY}; font: bold 11pt;"
-        )
+        ))
         top_bar.addWidget(self._lbl_progress, stretch=1)
 
         # Metric selector for the per-cell trace (CellTracker's "Metric" combo).
@@ -411,7 +412,7 @@ class TrackValidationDialog(QDialog):
         self._combo_overlay.currentIndexChanged.connect(self._on_overlay_choice_changed)
         top_bar.addWidget(self._combo_overlay)
         self._btn_ov_color = QPushButton()
-        self._btn_ov_color.setFixedSize(28, 22)
+        self._btn_ov_color.setFixedSize(scaled(28), scaled(22))
         self._btn_ov_color.setToolTip("Overlay color")
         self._btn_ov_color.clicked.connect(self._on_overlay_color)
         self._refresh_ov_color_btn()
@@ -431,7 +432,7 @@ class TrackValidationDialog(QDialog):
         for n, label in [(1, "1"), (2, "2"), (4, "4")]:
             btn = QPushButton(label)
             btn.setCheckable(True)
-            btn.setFixedSize(32, 26)
+            btn.setFixedSize(scaled(32), scaled(26))
             btn.setObjectName("modeBtn")
             btn.clicked.connect(lambda checked, m=n: self._set_mode(m))
             self._btn_mode[n] = btn
@@ -453,7 +454,7 @@ class TrackValidationDialog(QDialog):
 
         self._btn_play_all = QPushButton("▶ Play All")
         self._btn_play_all.setCheckable(True)
-        self._btn_play_all.setMinimumWidth(90)
+        self._btn_play_all.setMinimumWidth(scaled(90))
         self._btn_play_all.toggled.connect(self._on_play_toggled)
         t_row.addWidget(self._btn_play_all)
 
@@ -469,7 +470,7 @@ class TrackValidationDialog(QDialog):
         self._spin_t = QSpinBox()
         self._spin_t.setMinimum(0)
         self._spin_t.setMaximum(max(0, self._n_t - 1))
-        self._spin_t.setFixedWidth(55)
+        self._spin_t.setFixedWidth(scaled(55))
         self._spin_t.valueChanged.connect(self._on_spin_t_changed)
         t_row.addWidget(self._spin_t)
 
@@ -483,7 +484,7 @@ class TrackValidationDialog(QDialog):
         self._spin_fps.setRange(0.5, 60.0)
         self._spin_fps.setValue(5.0)
         self._spin_fps.setSingleStep(0.5)
-        self._spin_fps.setFixedWidth(65)
+        self._spin_fps.setFixedWidth(scaled(65))
         self._spin_fps.valueChanged.connect(self._on_fps_changed)
         t_row.addWidget(self._spin_fps)
 
@@ -495,14 +496,14 @@ class TrackValidationDialog(QDialog):
 
         self._btn_accept_all = QPushButton("Accept All")
         self._btn_accept_all.setObjectName("primaryBtn")
-        self._btn_accept_all.setMinimumWidth(110)
+        self._btn_accept_all.setMinimumWidth(scaled(110))
         self._btn_accept_all.setToolTip("Accept all undecided objects in this batch.")
         self._btn_accept_all.clicked.connect(self._on_accept_all)
         btn_row.addWidget(self._btn_accept_all)
 
         self._btn_reject_all = QPushButton("Reject All")
         self._btn_reject_all.setObjectName("rejectBtn")
-        self._btn_reject_all.setMinimumWidth(110)
+        self._btn_reject_all.setMinimumWidth(scaled(110))
         self._btn_reject_all.setToolTip("Reject all undecided objects in this batch.")
         self._btn_reject_all.clicked.connect(self._on_reject_all)
         btn_row.addWidget(self._btn_reject_all)
@@ -510,14 +511,14 @@ class TrackValidationDialog(QDialog):
         btn_row.addStretch(1)
 
         self._btn_close = QPushButton("Close")
-        self._btn_close.setMinimumWidth(90)
+        self._btn_close.setMinimumWidth(scaled(90))
         self._btn_close.clicked.connect(self.reject)
         btn_row.addWidget(self._btn_close)
 
         outer.addLayout(btn_row)
 
     def _apply_style(self) -> None:
-        self.setStyleSheet(f"""
+        self.setStyleSheet(scale_qss(f"""
             QWidget {{
                 background: {Settings.BG_PRIMARY};
                 color: {Settings.FG_PRIMARY};
@@ -569,7 +570,7 @@ class TrackValidationDialog(QDialog):
                 color: #ffffff;
                 border: none;
             }}
-        """)
+        """))
 
     # ── Mode control ──────────────────────────────────────────────────────────
 

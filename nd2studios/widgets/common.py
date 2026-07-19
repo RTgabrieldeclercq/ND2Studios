@@ -19,6 +19,7 @@ from matplotlib.figure import Figure
 
 from nd2studios.core.plugin_registry import ParamSpec
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss
 
 
 class MplCanvas(FigureCanvas):
@@ -53,6 +54,39 @@ class MplCanvas(FigureCanvas):
     def clear(self):
         self.fig.clear()
         self.draw()
+
+    def safe_tight_layout(self, **kwargs) -> None:
+        """``fig.tight_layout()`` guarded against a zero-size figure.
+
+        Rendering while the canvas is hidden or not yet laid out (e.g. a panel in a
+        just-shown / collapsed splitter) leaves the figure with a zero dimension,
+        which makes matplotlib's ``tight_layout`` raise ``'box_aspect' and
+        'fig_aspect' must be positive``. Skip it then (the next render at a real
+        size lays out correctly), and never let a layout pass crash the GUI.
+        """
+        try:
+            w, h = self.fig.get_size_inches()
+            if float(w) > 0 and float(h) > 0:
+                self.fig.tight_layout(**kwargs)
+        except Exception:  # noqa: BLE001 — layout must never crash the GUI
+            pass
+
+    def safe_draw(self) -> None:
+        """``draw()`` guarded against a zero-size figure.
+
+        Drawing while the canvas is hidden or not yet laid out (e.g. a panel that
+        is a not-yet-shown tab in a stacked viewer) leaves the figure with a zero
+        dimension. Axes with a fixed aspect (``imshow(..., aspect="equal")``) then
+        make matplotlib's ``apply_aspect`` raise ``'box_aspect' and 'fig_aspect'
+        must be positive`` during the draw. Skip the draw then — the canvas repaints
+        at its real size once shown — and never let it crash the GUI.
+        """
+        try:
+            w, h = self.fig.get_size_inches()
+            if float(w) > 0 and float(h) > 0:
+                self.draw()
+        except Exception:  # noqa: BLE001 — a draw must never crash the GUI
+            pass
 
 
 class ParamEditor(QWidget):
@@ -229,7 +263,7 @@ class StatusIndicator(QLabel):
     def set_status(self, status: str):
         color = self.STATUS_COLORS.get(status, Settings.FG_SECONDARY)
         self.setText(status.replace("_", " ").title())
-        self.setStyleSheet(
+        self.setStyleSheet(scale_qss(
             f"background-color: {color}; color: #282a36; "
             f"font: bold 9pt 'Helvetica Neue'; padding: 4px 12px; border-radius: 4px;"
-        )
+        ))

@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled
 from nd2studios.workers.base_worker import BaseWorker
 
 
@@ -220,7 +221,7 @@ class ResultsPage(QWidget):
         ctrl_row = QHBoxLayout()
         ctrl_row.addWidget(QLabel("Pipeline:"))
         self._combo_pipeline = QComboBox()
-        self._combo_pipeline.setMinimumWidth(220)
+        self._combo_pipeline.setMinimumWidth(scaled(220))
         self._combo_pipeline.currentTextChanged.connect(self._on_pipeline_changed)
         ctrl_row.addWidget(self._combo_pipeline)
 
@@ -231,7 +232,7 @@ class ResultsPage(QWidget):
 
         self._compute_progress_bar = QProgressBar()
         self._compute_progress_bar.setRange(0, 100)
-        self._compute_progress_bar.setMaximumHeight(14)
+        self._compute_progress_bar.setMaximumHeight(scaled(14))
         self._compute_progress_bar.setVisible(False)
         ctrl_row.addWidget(self._compute_progress_bar)
 
@@ -245,7 +246,7 @@ class ResultsPage(QWidget):
         ctrl_row.addStretch(1)
 
         self._lbl_count = QLabel("")
-        self._lbl_count.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self._lbl_count.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         ctrl_row.addWidget(self._lbl_count)
         root.addLayout(ctrl_row)
 
@@ -254,16 +255,16 @@ class ResultsPage(QWidget):
         track_row.setSpacing(6)
 
         lbl_tracking = QLabel("Object Tracking:")
-        lbl_tracking.setStyleSheet(
+        lbl_tracking.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: bold 8pt; letter-spacing: 0.5px;"
-        )
+        ))
         track_row.addWidget(lbl_tracking)
 
         track_row.addWidget(QLabel("Link distance (px):"))
         self._spin_max_disp = QSpinBox()
         self._spin_max_disp.setRange(1, 9999)
         self._spin_max_disp.setValue(100)
-        self._spin_max_disp.setFixedWidth(65)
+        self._spin_max_disp.setFixedWidth(scaled(65))
         self._spin_max_disp.setToolTip(
             "Maximum centroid displacement (Euclidean, pixels) between\n"
             "consecutive frames to link two detections as the same object."
@@ -275,7 +276,7 @@ class ResultsPage(QWidget):
         self._spin_min_track_len = QSpinBox()
         self._spin_min_track_len.setRange(2, 9999)
         self._spin_min_track_len.setValue(2)
-        self._spin_min_track_len.setFixedWidth(65)
+        self._spin_min_track_len.setFixedWidth(scaled(65))
         self._spin_min_track_len.setToolTip(
             "Minimum number of consecutive frames an object must appear in\n"
             "to be treated as a tracked object.  Objects with fewer frames\n"
@@ -290,7 +291,7 @@ class ResultsPage(QWidget):
         self._spin_min_circ.setSingleStep(0.05)
         self._spin_min_circ.setDecimals(2)
         self._spin_min_circ.setValue(0.0)
-        self._spin_min_circ.setFixedWidth(65)
+        self._spin_min_circ.setFixedWidth(scaled(65))
         self._spin_min_circ.setToolTip(
             "Minimum circularity (4π·area/perimeter²) an object must have\n"
             "to be eligible for tracking.  0.0 = no filter (all shapes pass);\n"
@@ -305,7 +306,7 @@ class ResultsPage(QWidget):
         self._spin_max_ecc.setSingleStep(0.05)
         self._spin_max_ecc.setDecimals(2)
         self._spin_max_ecc.setValue(1.0)
-        self._spin_max_ecc.setFixedWidth(65)
+        self._spin_max_ecc.setFixedWidth(scaled(65))
         self._spin_max_ecc.setToolTip(
             "Maximum eccentricity an object may have to be eligible for\n"
             "tracking.  0.0 = circles only; 1.0 = no filter (all shapes pass)."
@@ -330,7 +331,7 @@ class ResultsPage(QWidget):
         self._table.setSortingEnabled(True)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setAlternatingRowColors(False)
-        self._table.setStyleSheet(f"""
+        self._table.setStyleSheet(scale_qss(f"""
             QTableView {{
                 background-color: {Settings.BG_PRIMARY};
                 gridline-color: {Settings.BORDER_COLOR};
@@ -344,7 +345,7 @@ class ResultsPage(QWidget):
                 background-color: {Settings.BG_HOVER};
                 color: {Settings.FG_PRIMARY};
             }}
-        """)
+        """))
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalHeader().setVisible(False)
@@ -361,7 +362,7 @@ class ResultsPage(QWidget):
             rl.setContentsMargins(0, 0, 0, 0)
             lbl_key = QLabel(key.replace("_", " ").title() + ":")
             lbl_key.setStyleSheet(f"color: {Settings.FG_SECONDARY};")
-            lbl_key.setMinimumWidth(130)
+            lbl_key.setMinimumWidth(scaled(130))
             lbl_val = QLabel("—")
             rl.addWidget(lbl_key)
             rl.addWidget(lbl_val, stretch=1)
@@ -370,8 +371,8 @@ class ResultsPage(QWidget):
         self._dynamic_summary_container = QVBoxLayout()
         sl.addLayout(self._dynamic_summary_container)
         sl.addStretch(1)
-        summary_group.setMinimumWidth(220)
-        summary_group.setMaximumWidth(300)
+        summary_group.setMinimumWidth(scaled(220))
+        summary_group.setMaximumWidth(scaled(300))
         splitter.addWidget(summary_group)
 
         splitter.setStretchFactor(0, 0)
@@ -425,11 +426,11 @@ class ResultsPage(QWidget):
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
         self._progress_bar.setVisible(False)
-        self._progress_bar.setMaximumHeight(14)
+        self._progress_bar.setMaximumHeight(scaled(14))
         progress_row.addWidget(self._progress_bar, stretch=1)
         self._btn_cancel_export = QPushButton("Cancel")
         self._btn_cancel_export.setVisible(False)
-        self._btn_cancel_export.setMaximumWidth(70)
+        self._btn_cancel_export.setMaximumWidth(scaled(70))
         self._btn_cancel_export.clicked.connect(self._on_cancel_export)
         progress_row.addWidget(self._btn_cancel_export)
         root.addLayout(progress_row)
@@ -440,9 +441,9 @@ class ResultsPage(QWidget):
             "then click 'Compute Measurements'."
         )
         self._lbl_empty.setAlignment(Qt.AlignCenter)
-        self._lbl_empty.setStyleSheet(
+        self._lbl_empty.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: 11pt;"
-        )
+        ))
         root.addWidget(self._lbl_empty)
         self._lbl_empty.setVisible(False)
 
@@ -451,8 +452,8 @@ class ResultsPage(QWidget):
     def _build_columns_sidebar(self) -> QWidget:
         """Build the left column-selector panel with uniform checkbox spacing."""
         outer = QWidget()
-        outer.setMinimumWidth(180)
-        outer.setMaximumWidth(240)
+        outer.setMinimumWidth(scaled(180))
+        outer.setMaximumWidth(scaled(240))
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(0, 0, 4, 0)
         outer_layout.setSpacing(4)
@@ -472,11 +473,11 @@ class ResultsPage(QWidget):
 
         # Intensity placeholder (hidden until first compute).
         self._intensity_header = QLabel("INTENSITY")
-        self._intensity_header.setFixedHeight(_CB_HEIGHT)
-        self._intensity_header.setStyleSheet(
+        self._intensity_header.setFixedHeight(scaled(_CB_HEIGHT))
+        self._intensity_header.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: bold 8pt; "
             f"letter-spacing: 1px; padding-left: 4px;"
-        )
+        ))
         self._intensity_header.hide()
         self._col_inner_layout.addWidget(self._intensity_header)
 
@@ -490,10 +491,10 @@ class ResultsPage(QWidget):
 
         self._intensity_sep = QFrame()
         self._intensity_sep.setFrameShape(QFrame.Shape.HLine)
-        self._intensity_sep.setFixedHeight(1)
-        self._intensity_sep.setStyleSheet(
+        self._intensity_sep.setFixedHeight(scaled(1))
+        self._intensity_sep.setStyleSheet(scale_qss(
             f"background: {Settings.BORDER_COLOR}; margin: 4px 0;"
-        )
+        ))
         self._intensity_sep.hide()
         self._col_inner_layout.addWidget(self._intensity_sep)
 
@@ -504,11 +505,11 @@ class ResultsPage(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 2, 0, 0)
         btn_all = QPushButton("All")
-        btn_all.setFixedWidth(50)
+        btn_all.setFixedWidth(scaled(50))
         btn_all.setToolTip("Check all columns")
         btn_all.clicked.connect(self._select_all_columns)
         btn_none = QPushButton("None")
-        btn_none.setFixedWidth(50)
+        btn_none.setFixedWidth(scaled(50))
         btn_none.setToolTip("Uncheck all columns")
         btn_none.clicked.connect(self._clear_all_columns)
         btn_row.addWidget(btn_all)
@@ -521,28 +522,28 @@ class ResultsPage(QWidget):
     def _add_col_group(self, group_name: str, cols: List[tuple]) -> None:
         """Add a section header + uniform-height checkboxes to the inner layout."""
         lbl = QLabel(group_name.upper())
-        lbl.setFixedHeight(_CB_HEIGHT)
-        lbl.setStyleSheet(
+        lbl.setFixedHeight(scaled(_CB_HEIGHT))
+        lbl.setStyleSheet(scale_qss(
             f"color: {Settings.FG_SECONDARY}; font: bold 8pt; "
             f"letter-spacing: 1px; padding-left: 4px;"
-        )
+        ))
         self._col_inner_layout.addWidget(lbl)
 
         for key, label in cols:
             cb = QCheckBox(label)
-            cb.setFixedHeight(_CB_HEIGHT)
+            cb.setFixedHeight(scaled(_CB_HEIGHT))
             cb.setChecked(key in _DEFAULT_COLUMNS)
-            cb.setStyleSheet("padding-left: 4px;")
+            cb.setStyleSheet(scale_qss("padding-left: 4px;"))
             cb.toggled.connect(self._on_column_toggled)
             self._col_checkboxes[key] = cb
             self._col_inner_layout.addWidget(cb)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(
+        sep.setFixedHeight(scaled(1))
+        sep.setStyleSheet(scale_qss(
             f"background: {Settings.BORDER_COLOR}; margin: 4px 0;"
-        )
+        ))
         self._col_inner_layout.addWidget(sep)
 
     # ── Column sidebar slots ──────────────────────────────────────────────────
@@ -593,9 +594,9 @@ class ResultsPage(QWidget):
                 ch = key[len("std_intensity_"):].replace("_", " ")
                 label = f"Std intensity ({ch})"
             cb = QCheckBox(label)
-            cb.setFixedHeight(_CB_HEIGHT)
+            cb.setFixedHeight(scaled(_CB_HEIGHT))
             cb.setChecked(True)
-            cb.setStyleSheet("padding-left: 4px;")
+            cb.setStyleSheet(scale_qss("padding-left: 4px;"))
             cb.toggled.connect(self._on_column_toggled)
             self._col_checkboxes[key] = cb
             self._intensity_layout.addWidget(cb)
@@ -988,7 +989,7 @@ class ResultsPage(QWidget):
         self._table.resizeColumnsToContents()
         for c in range(proxy.columnCount()):
             w = self._table.columnWidth(c)
-            self._table.setColumnWidth(c, min(w, 160))
+            self._table.setColumnWidth(c, min(w, scaled(160)))
 
     # ── Summary update ────────────────────────────────────────────────────────
 

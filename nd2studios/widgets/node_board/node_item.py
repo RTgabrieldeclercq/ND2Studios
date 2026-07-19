@@ -14,14 +14,16 @@ from __future__ import annotations
 from typing import Callable, List, Optional
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
+from PySide6.QtGui import (
+    QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen,
+)
 from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsObject, QGraphicsProxyWidget, QLineEdit,
 )
 
 from nd2studios.core.settings import Settings
 from nd2studios.pipeline_graph.model import Node, NodeCategory, NodeRole, PortType, ShapeKind
-from nd2studios.widgets.icon_button import make_icon, scaled
+from nd2studios.widgets.icon_button import make_icon, scaled, scale_qss, scaled_pt
 from nd2studios.widgets.node_board.port_item import PortItem
 
 
@@ -101,6 +103,11 @@ class NodeItem(QGraphicsObject):
     """Visual + interactive representation of one model :class:`Node`."""
 
     BASE_WIDTH = 172
+    # V1.77 Prism (ShapeKind.GEM) silhouette proportions — shared by _body_path
+    # (outline), _build_ports (implicit, via the general branch) and _paint_gem
+    # (facet vertices), so the facets align exactly with the outline.
+    _GEM_TABLE_INSET = 0.26   # flat top/bottom half-inset (fraction of width)
+    _GEM_SHOULDER = 0.26      # girdle shoulder height (fraction of height)
 
     def __init__(self, node: Node, accent_hex: str) -> None:
         super().__init__()
@@ -123,12 +130,10 @@ class NodeItem(QGraphicsObject):
         self._previewed = False          # the node whose result is in the viewer
         self._run_state = ""             # "" | "shaded" | "current" | "done" (Run)
 
-        # In-place name editing (OUTPUT nodes): click the name to edit it.
+        # In-place name editing (INPUT / OUTPUT nodes): double-click to edit.
         self._editor: Optional[QGraphicsProxyWidget] = None
         self._editor_widget: Optional[_NameLineEdit] = None
-        self._maybe_name_edit = False
         self._edit_cancelled = False
-        self._press_scene_pos = QPointF()
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
@@ -150,6 +155,11 @@ class NodeItem(QGraphicsObject):
         # channel pills are short.
         if self._shape is ShapeKind.TRIANGLE:
             return self._tri_h
+        if self._shape is ShapeKind.GEM:
+            # A gem reads as a tall faceted crystal; grow with rainbow inputs (on the
+            # vertical mid-sides) so several channel wires fit like a rect process.
+            n_ci = sum(1 for p in self.node.inputs if p.type is PortType.CHANNEL)
+            return self._tri_h + scaled(13) * max(0, n_ci - 1)
         if self._shape is ShapeKind.PILL:
             # Grow with the number of rainbow inputs so several channels fit down
             # the left edge (channel-source pills have none → the base height).
@@ -162,8 +172,8 @@ class NodeItem(QGraphicsObject):
         return base + scaled(13) * max(0, n_ci - 1)
 
     def _is_shape(self) -> bool:
-        """True for the non-rectangular silhouettes (triangle / hexagon)."""
-        return self._shape in (ShapeKind.TRIANGLE, ShapeKind.HEXAGON)
+        """True for the non-rectangular silhouettes (triangle / hexagon / gem)."""
+        return self._shape in (ShapeKind.TRIANGLE, ShapeKind.HEXAGON, ShapeKind.GEM)
 
     def _port_x(self, i: int, n: int) -> float:
         """Even horizontal spread for ``n`` ports along a top/bottom edge."""
@@ -193,6 +203,23 @@ class NodeItem(QGraphicsObject):
             p.lineTo(w - inset, h)
             p.lineTo(inset, h)
             p.lineTo(0.0, h / 2.0)
+            p.closeSubpath()
+        elif self._shape is ShapeKind.GEM:
+            # V1.77 Prism — an upright faceted crystal (barrel octagon): a narrow flat
+            # table on top, angled shoulders out to the widest girdle at the vertical
+            # mid-sides, then angled shoulders in to a flat culet on the bottom. The
+            # flat top/bottom carry the structural in/out ports; the vertical mid-sides
+            # carry the rainbow channel ports. Facets + gloss are painted in _paint_gem.
+            tx = w * self._GEM_TABLE_INSET
+            sh = h * self._GEM_SHOULDER
+            p.moveTo(tx, 0.0)
+            p.lineTo(w - tx, 0.0)
+            p.lineTo(w, sh)
+            p.lineTo(w, h - sh)
+            p.lineTo(w - tx, h)
+            p.lineTo(tx, h)
+            p.lineTo(0.0, h - sh)
+            p.lineTo(0.0, sh)
             p.closeSubpath()
         elif self._shape is ShapeKind.PILL:
             p.addRoundedRect(QRectF(0, 0, w, h), h / 2.0, h / 2.0)
@@ -356,7 +383,10 @@ class NodeItem(QGraphicsObject):
         h = self._height()
         body_path = self._body_path()
 
-        if self._is_shape():
+        if self._shape is ShapeKind.GEM:
+            # V1.77 Prism — a faceted 2.5D crystal (facets + gloss + seams).
+            self._paint_gem(painter, body_path, dim, h)
+        elif self._is_shape():
             # Triangle / hexagon: a dark body tinted by the category color so an
             # if-else reads purple and a special node reads orange (Dismiss red).
             painter.fillPath(body_path, QColor(Settings.BG_TERTIARY))
@@ -415,7 +445,7 @@ class NodeItem(QGraphicsObject):
         if self._editor is not None:
             return
         font = QFont()
-        font.setPointSizeF(max(7.5, 9.0))
+        font.setPointSizeF(scaled_pt(max(7.5, 9.0)))
         font.setBold(True)
         painter.setFont(font)
         painter.setPen(QColor(Settings.FG_PRIMARY if not dim else Settings.FG_SECONDARY))
@@ -425,6 +455,10 @@ class NodeItem(QGraphicsObject):
             align = Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
         elif self._shape is ShapeKind.HEXAGON:
             title_rect = QRectF(self._w * 0.22, 0, self._w * 0.56, h)
+            align = Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+        elif self._shape is ShapeKind.GEM:
+            # Center the label over the girdle band where the gem is widest.
+            title_rect = QRectF(self._w * 0.16, 0, self._w * 0.68, h)
             align = Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
         else:
             title_rect = QRectF(self._lip_w + scaled(10), 0,
@@ -457,7 +491,7 @@ class NodeItem(QGraphicsObject):
         painter.setPen(pen)
         painter.drawPath(body)
         font = QFont()
-        font.setPointSizeF(8.5)
+        font.setPointSizeF(scaled_pt(8.5))
         font.setBold(True)
         painter.setFont(font)
         painter.setPen(QColor(Settings.FG_PRIMARY if not dim else Settings.FG_SECONDARY))
@@ -468,6 +502,65 @@ class NodeItem(QGraphicsObject):
                                   int(text_rect.width()))
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter
                          | Qt.AlignmentFlag.AlignLeft, text)
+
+    def _paint_gem(self, painter: QPainter, body_path: QPainterPath,
+                   dim: bool, h: float) -> None:
+        """Paint the Prism node as a faceted 2.5D crystal (V1.77).
+
+        A dark base, then eight accent facets meeting at the center — brighter on the
+        upper-right (light from that corner), darker on the lower-left — a diagonal
+        gloss sheen, and thin facet seams. Vertices reuse the ``_body_path`` GEM outline
+        proportions so facets align exactly with the silhouette. Honors ``dim`` (Run
+        shading / disabled) exactly as the triangle/hexagon tint does."""
+        w = self._w
+        painter.fillPath(body_path, QColor(Settings.BG_TERTIARY))
+        accent = QColor(self._accent)
+        tx = w * self._GEM_TABLE_INSET
+        sh = h * self._GEM_SHOULDER
+        # Outline vertices …
+        TL, TR = QPointF(tx, 0.0), QPointF(w - tx, 0.0)
+        RU, RL = QPointF(w, sh), QPointF(w, h - sh)
+        BR, BL = QPointF(w - tx, h), QPointF(tx, h)
+        LL, LU = QPointF(0.0, h - sh), QPointF(0.0, sh)
+        # … and the internal anchors (table/culet mids, girdle mids, center).
+        TM, BM = QPointF(w / 2.0, 0.0), QPointF(w / 2.0, h)
+        LM, RM = QPointF(0.0, h / 2.0), QPointF(w, h / 2.0)
+        C = QPointF(w / 2.0, h / 2.0)
+        base_alpha = 70 if dim else 165
+
+        def facet(pts, shade: int) -> None:
+            c = (QColor(accent).lighter(shade) if shade >= 100
+                 else QColor(accent).darker(200 - shade))
+            c.setAlpha(base_alpha)
+            fp = QPainterPath(pts[0])
+            for q in pts[1:]:
+                fp.lineTo(q)
+            fp.closeSubpath()
+            painter.fillPath(fp, c)
+
+        # Light from the upper-right: right/top facets brighter, lower-left darkest.
+        facet([TL, TM, C, LU], 108)   # crown left
+        facet([TM, TR, RU, C], 162)   # crown right (brightest)
+        facet([LU, C, LM], 88)        # upper-left
+        facet([RU, RM, C], 138)       # upper-right
+        facet([LM, C, LL], 80)        # lower-left (darkest)
+        facet([RM, RL, C], 118)       # lower-right
+        facet([LL, BL, BM, C], 96)    # pavilion left
+        facet([C, BM, BR, RL], 126)   # pavilion right
+
+        # Diagonal gloss sheen (top-left highlight → bottom-right shadow).
+        g = QLinearGradient(0.0, 0.0, w, h)
+        g.setColorAt(0.0, QColor(255, 255, 255, 12 if dim else 30))
+        g.setColorAt(0.5, QColor(255, 255, 255, 0))
+        g.setColorAt(1.0, QColor(0, 0, 0, 14 if dim else 34))
+        painter.fillPath(body_path, g)
+
+        # Facet seams — the center vertical, the girdle, and the four girdle diagonals.
+        seam = QPen(QColor(Settings.BG_PRIMARY))
+        seam.setWidthF(scaled(1.0))
+        painter.setPen(seam)
+        for a, b in ((TM, BM), (LM, RM), (LU, C), (RU, C), (LL, C), (RL, C)):
+            painter.drawLine(a, b)
 
     # ── interaction ───────────────────────────────────────────────────────
     def itemChange(self, change, value):  # noqa: N802 (Qt naming)
@@ -492,30 +585,20 @@ class NodeItem(QGraphicsObject):
         super().hoverLeaveEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        # On an OUTPUT node, a plain click on the name opens an inline editor.
-        # We arm it here and trigger on release *only* if the mouse didn't move
-        # (a drag should move the node, not rename it).
-        self._maybe_name_edit = False
-        if (event.button() == Qt.MouseButton.LeftButton
-                and self._is_renamable()
-                and self._editor is None
-                and self._name_hit(event.pos())):
-            self._maybe_name_edit = True
-            self._press_scene_pos = event.scenePos()
+        # V1.61: renaming moved to double-click (see mouseDoubleClickEvent); a
+        # plain press just selects / drags the node.
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         super().mouseReleaseEvent(event)
-        if self._maybe_name_edit:
-            self._maybe_name_edit = False
-            d = event.scenePos() - self._press_scene_pos
-            if abs(d.x()) + abs(d.y()) <= scaled(4):  # a click, not a drag
-                self._begin_name_edit()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
-        # Renamable (OUTPUT) nodes consume the double-click for inline editing
-        # (armed on press) rather than promoting to the previewed node.
+        # V1.61 gesture policy: double-clicking an INPUT / OUTPUT node opens the
+        # inline rename editor (Enter / click-away commits, Esc cancels) instead
+        # of promoting it to the previewed node. ACTION nodes keep promoting to
+        # the previewed node; channel pills are inert.
         if self._is_renamable():
+            self._begin_name_edit()
             event.accept()
             return
         # Channel-source pills are not previewable — swallow the double-click.
@@ -528,9 +611,11 @@ class NodeItem(QGraphicsObject):
             fn(self.node.id)
         super().mouseDoubleClickEvent(event)
 
-    # ── in-place name editing (OUTPUT nodes) ───────────────────────────────
+    # ── in-place name editing (INPUT / OUTPUT nodes) ────────────────────────
     def _is_renamable(self) -> bool:
-        return self.node.role is NodeRole.OUTPUT
+        # V1.61: input nodes (one per loaded file) are renamable too, not just
+        # output/bridge nodes.
+        return self.node.role in (NodeRole.INPUT, NodeRole.OUTPUT)
 
     def _name_hit(self, pos: QPointF) -> bool:
         """True if ``pos`` (item coords) is on the node's name area (the body
@@ -551,12 +636,12 @@ class NodeItem(QGraphicsObject):
         self._edit_cancelled = False
         edit = _NameLineEdit(self.node.title)
         edit.setObjectName("nodeNameEdit")
-        edit.setStyleSheet(
+        edit.setStyleSheet(scale_qss(
             f"background:{Settings.BG_SECONDARY}; color:{Settings.FG_PRIMARY};"
             f"border:1px solid {Settings.ACCENT_GOLD}; border-radius:4px;"
             "padding:1px 4px;"
             f"selection-background-color:{Settings.BG_HOVER};"
-        )
+        ))
         edit.selectAll()
         edit.editingFinished.connect(self._commit_name_edit)
         edit.escaped.connect(self._cancel_name_edit)

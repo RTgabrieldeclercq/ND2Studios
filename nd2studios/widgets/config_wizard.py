@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from nd2studios.core.settings import Settings
+from nd2studios.widgets.icon_button import scale_qss, scaled
 
 CONFIG_EXTENSION = ".nd2s_cfg"
 
@@ -281,21 +282,21 @@ def build_config_diff(old: dict, new: dict) -> Dict[str, List[str]]:
 def _make_nav_panel(title: str, items: List[str]) -> tuple:
     """Return (nav_panel_widget, QListWidget) ready to connect to a QStackedWidget."""
     nav_panel = QWidget()
-    nav_panel.setFixedWidth(180)
+    nav_panel.setFixedWidth(scaled(180))
     nav_panel.setStyleSheet(f"background: {Settings.BG_SECONDARY};")
     layout = QVBoxLayout(nav_panel)
     layout.setContentsMargins(0, 20, 0, 8)
     layout.setSpacing(0)
 
     title_lbl = QLabel(title)
-    title_lbl.setStyleSheet(
+    title_lbl.setStyleSheet(scale_qss(
         f"color: {Settings.FG_SECONDARY}; font: bold 9pt; "
         f"padding: 0 12px 12px 12px; background: transparent;"
-    )
+    ))
     layout.addWidget(title_lbl)
 
     nav = QListWidget()
-    nav.setStyleSheet(f"""
+    nav.setStyleSheet(scale_qss(f"""
         QListWidget {{
             background: {Settings.BG_SECONDARY};
             border: none;
@@ -313,7 +314,7 @@ def _make_nav_panel(title: str, items: List[str]) -> tuple:
             color: {Settings.ACCENT_PURPLE};
             border-left: 3px solid {Settings.ACCENT_PURPLE};
         }}
-    """)
+    """))
     for item in items:
         nav.addItem(item)
     layout.addWidget(nav)
@@ -341,8 +342,8 @@ class ConfigWizard(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Configure Pipelines")
-        self.setMinimumSize(800, 600)
-        self.setStyleSheet(_DLG_STYLE)
+        self.setMinimumSize(scaled(800), scaled(600))
+        self.setStyleSheet(scale_qss(_DLG_STYLE))
 
         self._recipe_page = recipe_page
         self._analysis_page = analysis_page
@@ -404,7 +405,7 @@ class ConfigWizard(QDialog):
         self._lbl_path.setStyleSheet(f"color: {Settings.FG_SECONDARY};")
         path_row.addWidget(self._lbl_path, stretch=1)
         btn_browse = QPushButton("Browse…")
-        btn_browse.setFixedWidth(80)
+        btn_browse.setFixedWidth(scaled(80))
         btn_browse.clicked.connect(self._browse_path)
         path_row.addWidget(btn_browse)
         right_layout.addLayout(path_row)
@@ -431,14 +432,14 @@ class ConfigWizard(QDialog):
         layout.setSpacing(10)
 
         hdr = QLabel("Processing Recipe")
-        hdr.setStyleSheet(f"font: bold 12pt; color: {Settings.FG_PRIMARY};")
+        hdr.setStyleSheet(scale_qss(f"font: bold 12pt; color: {Settings.FG_PRIMARY};"))
         layout.addWidget(hdr)
 
         desc = QLabel(
             "Configure the image processing recipe applied to raw data before analysis."
         )
         desc.setWordWrap(True)
-        desc.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        desc.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         layout.addWidget(desc)
 
         self._cb_normalized = QCheckBox("Frame-mean normalization (applied first)")
@@ -446,12 +447,12 @@ class ConfigWizard(QDialog):
         layout.addWidget(self._cb_normalized)
 
         steps_lbl = QLabel("Recipe steps:")
-        steps_lbl.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: bold 9pt;")
+        steps_lbl.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: bold 9pt;"))
         layout.addWidget(steps_lbl)
 
         self._recipe_list_widget = QListWidget()
-        self._recipe_list_widget.setFixedHeight(160)
-        self._recipe_list_widget.setStyleSheet(f"""
+        self._recipe_list_widget.setFixedHeight(scaled(160))
+        self._recipe_list_widget.setStyleSheet(scale_qss(f"""
             QListWidget {{
                 background: {Settings.BG_SECONDARY};
                 color: {Settings.FG_PRIMARY};
@@ -462,7 +463,7 @@ class ConfigWizard(QDialog):
                 color: {Settings.FG_PRIMARY};
                 padding: 3px 8px;
             }}
-        """)
+        """))
         self._refresh_wizard_recipe_list()
         layout.addWidget(self._recipe_list_widget)
 
@@ -535,20 +536,20 @@ class ConfigWizard(QDialog):
         layout.setSpacing(10)
 
         hdr = QLabel("Analysis Pipeline")
-        hdr.setStyleSheet(f"font: bold 12pt; color: {Settings.FG_PRIMARY};")
+        hdr.setStyleSheet(scale_qss(f"font: bold 12pt; color: {Settings.FG_PRIMARY};"))
         layout.addWidget(hdr)
 
         desc = QLabel(
             "Select the analysis pipeline and configure its parameters."
         )
         desc.setWordWrap(True)
-        desc.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        desc.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         layout.addWidget(desc)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Pipeline:"))
         self._combo_pipeline = QComboBox()
-        self._combo_pipeline.setMinimumWidth(280)
+        self._combo_pipeline.setMinimumWidth(scaled(280))
         for cls in AnalysisPipeline.get_pipelines():
             self._combo_pipeline.addItem(cls.name)
         if self._analysis_page is not None:
@@ -614,14 +615,14 @@ class ConfigWizard(QDialog):
         layout.setSpacing(10)
 
         hdr = QLabel("Result Columns")
-        hdr.setStyleSheet(f"font: bold 12pt; color: {Settings.FG_PRIMARY};")
+        hdr.setStyleSheet(scale_qss(f"font: bold 12pt; color: {Settings.FG_PRIMARY};"))
         layout.addWidget(hdr)
 
         desc = QLabel(
             "Choose which measurement columns to include in the results table."
         )
         desc.setWordWrap(True)
-        desc.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        desc.setStyleSheet(scale_qss(f"color: {Settings.FG_SECONDARY}; font: 9pt;"))
         layout.addWidget(desc)
 
         scroll = QScrollArea()
@@ -647,33 +648,33 @@ class ConfigWizard(QDialog):
 
         for group_name, cols in all_groups:
             lbl = QLabel(group_name.upper())
-            lbl.setFixedHeight(24)
-            lbl.setStyleSheet(
+            lbl.setFixedHeight(scaled(24))
+            lbl.setStyleSheet(scale_qss(
                 f"color: {Settings.FG_SECONDARY}; font: bold 8pt; "
                 f"letter-spacing: 1px; padding-left: 4px; background: transparent;"
-            )
+            ))
             il.addWidget(lbl)
 
             for key, label in cols:
                 src = existing.get(key)
                 cb = QCheckBox(label)
-                cb.setFixedHeight(24)
+                cb.setFixedHeight(scaled(24))
                 cb.setChecked(
                     src.isChecked() if src is not None else key in _DEFAULT_COLUMNS
                 )
                 cb.toggled.connect(
                     lambda checked, k=key: self._on_col_toggled(k, checked)
                 )
-                cb.setStyleSheet("padding-left: 4px; background: transparent;")
+                cb.setStyleSheet(scale_qss("padding-left: 4px; background: transparent;"))
                 self._wizard_col_checkboxes[key] = cb
                 il.addWidget(cb)
 
             sep = QFrame()
             sep.setFrameShape(QFrame.Shape.HLine)
-            sep.setFixedHeight(1)
-            sep.setStyleSheet(
+            sep.setFixedHeight(scaled(1))
+            sep.setStyleSheet(scale_qss(
                 f"background: {Settings.BORDER_COLOR}; margin: 4px 0;"
-            )
+            ))
             il.addWidget(sep)
 
         il.addStretch(1)
@@ -682,12 +683,12 @@ class ConfigWizard(QDialog):
 
         btn_row = QHBoxLayout()
         btn_all = QPushButton("Select all")
-        btn_all.setFixedWidth(90)
+        btn_all.setFixedWidth(scaled(90))
         btn_all.clicked.connect(
             lambda: [cb.setChecked(True) for cb in self._wizard_col_checkboxes.values()]
         )
         btn_none = QPushButton("Clear all")
-        btn_none.setFixedWidth(90)
+        btn_none.setFixedWidth(scaled(90))
         btn_none.clicked.connect(
             lambda: [cb.setChecked(False) for cb in self._wizard_col_checkboxes.values()]
         )
@@ -887,8 +888,8 @@ class SavePreviewDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Save Configuration")
-        self.setMinimumSize(800, 560)
-        self.setStyleSheet(_DLG_STYLE)
+        self.setMinimumSize(scaled(800), scaled(560))
+        self.setStyleSheet(scale_qss(_DLG_STYLE))
 
         self._save_path = default_path
         diff = build_config_diff(old_config, new_config)
@@ -947,7 +948,7 @@ class SavePreviewDialog(QDialog):
         self._lbl_path.setStyleSheet(f"color: {Settings.FG_SECONDARY};")
         path_row.addWidget(self._lbl_path, stretch=1)
         btn_browse = QPushButton("Browse…")
-        btn_browse.setFixedWidth(80)
+        btn_browse.setFixedWidth(scaled(80))
         btn_browse.clicked.connect(self._browse_path)
         path_row.addWidget(btn_browse)
         right_layout.addLayout(path_row)
@@ -976,14 +977,14 @@ class SavePreviewDialog(QDialog):
         layout.setSpacing(10)
 
         hdr = QLabel(title)
-        hdr.setStyleSheet(f"font: bold 12pt; color: {Settings.FG_PRIMARY};")
+        hdr.setStyleSheet(scale_qss(f"font: bold 12pt; color: {Settings.FG_PRIMARY};"))
         layout.addWidget(hdr)
 
         if not changes:
             no_change = QLabel("No changes in this section.")
-            no_change.setStyleSheet(
+            no_change.setStyleSheet(scale_qss(
                 f"color: {Settings.FG_SECONDARY}; font: 10pt;"
-            )
+            ))
             layout.addWidget(no_change)
         else:
             scroll = QScrollArea()
@@ -998,29 +999,29 @@ class SavePreviewDialog(QDialog):
                 lbl = QLabel(line)
                 lbl.setWordWrap(True)
                 if line.strip().startswith("+"):
-                    lbl.setStyleSheet(
+                    lbl.setStyleSheet(scale_qss(
                         f"color: {Settings.ACCENT_GREEN}; font: 9pt; "
                         f"padding: 2px 0; font-family: monospace; "
                         f"background: transparent;"
-                    )
+                    ))
                 elif line.strip().startswith("−"):
-                    lbl.setStyleSheet(
+                    lbl.setStyleSheet(scale_qss(
                         f"color: {Settings.ACCENT_RED}; font: 9pt; "
                         f"padding: 2px 0; font-family: monospace; "
                         f"background: transparent;"
-                    )
+                    ))
                 elif "→" in line:
-                    lbl.setStyleSheet(
+                    lbl.setStyleSheet(scale_qss(
                         f"color: {Settings.ACCENT_ORANGE}; font: 9pt; "
                         f"padding: 2px 0; font-family: monospace; "
                         f"background: transparent;"
-                    )
+                    ))
                 else:
-                    lbl.setStyleSheet(
+                    lbl.setStyleSheet(scale_qss(
                         f"color: {Settings.FG_SECONDARY}; font: 9pt; "
                         f"padding: 2px 0; font-family: monospace; "
                         f"background: transparent;"
-                    )
+                    ))
                 il.addWidget(lbl)
 
             il.addStretch(1)
